@@ -3,7 +3,92 @@ import { spawn } from "node:child_process";
 import { getProject } from "../lib/projects.js";
 import { getSessions, getSession, getEvents } from "../lib/sessions.js";
 
+// Strip ANSI escape codes (color, cursor, etc.)
+const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
+function stripAnsi(s: string): string {
+  return s.replace(ANSI_RE, "");
+}
+
 export const sessionsRouter = Router();
+
+// Stream a new session via SSE — must be before /:sessionId routes
+sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
+  const project = await getProject(req.params.projectId);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+
+  const message = req.query.message as string;
+  const resumeSessionId = req.query.resumeSessionId as string | undefined;
+  const model = req.query.model as string | undefined;
+
+  if (!message) {
+    res.status(400).json({ error: "message query param is required" });
+    return;
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const args = ["chat", message];
+  if (resumeSessionId) {
+    args.push("--resume", resumeSessionId);
+  }
+
+  const cmdArgs: string[] = [];
+  if (model) {
+    cmdArgs.push("--model", model);
+  }
+
+  const child = spawn("ada", [...cmdArgs, ...args], {
+    cwd: project.path,
+    env: { ...process.env },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  // Auto-approve tool calls by piping "y" to stdin whenever prompted
+  child.stderr.on("data", (data: Buffer) => {
+    const raw = data.toString();
+    const text = stripAnsi(raw);
+    res.write(`data: ${JSON.stringify({ type: "stderr", text })}\n\n`);
+
+    if (raw.includes("[y/n]")) {
+      child.stdin.write("y\n");
+    }
+  });
+
+  child.stdout.on("data", (data: Buffer) => {
+    const raw = data.toString();
+    const text = stripAnsi(raw);
+    res.write(`data: ${JSON.stringify({ type: "stdout", text })}\n\n`);
+
+    if (raw.includes("[y/n]")) {
+      child.stdin.write("y\n");
+    }
+  });
+
+  child.on("close", (code) => {
+    res.write(
+      `data: ${JSON.stringify({ type: "done", exitCode: code })}\n\n`
+    );
+    res.end();
+  });
+
+  child.on("error", (err) => {
+    res.write(
+      `data: ${JSON.stringify({ type: "error", text: err.message })}\n\n`
+    );
+    res.end();
+  });
+
+  req.on("close", () => {
+    child.kill();
+  });
+});
 
 // List sessions for a project
 sessionsRouter.get("/:projectId/sessions", async (req, res) => {
@@ -44,64 +129,3 @@ sessionsRouter.get(
     res.json(events);
   }
 );
-
-// Stream a new session via SSE (GET so EventSource can use it)
-sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
-  const project = await getProject(req.params.projectId);
-  if (!project) {
-    res.status(404).json({ error: "Project not found" });
-    return;
-  }
-
-  const message = req.query.message as string;
-  const resumeSessionId = req.query.resumeSessionId as string | undefined;
-
-  if (!message) {
-    res.status(400).json({ error: "message query param is required" });
-    return;
-  }
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-
-  const args = ["chat", message];
-  if (resumeSessionId) {
-    args.push("--resume", resumeSessionId);
-  }
-
-  const child = spawn("ada", args, {
-    cwd: project.path,
-    env: { ...process.env },
-  });
-
-  child.stdout.on("data", (data: Buffer) => {
-    const text = data.toString();
-    res.write(`data: ${JSON.stringify({ type: "stdout", text })}\n\n`);
-  });
-
-  child.stderr.on("data", (data: Buffer) => {
-    const text = data.toString();
-    res.write(`data: ${JSON.stringify({ type: "stderr", text })}\n\n`);
-  });
-
-  child.on("close", (code) => {
-    res.write(
-      `data: ${JSON.stringify({ type: "done", exitCode: code })}\n\n`
-    );
-    res.end();
-  });
-
-  child.on("error", (err) => {
-    res.write(
-      `data: ${JSON.stringify({ type: "error", text: err.message })}\n\n`
-    );
-    res.end();
-  });
-
-  req.on("close", () => {
-    child.kill();
-  });
-});

@@ -71,18 +71,26 @@ export async function fetchEvents(
   return res.json();
 }
 
+export interface Model {
+  id: string;
+  name: string;
+  size: string;
+}
+
+export async function fetchModels(): Promise<Model[]> {
+  const res = await fetch(`${BASE}/models`);
+  return res.json();
+}
+
 export function startSession(
   projectId: string,
   message: string,
-  resumeSessionId?: string
+  options?: { resumeSessionId?: string; model?: string }
 ): EventSource {
-  // We can't use EventSource with POST, so use fetch + ReadableStream
-  // Instead, let's use a custom approach
   const params = new URLSearchParams({ message });
-  if (resumeSessionId) params.set("resumeSessionId", resumeSessionId);
-
-  const es = new EventSource(
+  if (options?.resumeSessionId) params.set("resumeSessionId", options.resumeSessionId);
+  if (options?.model) params.set("model", options.model);
+  return new EventSource(
     `${BASE}/projects/${projectId}/sessions/stream?${params}`
   );
-  return es;
 }
