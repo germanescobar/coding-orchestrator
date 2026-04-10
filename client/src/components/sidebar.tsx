@@ -59,7 +59,7 @@ export function Sidebar({
     };
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projects, activeProjectId]);
+  }, [projects, activeProjectId, activeSessionId]);
 
   const toggleProject = (id: string) => {
     setProjectData((prev) =>
