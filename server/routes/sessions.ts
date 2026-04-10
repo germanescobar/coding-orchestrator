@@ -22,6 +22,10 @@ type AdaStreamEvent =
       text: string;
     }
   | {
+      type: "assistant.reasoning";
+      text: string;
+    }
+  | {
       type: "tool.call";
       id: string;
       name: string;

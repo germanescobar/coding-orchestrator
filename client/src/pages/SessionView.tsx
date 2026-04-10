@@ -23,6 +23,7 @@ interface SessionViewProps {
 
 type StreamItem =
   | { type: "assistant"; text: string }
+  | { type: "reasoning"; text: string }
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; name?: string; content: string; isError: boolean }
   | { type: "error"; text: string };
@@ -64,25 +65,48 @@ function EventBlock({
   // assistant_response: render markdown
   if (event.type === "assistant_response") {
     const content = data.content as Array<{ type: string; text?: string }> | undefined;
+    const reasoningText = content
+      ?.filter((b) => b.type === "reasoning")
+      .map((b) => b.text)
+      .filter((text): text is string => Boolean(text))
+      .join("\n");
     const text = content
       ?.filter((b) => b.type === "text")
       .map((b) => b.text)
+      .filter((text): text is string => Boolean(text))
       .join("\n");
-    if (!text) return null;
+    if (!reasoningText && !text) return null;
     return (
-      <AssistantBlock text={text}>
-        <button
-          onClick={() => onCopy(event)}
-          className="flex items-center gap-1 text-muted-foreground hover:text-foreground transition-colors"
-        >
-          {copiedId === event.id ? (
-            <Check className="h-3.5 w-3.5" />
-          ) : (
-            <Copy className="h-3.5 w-3.5" />
-          )}
-        </button>
-      </AssistantBlock>
+      <div className="space-y-3">
+        {reasoningText ? <ReasoningBlock text={reasoningText} /> : null}
+        {text ? (
+          <AssistantBlock text={text}>
+            <button
+              onClick={() => onCopy(event)}
+              className="flex items-center gap-1 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              {copiedId === event.id ? (
+                <Check className="h-3.5 w-3.5" />
+              ) : (
+                <Copy className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </AssistantBlock>
+        ) : null}
+      </div>
     );
+  }
+
+  if (
+    event.type === "assistant_reasoning" ||
+    event.type === "assistant.reasoning"
+  ) {
+    const text =
+      (data.text as string | undefined) ??
+      (data.content as string | undefined) ??
+      "";
+    if (!text) return null;
+    return <ReasoningBlock text={text} />;
   }
 
   // tool_call: show tool name + input, expandable
@@ -203,6 +227,42 @@ function AssistantBlock({
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
       </div>
       {children}
+    </div>
+  );
+}
+
+function ReasoningBlock({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const preview = text.replace(/\s+/g, " ").trim();
+
+  return (
+    <div className="rounded-lg border border-border/70 bg-card/60 overflow-hidden">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 p-3 text-left min-w-0"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        )}
+        <Badge variant="secondary" className="shrink-0 text-[10px]">
+          <span className="text-sky-400">reasoning</span>
+        </Badge>
+        {!expanded && preview && (
+          <span className="truncate text-xs text-muted-foreground">
+            {preview.slice(0, 120)}
+            {preview.length > 120 ? "..." : ""}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <div className="border-t border-border px-4 py-3">
+          <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words text-muted-foreground">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -417,6 +477,13 @@ export function SessionView({
               { type: "assistant", text: adaEvent.text },
             ]);
           }
+        } else if (adaEvent.type === "assistant.reasoning") {
+          if (adaEvent.text) {
+            setStreamItems((prev) => [
+              ...prev,
+              { type: "reasoning", text: adaEvent.text },
+            ]);
+          }
         } else if (adaEvent.type === "tool.call") {
           setStreamItems((prev) => [
             ...prev,
@@ -558,6 +625,10 @@ export function SessionView({
               {streamItems.map((item, i) => {
                 if (item.type === "assistant") {
                   return <AssistantBlock key={i} text={item.text} />;
+                }
+
+                if (item.type === "reasoning") {
+                  return <ReasoningBlock key={i} text={item.text} />;
                 }
 
                 if (item.type === "tool_call") {
