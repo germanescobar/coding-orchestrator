@@ -11,6 +11,7 @@ import {
   type Project,
   type AgentEvent,
   type Model,
+  type SessionStreamEvent,
 } from "../api.ts";
 
 interface SessionViewProps {
@@ -18,6 +19,24 @@ interface SessionViewProps {
   sessionId?: string;
   project?: Project;
   onSessionCreated: (sessionId: string) => void;
+}
+
+type StreamItem =
+  | { type: "assistant"; text: string }
+  | { type: "reasoning"; text: string }
+  | { type: "tool_call"; name: string; input: Record<string, unknown> }
+  | { type: "tool_result"; name?: string; content: string; isError: boolean }
+  | { type: "error"; text: string };
+
+function getRunStatusText(
+  stopReason: "completed" | "max_iterations" | string,
+  status: "completed" | "max_iterations"
+) {
+  if (status === "max_iterations" || stopReason === "max_turns") {
+    return "Paused after a long run. You can keep going with a follow-up message.";
+  }
+
+  return "Done.";
 }
 
 function EventBlock({
@@ -46,28 +65,48 @@ function EventBlock({
   // assistant_response: render markdown
   if (event.type === "assistant_response") {
     const content = data.content as Array<{ type: string; text?: string }> | undefined;
+    const reasoningText = content
+      ?.filter((b) => b.type === "reasoning")
+      .map((b) => b.text)
+      .filter((text): text is string => Boolean(text))
+      .join("\n");
     const text = content
       ?.filter((b) => b.type === "text")
       .map((b) => b.text)
+      .filter((text): text is string => Boolean(text))
       .join("\n");
-    if (!text) return null;
+    if (!reasoningText && !text) return null;
     return (
-      <div className="space-y-2">
-        <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-        </div>
-        <button
-          onClick={() => onCopy(event)}
-          className="flex items-center gap-1 text-muted-foreground hover:text-foreground transition-colors"
-        >
-          {copiedId === event.id ? (
-            <Check className="h-3.5 w-3.5" />
-          ) : (
-            <Copy className="h-3.5 w-3.5" />
-          )}
-        </button>
+      <div className="space-y-3">
+        {reasoningText ? <ReasoningBlock text={reasoningText} /> : null}
+        {text ? (
+          <AssistantBlock text={text}>
+            <button
+              onClick={() => onCopy(event)}
+              className="flex items-center gap-1 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              {copiedId === event.id ? (
+                <Check className="h-3.5 w-3.5" />
+              ) : (
+                <Copy className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </AssistantBlock>
+        ) : null}
       </div>
     );
+  }
+
+  if (
+    event.type === "assistant_reasoning" ||
+    event.type === "assistant.reasoning"
+  ) {
+    const text =
+      (data.text as string | undefined) ??
+      (data.content as string | undefined) ??
+      "";
+    if (!text) return null;
+    return <ReasoningBlock text={text} />;
   }
 
   // tool_call: show tool name + input, expandable
@@ -84,32 +123,13 @@ function EventBlock({
           .join(", ")
       : "";
     return (
-      <div className="rounded-lg border border-border bg-card overflow-hidden">
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="flex w-full items-center gap-2 p-3 text-left min-w-0"
-        >
-          {expanded ? (
-            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          )}
-          <Badge variant="secondary" className="shrink-0 text-[10px]">
-            <span className="text-yellow-400">tool_call</span>
-          </Badge>
-          <span className="font-mono text-xs text-foreground">{tool}</span>
-          {!expanded && inputPreview && (
-            <span className="truncate text-xs text-muted-foreground">
-              {inputPreview}
-            </span>
-          )}
-        </button>
-        {expanded && input && (
-          <pre className="border-t border-border px-4 py-3 text-xs text-muted-foreground font-mono whitespace-pre-wrap overflow-x-auto">
-            {JSON.stringify(input, null, 2)}
-          </pre>
-        )}
-      </div>
+      <ToolCallBlock
+        expanded={expanded}
+        input={input}
+        inputPreview={inputPreview}
+        onToggle={() => setExpanded(!expanded)}
+        tool={tool}
+      />
     );
   }
 
@@ -121,40 +141,14 @@ function EventBlock({
     if (!content) return null;
     const isLong = content.length > 200;
     return (
-      <div className="rounded-lg border border-border bg-card overflow-hidden">
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="flex w-full items-center gap-2 p-3 text-left min-w-0"
-        >
-          {expanded ? (
-            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          )}
-          <Badge
-            variant={isError ? "destructive" : "secondary"}
-            className="shrink-0 text-[10px]"
-          >
-            <span className={isError ? "text-red-400" : "text-orange-400"}>
-              tool_result
-            </span>
-          </Badge>
-          {tool && (
-            <span className="font-mono text-xs text-foreground">{tool}</span>
-          )}
-          {!expanded && (
-            <span className="truncate text-xs text-muted-foreground">
-              {content.slice(0, 120)}
-              {isLong ? "..." : ""}
-            </span>
-          )}
-        </button>
-        {expanded && (
-          <pre className="border-t border-border px-4 py-3 text-xs text-muted-foreground font-mono whitespace-pre-wrap overflow-x-auto max-h-96 overflow-y-auto">
-            {content}
-          </pre>
-        )}
-      </div>
+      <ToolResultBlock
+        content={content}
+        expanded={expanded}
+        isError={isError ?? false}
+        isLong={isLong}
+        onToggle={() => setExpanded(!expanded)}
+        tool={tool}
+      />
     );
   }
 
@@ -192,16 +186,7 @@ function EventBlock({
   if (event.type === "error") {
     const msg =
       (data.message as string) ?? (data.text as string) ?? JSON.stringify(data);
-    return (
-      <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3">
-        <div className="flex items-center gap-2">
-          <Badge variant="destructive" className="shrink-0 text-[10px]">
-            error
-          </Badge>
-          <span className="text-xs text-destructive-foreground">{msg}</span>
-        </div>
-      </div>
-    );
+    return <ErrorBlock text={msg} />;
   }
 
   // Fallback: generic expandable
@@ -229,6 +214,168 @@ function EventBlock({
   );
 }
 
+function AssistantBlock({
+  text,
+  children,
+}: {
+  text: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function ReasoningBlock({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const preview = text.replace(/\s+/g, " ").trim();
+
+  return (
+    <div className="rounded-lg border border-border/70 bg-card/60 overflow-hidden">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 p-3 text-left min-w-0"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        )}
+        <Badge variant="secondary" className="shrink-0 text-[10px]">
+          <span className="text-sky-400">reasoning</span>
+        </Badge>
+        {!expanded && preview && (
+          <span className="truncate text-xs text-muted-foreground">
+            {preview.slice(0, 120)}
+            {preview.length > 120 ? "..." : ""}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <div className="border-t border-border px-4 py-3">
+          <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words text-muted-foreground">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolCallBlock({
+  expanded,
+  input,
+  inputPreview,
+  onToggle,
+  tool,
+}: {
+  expanded: boolean;
+  input?: Record<string, unknown>;
+  inputPreview: string;
+  onToggle: () => void;
+  tool: string;
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card overflow-hidden">
+      <button
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 p-3 text-left min-w-0"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        )}
+        <Badge variant="secondary" className="shrink-0 text-[10px]">
+          <span className="text-yellow-400">tool_call</span>
+        </Badge>
+        <span className="font-mono text-xs text-foreground">{tool}</span>
+        {!expanded && inputPreview && (
+          <span className="truncate text-xs text-muted-foreground">
+            {inputPreview}
+          </span>
+        )}
+      </button>
+      {expanded && input && (
+        <pre className="border-t border-border px-4 py-3 text-xs text-muted-foreground font-mono whitespace-pre-wrap overflow-x-auto">
+          {JSON.stringify(input, null, 2)}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function ToolResultBlock({
+  content,
+  expanded,
+  isError,
+  isLong,
+  onToggle,
+  tool,
+}: {
+  content: string;
+  expanded: boolean;
+  isError: boolean;
+  isLong: boolean;
+  onToggle: () => void;
+  tool?: string;
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card overflow-hidden">
+      <button
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 p-3 text-left min-w-0"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        )}
+        <Badge
+          variant={isError ? "destructive" : "secondary"}
+          className="shrink-0 text-[10px]"
+        >
+          <span className={isError ? "text-red-400" : "text-orange-400"}>
+            tool_result
+          </span>
+        </Badge>
+        {tool && (
+          <span className="font-mono text-xs text-foreground">{tool}</span>
+        )}
+        {!expanded && (
+          <span className="truncate text-xs text-muted-foreground">
+            {content.slice(0, 120)}
+            {isLong ? "..." : ""}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <pre className="border-t border-border px-4 py-3 text-xs text-muted-foreground font-mono whitespace-pre-wrap overflow-x-auto max-h-96 overflow-y-auto">
+          {content}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function ErrorBlock({ text }: { text: string }) {
+  return (
+    <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3">
+      <div className="flex items-center gap-2">
+        <Badge variant="destructive" className="shrink-0 text-[10px]">
+          error
+        </Badge>
+        <span className="text-xs text-destructive-foreground">{text}</span>
+      </div>
+    </div>
+  );
+}
+
 export function SessionView({
   projectId,
   sessionId,
@@ -238,7 +385,7 @@ export function SessionView({
   const [message, setMessage] = useState("");
   const [pendingMessage, setPendingMessage] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
-  const [streamOutput, setStreamOutput] = useState<string[]>([]);
+  const [streamItems, setStreamItems] = useState<StreamItem[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [models, setModels] = useState<Model[]>([]);
@@ -263,16 +410,22 @@ export function SessionView({
 
   useEffect(() => {
     if (sessionId) {
-      fetchEvents(projectId, sessionId).then(setEvents);
+      fetchEvents(projectId, sessionId)
+        .then((evts) => {
+          setEvents(evts);
+        })
+        .catch(() => {
+          // Keep current stream items visible if events cannot be loaded yet.
+        });
     } else {
       setEvents([]);
+      setStreamItems([]);
     }
-    setStreamOutput([]);
   }, [projectId, sessionId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [events, streamOutput]);
+  }, [events, streamItems]);
 
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
@@ -295,8 +448,9 @@ export function SessionView({
     setMessage("");
     setPendingMessage(sentMessage);
     setStreaming(true);
-    setStreamOutput([]);
+    setStreamItems([]);
     let detectedSessionId = sessionId;
+    let runFailed = false;
 
     const es = startSession(projectId, sentMessage, {
       resumeSessionId: sessionId,
@@ -304,40 +458,95 @@ export function SessionView({
     });
 
     es.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === "stdout" || data.type === "stderr") {
-        const text = data.text as string;
-        setStreamOutput((prev) => [...prev, text]);
-
-        // Parse session ID from ada output: "Session: <uuid>"
-        if (!detectedSessionId) {
-          const match = text.match(/Session:\s+([0-9a-f-]{36})/);
-          if (match) {
-            detectedSessionId = match[1];
+      const data = JSON.parse(event.data) as SessionStreamEvent;
+      if (data.type === "started" || data.type === "stderr") {
+        if (data.type === "stderr") {
+          const text = data.text.trim();
+          if (text) {
+            setStreamItems((prev) => [...prev, { type: "error", text }]);
+          }
+        }
+      } else if (data.type === "ada_event") {
+        const adaEvent = data.event;
+        if (adaEvent.type === "run.started") {
+          detectedSessionId = adaEvent.sessionId;
+        } else if (adaEvent.type === "assistant.text") {
+          if (adaEvent.text) {
+            setStreamItems((prev) => [
+              ...prev,
+              { type: "assistant", text: adaEvent.text },
+            ]);
+          }
+        } else if (adaEvent.type === "assistant.reasoning") {
+          if (adaEvent.text) {
+            setStreamItems((prev) => [
+              ...prev,
+              { type: "reasoning", text: adaEvent.text },
+            ]);
+          }
+        } else if (adaEvent.type === "tool.call") {
+          setStreamItems((prev) => [
+            ...prev,
+            { type: "tool_call", name: adaEvent.name, input: adaEvent.input },
+          ]);
+        } else if (adaEvent.type === "tool.result") {
+          setStreamItems((prev) => [
+            ...prev,
+            {
+              type: "tool_result",
+              name: adaEvent.name,
+              content: adaEvent.content,
+              isError: adaEvent.isError,
+            },
+          ]);
+        } else if (adaEvent.type === "run.failed") {
+          runFailed = true;
+          setStreamItems((prev) => [
+            ...prev,
+            { type: "error", text: adaEvent.error },
+          ]);
+        } else if (adaEvent.type === "run.completed") {
+          detectedSessionId = adaEvent.sessionId;
+          if (adaEvent.status === "max_iterations" || adaEvent.stopReason === "max_turns") {
+            setStreamItems((prev) => [
+              ...prev,
+              {
+                type: "error",
+                text: getRunStatusText(adaEvent.stopReason, adaEvent.status),
+              },
+            ]);
           }
         }
       } else if (data.type === "done") {
         es.close();
         setStreaming(false);
-        setStreamOutput([]);
         setPendingMessage(null);
         if (detectedSessionId) {
-          // Fetch events directly, then navigate
-          fetchEvents(projectId, detectedSessionId).then((evts) => {
-            setEvents(evts);
-            onSessionCreated(detectedSessionId!);
-          });
+          onSessionCreated(detectedSessionId);
+          fetchEvents(projectId, detectedSessionId)
+            .then((evts) => {
+              setEvents(evts);
+              if (!runFailed && (data.exitCode ?? 1) === 0) {
+                setStreamItems([]);
+              }
+            })
+            .catch(() => {
+              // Keep any streamed content visible if events fail to load.
+            });
         }
       } else if (data.type === "error") {
-        setStreamOutput((prev) => [...prev, `Error: ${data.text}`]);
+        const text = data.text.trim();
+        setStreamItems((prev) => [...prev, { type: "error", text }]);
         es.close();
         setStreaming(false);
+        setPendingMessage(null);
       }
     };
 
     es.onerror = () => {
       es.close();
       setStreaming(false);
+      setPendingMessage(null);
     };
   };
 
@@ -365,17 +574,6 @@ export function SessionView({
           <h1 className="text-sm font-medium truncate">
             {project?.name ?? "Project"}
           </h1>
-          {sessionId && (
-            <span className="hidden sm:inline font-mono text-xs text-muted-foreground">
-              {sessionId.slice(0, 8)}...
-            </span>
-          )}
-          {streaming && (
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              <span className="hidden sm:inline">Running</span>
-            </div>
-          )}
         </div>
         <div className="hidden md:flex items-center gap-2">
           {project && (
@@ -389,7 +587,7 @@ export function SessionView({
       {/* Messages / Events area */}
       <div className="flex-1 overflow-y-auto min-h-0">
         <div className="mx-auto max-w-3xl px-3 py-4 md:px-4 md:py-6">
-          {!sessionId && events.length === 0 && streamOutput.length === 0 && (
+          {!sessionId && events.length === 0 && streamItems.length === 0 && (
             <div className="flex flex-col items-center justify-center py-20">
               <h2 className="text-lg font-medium text-muted-foreground">
                 Start a new thread
@@ -422,11 +620,59 @@ export function SessionView({
           )}
 
           {/* Stream output */}
-          {streamOutput.length > 0 && (
-            <div className="mt-4 rounded-lg border border-border bg-card p-4 font-mono text-sm whitespace-pre-wrap break-words overflow-x-auto text-muted-foreground">
-              {streamOutput.map((line, i) => (
-                <span key={i}>{line}</span>
-              ))}
+          {streamItems.length > 0 && (
+            <div className="mt-4 space-y-3">
+              {streamItems.map((item, i) => {
+                if (item.type === "assistant") {
+                  return <AssistantBlock key={i} text={item.text} />;
+                }
+
+                if (item.type === "reasoning") {
+                  return <ReasoningBlock key={i} text={item.text} />;
+                }
+
+                if (item.type === "tool_call") {
+                  const inputPreview = Object.entries(item.input)
+                    .map(([k, v]) => {
+                      const val = typeof v === "string" ? v : JSON.stringify(v);
+                      return `${k}: ${val.length > 60 ? val.slice(0, 60) + "..." : val}`;
+                    })
+                    .join(", ");
+
+                  return (
+                    <LiveToolCallBlock
+                      key={i}
+                      input={item.input}
+                      inputPreview={inputPreview}
+                      tool={item.name}
+                    />
+                  );
+                }
+
+                if (item.type === "tool_result") {
+                  return (
+                    <LiveToolResultBlock
+                      key={i}
+                      content={item.content}
+                      isError={item.isError}
+                      tool={item.name}
+                    />
+                  );
+                }
+
+                if (item.type === "error") {
+                  return <ErrorBlock key={i} text={item.text} />;
+                }
+
+                return null;
+              })}
+            </div>
+          )}
+
+          {streaming && (
+            <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span>Working...</span>
             </div>
           )}
 
@@ -517,5 +763,50 @@ export function SessionView({
         </div>
       </div>
     </>
+  );
+}
+
+function LiveToolCallBlock({
+  input,
+  inputPreview,
+  tool,
+}: {
+  input: Record<string, unknown>;
+  inputPreview: string;
+  tool: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <ToolCallBlock
+      expanded={expanded}
+      input={input}
+      inputPreview={inputPreview}
+      onToggle={() => setExpanded(!expanded)}
+      tool={tool}
+    />
+  );
+}
+
+function LiveToolResultBlock({
+  content,
+  isError,
+  tool,
+}: {
+  content: string;
+  isError: boolean;
+  tool?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <ToolResultBlock
+      content={content}
+      expanded={expanded}
+      isError={isError}
+      isLong={content.length > 200}
+      onToggle={() => setExpanded(!expanded)}
+      tool={tool}
+    />
   );
 }

@@ -25,6 +25,56 @@ export interface AgentEvent {
   data: Record<string, unknown>;
 }
 
+export type AdaStreamEvent =
+  | {
+      type: "run.started";
+      sessionId: string;
+      model: string;
+      workingDirectory: string;
+      timestamp: string;
+    }
+  | {
+      type: "assistant.text";
+      text: string;
+    }
+  | {
+      type: "assistant.reasoning";
+      text: string;
+    }
+  | {
+      type: "tool.call";
+      id: string;
+      name: string;
+      input: Record<string, unknown>;
+    }
+  | {
+      type: "tool.result";
+      id: string;
+      name: string;
+      content: string;
+      isError: boolean;
+    }
+  | {
+      type: "run.completed";
+      sessionId: string;
+      status: "completed" | "max_iterations";
+      stopReason: string;
+      timestamp: string;
+    }
+  | {
+      type: "run.failed";
+      sessionId: string;
+      error: string;
+      timestamp: string;
+    };
+
+export type SessionStreamEvent =
+  | { type: "started" }
+  | { type: "ada_event"; event: AdaStreamEvent }
+  | { type: "stderr"; text: string }
+  | { type: "done"; exitCode: number | null }
+  | { type: "error"; text: string; raw?: string };
+
 export async function fetchProjects(): Promise<Project[]> {
   const res = await fetch(`${BASE}/projects`);
   return res.json();

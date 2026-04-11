@@ -14,7 +14,7 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     allowedHosts: ["macbook-black"],
-    port: 5000,
+    port: 4500,
     proxy: {
       "/api": "http://localhost:3100",
     },
