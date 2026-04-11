@@ -10,11 +10,27 @@ export type View =
   | { page: "new-project" }
   | { page: "session"; projectId: string; sessionId?: string };
 
+function loadSavedView(): View {
+  try {
+    const saved = localStorage.getItem("activeView");
+    if (saved) return JSON.parse(saved) as View;
+  } catch {}
+  return { page: "empty" };
+}
+
 export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
-  const [view, setView] = useState<View>({ page: "empty" });
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [view, setViewState] = useState<View>(loadSavedView);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(() => {
+    const saved = loadSavedView();
+    return saved.page === "session" ? saved.projectId : null;
+  });
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const setView = (v: View) => {
+    setViewState(v);
+    localStorage.setItem("activeView", JSON.stringify(v));
+  };
 
   const loadProjects = useCallback(() => {
     fetchProjects().then(setProjects);
