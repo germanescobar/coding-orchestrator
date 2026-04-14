@@ -3,6 +3,7 @@ import path from "node:path";
 
 export interface SessionState {
   id: string;
+  title?: string;
   workingDirectory: string;
   model: string;
   messages: unknown[];

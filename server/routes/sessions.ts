@@ -2,6 +2,7 @@ import { Router } from "express";
 import { spawn } from "node:child_process";
 import { getProject } from "../lib/projects.js";
 import { getSessions, getSession, getEvents } from "../lib/sessions.js";
+import { getApiKeyEnvVars } from "../lib/api-keys.js";
 
 // Strip ANSI escape codes (color, cursor, etc.)
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
@@ -87,9 +88,11 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     cmdArgs.push("--model", model);
   }
 
+  const apiKeyEnv = await getApiKeyEnvVars();
+
   const child = spawn("ada", [...cmdArgs, ...args], {
     cwd: project.path,
-    env: { ...process.env },
+    env: { ...process.env, ...apiKeyEnv },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdoutBuffer = "";
