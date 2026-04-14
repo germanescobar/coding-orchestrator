@@ -714,31 +714,47 @@ export function SessionView({
                       <ChevronDown className="h-3 w-3" />
                     </button>
                     {showModelPicker && (
-                      <div className="absolute bottom-full left-0 mb-1 w-64 rounded-lg border border-border bg-popover p-1 shadow-lg">
+                      <div className="absolute bottom-full left-0 mb-1 w-96 max-h-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-lg">
                         {models.length === 0 ? (
                           <div className="px-3 py-2 text-xs text-muted-foreground">
-                            No models found (is ollama running?)
+                            No models found. Check ollama or add API keys in Settings.
                           </div>
                         ) : (
-                          models.map((model) => (
-                            <button
-                              key={model.id}
-                              type="button"
-                              onClick={() => {
-                                setSelectedModel(model.id);
-                                setShowModelPicker(false);
-                              }}
-                              className={`flex w-full items-center justify-between rounded-md px-3 py-2 text-sm transition-colors ${
-                                selectedModel === model.id
-                                  ? "bg-accent text-accent-foreground"
-                                  : "text-popover-foreground hover:bg-accent"
-                              }`}
-                            >
-                              <span className="font-mono">{model.name}</span>
-                              <span className="text-xs text-muted-foreground">
-                                {model.size}
-                              </span>
-                            </button>
+                          Object.entries(
+                            models.reduce<Record<string, Model[]>>((acc, m) => {
+                              const provider = m.provider || "ollama";
+                              if (!acc[provider]) acc[provider] = [];
+                              acc[provider].push(m);
+                              return acc;
+                            }, {})
+                          ).map(([provider, providerModels]) => (
+                            <div key={provider}>
+                              <div className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                                {provider}
+                              </div>
+                              {providerModels.map((model) => (
+                                <button
+                                  key={model.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedModel(model.id);
+                                    setShowModelPicker(false);
+                                  }}
+                                  className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                                    selectedModel === model.id
+                                      ? "bg-accent text-accent-foreground"
+                                      : "text-popover-foreground hover:bg-accent"
+                                  }`}
+                                >
+                                  <span className="font-mono text-xs">{model.name}</span>
+                                  {model.size && (
+                                    <span className="ml-auto text-xs text-muted-foreground">
+                                      {model.size}
+                                    </span>
+                                  )}
+                                </button>
+                              ))}
+                            </div>
                           ))
                         )}
                       </div>

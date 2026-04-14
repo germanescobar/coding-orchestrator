@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { Menu, X } from "lucide-react";
 import { fetchProjects, type Project } from "./api.ts";
 import { Sidebar } from "./components/sidebar.tsx";
+import { SettingsDialog } from "./components/settings-dialog.tsx";
 import { ProjectSetup } from "./pages/ProjectSetup.tsx";
 import { SessionView } from "./pages/SessionView.tsx";
 
@@ -26,6 +27,7 @@ export function App() {
     return saved.page === "session" ? saved.projectId : null;
   });
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const setView = (v: View) => {
     setViewState(v);
@@ -92,6 +94,10 @@ export function App() {
             closeSidebar();
           }}
           onProjectsChanged={loadProjects}
+          onSettings={() => {
+            setSettingsOpen(true);
+            closeSidebar();
+          }}
         />
       </div>
 
@@ -143,6 +149,8 @@ export function App() {
           />
         )}
       </main>
+
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </div>
   );
 }

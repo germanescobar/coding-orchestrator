@@ -11,6 +11,16 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { fetchSessions, deleteProject, type Project, type Session } from "../api.ts";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+} from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 
@@ -23,6 +33,7 @@ interface SidebarProps {
   onNewThread: (projectId: string) => void;
   onNewProject: () => void;
   onProjectsChanged: () => void;
+  onSettings: () => void;
 }
 
 interface ProjectWithSessions extends Project {
@@ -39,6 +50,7 @@ export function Sidebar({
   onNewThread,
   onNewProject,
   onProjectsChanged,
+  onSettings,
 }: SidebarProps) {
   const [projectData, setProjectData] = useState<ProjectWithSessions[]>([]);
 
@@ -69,9 +81,17 @@ export function Sidebar({
     );
   };
 
-  const handleDelete = async (e: React.MouseEvent, id: string) => {
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  const handleDelete = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
-    await deleteProject(id);
+    setConfirmDeleteId(id);
+  };
+
+  const confirmDelete = async () => {
+    if (!confirmDeleteId) return;
+    await deleteProject(confirmDeleteId);
+    setConfirmDeleteId(null);
     onProjectsChanged();
   };
 
@@ -101,7 +121,7 @@ export function Sidebar({
       <Separator />
 
       {/* Projects & Sessions */}
-      <ScrollArea className="flex-1 px-3">
+      <ScrollArea className="flex-1 overflow-hidden px-3">
         <div className="flex items-center justify-between py-3">
           <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
             Projects
@@ -177,7 +197,7 @@ export function Sidebar({
                           <span className="flex items-center gap-2 truncate">
                             <MessageSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                             <span className="truncate">
-                              {session.id.slice(0, 8)}
+                              {session.title || session.id.slice(0, 8)}
                             </span>
                           </span>
                           <span className="shrink-0 text-xs text-muted-foreground">
@@ -197,11 +217,41 @@ export function Sidebar({
       {/* Footer */}
       <Separator />
       <div className="p-3">
-        <button className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-accent transition-colors">
+        <button
+          onClick={onSettings}
+          className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-accent transition-colors"
+        >
           <Settings className="h-4 w-4" />
           <span>Settings</span>
         </button>
       </div>
+      <Dialog
+        open={!!confirmDeleteId}
+        onOpenChange={(open) => {
+          if (!open) setConfirmDeleteId(null);
+        }}
+      >
+        <DialogContent showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>Delete project</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete{" "}
+              <span className="font-medium text-foreground">
+                {projectData.find((p) => p.id === confirmDeleteId)?.name}
+              </span>
+              ? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline" />}>
+              Cancel
+            </DialogClose>
+            <Button variant="destructive" onClick={confirmDelete}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </aside>
   );
 }

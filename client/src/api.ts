@@ -9,6 +9,7 @@ export interface Project {
 
 export interface Session {
   id: string;
+  title?: string;
   workingDirectory: string;
   model: string;
   messages: unknown[];
@@ -124,12 +125,40 @@ export async function fetchEvents(
 export interface Model {
   id: string;
   name: string;
+  provider: string;
   size: string;
+}
+
+export interface ProviderStatus {
+  id: string;
+  name: string;
+  configured: boolean;
+  hint: string | null;
 }
 
 export async function fetchModels(): Promise<Model[]> {
   const res = await fetch(`${BASE}/models`);
   return res.json();
+}
+
+export async function fetchProviders(): Promise<ProviderStatus[]> {
+  const res = await fetch(`${BASE}/api-keys`);
+  return res.json();
+}
+
+export async function setProviderKey(
+  providerId: string,
+  key: string
+): Promise<void> {
+  await fetch(`${BASE}/api-keys/${providerId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key }),
+  });
+}
+
+export async function deleteProviderKey(providerId: string): Promise<void> {
+  await fetch(`${BASE}/api-keys/${providerId}`, { method: "DELETE" });
 }
 
 export function startSession(
