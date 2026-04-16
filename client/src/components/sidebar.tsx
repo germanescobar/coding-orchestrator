@@ -8,9 +8,11 @@ import {
   Settings,
   Trash2,
   MessageSquare,
+  Archive,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { fetchSessions, deleteProject, type Project, type Session } from "../api.ts";
+import { fetchSessions, deleteProject, archiveSession, type Project, type Session } from "../api.ts";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -53,6 +55,7 @@ export function Sidebar({
   onSettings,
 }: SidebarProps) {
   const [projectData, setProjectData] = useState<ProjectWithSessions[]>([]);
+  const [archivedIds, setArchivedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     const load = async () => {
@@ -62,7 +65,7 @@ export function Sidebar({
           const existing = projectData.find((d) => d.id === p.id);
           return {
             ...p,
-            sessions,
+            sessions: sessions.filter((s) => !archivedIds.has(s.id)),
             isExpanded: existing?.isExpanded ?? p.id === activeProjectId,
           };
         })
@@ -182,28 +185,58 @@ export function Sidebar({
                       </span>
                     ) : (
                       project.sessions.map((session) => (
-                        <button
+                        <div
                           key={session.id}
-                          onClick={() =>
-                            onSelectSession(project.id, session.id)
-                          }
-                          className={cn(
-                            "flex items-center justify-between rounded-md px-4 py-1.5 text-sm transition-colors",
-                            session.id === activeSessionId
-                              ? "bg-sidebar-accent text-sidebar-foreground"
-                              : "text-sidebar-foreground/80 hover:bg-sidebar-accent"
-                          )}
+                          className="group/session flex items-center"
                         >
-                          <span className="flex items-center gap-2 truncate">
-                            <MessageSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                            <span className="truncate">
-                              {session.title || session.id.slice(0, 8)}
+                          <button
+                            onClick={() =>
+                              onSelectSession(project.id, session.id)
+                            }
+                            className={cn(
+                              "flex flex-1 items-center justify-between rounded-md px-4 py-1.5 text-sm transition-colors min-w-0",
+                              session.id === activeSessionId
+                                ? "bg-sidebar-accent text-sidebar-foreground"
+                                : "text-sidebar-foreground/80 hover:bg-sidebar-accent"
+                            )}
+                          >
+                            <span className="flex items-center gap-2 truncate">
+                              <MessageSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                              <span className="truncate">
+                                {session.title || session.id.slice(0, 8)}
+                              </span>
                             </span>
-                          </span>
-                          <span className="shrink-0 text-xs text-muted-foreground">
-                            {formatTime(session.lastActiveAt)}
-                          </span>
-                        </button>
+                            <span className="shrink-0 text-xs text-muted-foreground group-hover/session:hidden">
+                              {formatTime(session.lastActiveAt)}
+                            </span>
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                setArchivedIds((prev) => new Set(prev).add(session.id));
+                                setProjectData((prev) =>
+                                  prev.map((p) =>
+                                    p.id === project.id
+                                      ? {
+                                          ...p,
+                                          sessions: p.sessions.filter(
+                                            (s) => s.id !== session.id
+                                          ),
+                                        }
+                                      : p
+                                  )
+                                );
+                                toast.success("Session archived");
+                                await archiveSession(project.id, session.id);
+                              }}
+                              className="hidden shrink-0 rounded p-0.5 text-muted-foreground hover:text-sidebar-foreground transition-colors group-hover/session:inline-flex"
+                              title="Archive session"
+                            >
+                              <Archive className="h-3.5 w-3.5" />
+                            </span>
+                          </button>
+                        </div>
                       ))
                     )}
                   </div>
