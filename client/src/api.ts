@@ -12,6 +12,7 @@ export interface Session {
   title?: string;
   workingDirectory: string;
   model: string;
+  provider?: string;
   messages: unknown[];
   createdAt: string;
   lastActiveAt: string;

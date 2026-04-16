@@ -88,6 +88,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       title,
       workingDirectory: projectPath,
       model: model ?? "",
+      provider: providerId,
       messages: [],
       createdAt: new Date().toISOString(),
       lastActiveAt: new Date().toISOString(),

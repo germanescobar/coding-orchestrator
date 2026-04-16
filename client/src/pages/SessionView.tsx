@@ -8,6 +8,7 @@ import {
   fetchEvents,
   fetchModels,
   fetchAgentProviders,
+  fetchSession,
   startSession,
   type Project,
   type AgentEvent,
@@ -418,8 +419,16 @@ export function SessionView({
       .catch(() => {});
   }, []);
 
+  // When loading an existing session, lock the provider to what was used originally
   useEffect(() => {
     if (sessionId) {
+      fetchSession(projectId, sessionId)
+        .then((session) => {
+          if (session.provider) {
+            setSelectedProvider(session.provider);
+          }
+        })
+        .catch(() => {});
       fetchEvents(projectId, sessionId)
         .then((evts) => {
           setEvents(evts);
@@ -724,11 +733,14 @@ export function SessionView({
                   <div className="relative" ref={providerPickerRef}>
                     <button
                       type="button"
-                      onClick={() => setShowProviderPicker(!showProviderPicker)}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                      onClick={() => !sessionId && setShowProviderPicker(!showProviderPicker)}
+                      disabled={!!sessionId}
+                      className={`flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground transition-colors ${
+                        sessionId ? "opacity-50 cursor-not-allowed" : "hover:bg-accent hover:text-foreground"
+                      }`}
                     >
                       {agentProviders.find((p) => p.id === selectedProvider)?.name ?? selectedProvider}
-                      <ChevronDown className="h-3 w-3" />
+                      {!sessionId && <ChevronDown className="h-3 w-3" />}
                     </button>
                     {showProviderPicker && (
                       <div className="absolute bottom-full left-0 mb-1 w-40 rounded-lg border border-border bg-popover p-1 shadow-lg">
