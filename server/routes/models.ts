@@ -98,7 +98,26 @@ const PROVIDER_FETCHERS: Record<
   openai: fetchOpenAIModels,
 };
 
-modelsRouter.get("/", async (_req, res) => {
+/** Well-known models available through Codex CLI (user authenticates separately). */
+function getCodexModels(): Model[] {
+  return [
+    { id: "gpt-5.4", name: "GPT-5.4", provider: "codex", size: "flagship" },
+    { id: "gpt-5.4-mini", name: "GPT-5.4 Mini", provider: "codex", size: "fast" },
+    { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", provider: "codex", size: "coding" },
+    { id: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark", provider: "codex", size: "real-time" },
+    { id: "gpt-5.2", name: "GPT-5.2", provider: "codex", size: "" },
+  ];
+}
+
+modelsRouter.get("/", async (req, res) => {
+  const agent = (req.query.agent as string) || "ada";
+
+  if (agent === "codex") {
+    res.json(getCodexModels());
+    return;
+  }
+
+  // Default: Ada models (ollama + configured API providers)
   const modelLists = await Promise.all([
     fetchOllamaModels(),
     ...PROVIDERS.map(async (p) => {

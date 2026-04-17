@@ -12,6 +12,7 @@ export interface Session {
   title?: string;
   workingDirectory: string;
   model: string;
+  provider?: string;
   messages: unknown[];
   createdAt: string;
   lastActiveAt: string;
@@ -112,6 +113,16 @@ export async function fetchSession(
   return res.json();
 }
 
+export async function archiveSession(
+  projectId: string,
+  sessionId: string
+): Promise<void> {
+  await fetch(
+    `${BASE}/projects/${projectId}/sessions/${sessionId}/archive`,
+    { method: "POST" }
+  );
+}
+
 export async function fetchEvents(
   projectId: string,
   sessionId: string
@@ -136,8 +147,19 @@ export interface ProviderStatus {
   hint: string | null;
 }
 
-export async function fetchModels(): Promise<Model[]> {
-  const res = await fetch(`${BASE}/models`);
+export interface AgentProviderInfo {
+  id: string;
+  name: string;
+}
+
+export async function fetchAgentProviders(): Promise<AgentProviderInfo[]> {
+  const res = await fetch(`${BASE}/agent-providers`);
+  return res.json();
+}
+
+export async function fetchModels(agent?: string): Promise<Model[]> {
+  const params = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  const res = await fetch(`${BASE}/models${params}`);
   return res.json();
 }
 
@@ -164,11 +186,12 @@ export async function deleteProviderKey(providerId: string): Promise<void> {
 export function startSession(
   projectId: string,
   message: string,
-  options?: { resumeSessionId?: string; model?: string }
+  options?: { resumeSessionId?: string; model?: string; provider?: string }
 ): EventSource {
   const params = new URLSearchParams({ message });
   if (options?.resumeSessionId) params.set("resumeSessionId", options.resumeSessionId);
   if (options?.model) params.set("model", options.model);
+  if (options?.provider) params.set("provider", options.provider);
   return new EventSource(
     `${BASE}/projects/${projectId}/sessions/stream?${params}`
   );

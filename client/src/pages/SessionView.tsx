@@ -7,9 +7,12 @@ import { Badge } from "@/components/ui/badge";
 import {
   fetchEvents,
   fetchModels,
+  fetchAgentProviders,
+  fetchSession,
   startSession,
   type Project,
   type AgentEvent,
+  type AgentProviderInfo,
   type Model,
   type SessionStreamEvent,
 } from "../api.ts";
@@ -391,25 +394,45 @@ export function SessionView({
   const [models, setModels] = useState<Model[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [agentProviders, setAgentProviders] = useState<AgentProviderInfo[]>([]);
+  const [selectedProvider, setSelectedProvider] = useState<string>("ada");
+  const [providerResolved, setProviderResolved] = useState(!sessionId);
+  const [showProviderPicker, setShowProviderPicker] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
+  const providerPickerRef = useRef<HTMLDivElement>(null);
 
-  const loadModels = () => {
-    fetchModels()
+  const loadModels = (provider?: string) => {
+    fetchModels(provider ?? selectedProvider)
       .then((m) => {
         setModels(m);
-        if (m.length > 0 && !selectedModel) {
-          setSelectedModel(m[0].id);
-        }
+        setSelectedModel(m.length > 0 ? m[0].id : "");
       })
       .catch(() => {});
   };
 
-  useEffect(loadModels, []);
+  useEffect(() => {
+    if (providerResolved) loadModels(selectedProvider);
+  }, [selectedProvider, providerResolved]);
 
   useEffect(() => {
+    fetchAgentProviders()
+      .then((p) => setAgentProviders(p))
+      .catch(() => {});
+  }, []);
+
+  // When loading an existing session, lock the provider to what was used originally
+  useEffect(() => {
     if (sessionId) {
+      fetchSession(projectId, sessionId)
+        .then((session) => {
+          if (session.provider) {
+            setSelectedProvider(session.provider);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setProviderResolved(true));
       fetchEvents(projectId, sessionId)
         .then((evts) => {
           setEvents(evts);
@@ -420,6 +443,7 @@ export function SessionView({
     } else {
       setEvents([]);
       setStreamItems([]);
+      setProviderResolved(true);
     }
   }, [projectId, sessionId]);
 
@@ -434,6 +458,12 @@ export function SessionView({
         !modelPickerRef.current.contains(e.target as Node)
       ) {
         setShowModelPicker(false);
+      }
+      if (
+        providerPickerRef.current &&
+        !providerPickerRef.current.contains(e.target as Node)
+      ) {
+        setShowProviderPicker(false);
       }
     };
     document.addEventListener("mousedown", handleClick);
@@ -455,6 +485,7 @@ export function SessionView({
     const es = startSession(projectId, sentMessage, {
       resumeSessionId: sessionId,
       model: selectedModel || undefined,
+      provider: selectedProvider || undefined,
     });
 
     es.onmessage = (event) => {
@@ -506,7 +537,7 @@ export function SessionView({
             { type: "error", text: adaEvent.error },
           ]);
         } else if (adaEvent.type === "run.completed") {
-          detectedSessionId = adaEvent.sessionId;
+          if (adaEvent.sessionId) detectedSessionId = adaEvent.sessionId;
           if (adaEvent.status === "max_iterations" || adaEvent.stopReason === "max_turns") {
             setStreamItems((prev) => [
               ...prev,
@@ -526,7 +557,9 @@ export function SessionView({
           fetchEvents(projectId, detectedSessionId)
             .then((evts) => {
               setEvents(evts);
-              if (!runFailed && (data.exitCode ?? 1) === 0) {
+              // Only clear stream items if persisted events were loaded
+              // (Codex doesn't write to Ada's event store)
+              if (evts.length > 0 && !runFailed && (data.exitCode ?? 1) === 0) {
                 setStreamItems([]);
               }
             })
@@ -701,11 +734,48 @@ export function SessionView({
               />
               <div className="mt-2 flex items-center justify-between">
                 <div className="flex items-center gap-2">
+                  {/* Agent provider picker */}
+                  <div className="relative" ref={providerPickerRef}>
+                    <button
+                      type="button"
+                      onClick={() => !sessionId && setShowProviderPicker(!showProviderPicker)}
+                      disabled={!!sessionId}
+                      className={`flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground transition-colors ${
+                        sessionId ? "opacity-50 cursor-not-allowed" : "hover:bg-accent hover:text-foreground"
+                      }`}
+                    >
+                      {agentProviders.find((p) => p.id === selectedProvider)?.name ?? selectedProvider}
+                      {!sessionId && <ChevronDown className="h-3 w-3" />}
+                    </button>
+                    {showProviderPicker && (
+                      <div className="absolute bottom-full left-0 mb-1 w-40 rounded-lg border border-border bg-popover p-1 shadow-lg">
+                        {agentProviders.map((p) => (
+                          <button
+                            key={p.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedProvider(p.id);
+                              setShowProviderPicker(false);
+                            }}
+                            className={`flex w-full items-center rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                              selectedProvider === p.id
+                                ? "bg-accent text-accent-foreground"
+                                : "text-popover-foreground hover:bg-accent"
+                            }`}
+                          >
+                            {p.name}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <span className="text-muted-foreground/40">|</span>
+                  {/* Model picker */}
                   <div className="relative" ref={modelPickerRef}>
                     <button
                       type="button"
                       onClick={() => {
-                        if (!showModelPicker && models.length === 0) loadModels();
+                        if (!showModelPicker && models.length === 0) loadModels(selectedProvider);
                         setShowModelPicker(!showModelPicker);
                       }}
                       className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
