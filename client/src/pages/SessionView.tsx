@@ -396,6 +396,7 @@ export function SessionView({
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [agentProviders, setAgentProviders] = useState<AgentProviderInfo[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<string>("ada");
+  const [providerResolved, setProviderResolved] = useState(!sessionId);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -411,7 +412,9 @@ export function SessionView({
       .catch(() => {});
   };
 
-  useEffect(() => loadModels(selectedProvider), [selectedProvider]);
+  useEffect(() => {
+    if (providerResolved) loadModels(selectedProvider);
+  }, [selectedProvider, providerResolved]);
 
   useEffect(() => {
     fetchAgentProviders()
@@ -428,7 +431,8 @@ export function SessionView({
             setSelectedProvider(session.provider);
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => setProviderResolved(true));
       fetchEvents(projectId, sessionId)
         .then((evts) => {
           setEvents(evts);
@@ -439,6 +443,7 @@ export function SessionView({
     } else {
       setEvents([]);
       setStreamItems([]);
+      setProviderResolved(true);
     }
   }, [projectId, sessionId]);
 
