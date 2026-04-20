@@ -680,6 +680,36 @@ export function SessionView({
             {project?.name ?? "Project"}
           </h1>
         </div>
+
+        {/* Mobile: Agent/Terminal tabs in header */}
+        {sessionId && (
+          <div className="flex items-center gap-1 md:hidden">
+            <button
+              onClick={() => setMobilePanel("agent")}
+              className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                mobilePanel === "agent"
+                  ? "bg-accent text-foreground"
+                  : "text-muted-foreground"
+              }`}
+            >
+              <MessageSquare className="h-3 w-3" />
+              Agent
+            </button>
+            <button
+              onClick={() => setMobilePanel("terminal")}
+              className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                mobilePanel === "terminal"
+                  ? "bg-accent text-foreground"
+                  : "text-muted-foreground"
+              }`}
+            >
+              <TerminalSquare className="h-3 w-3" />
+              Terminal
+            </button>
+          </div>
+        )}
+
+        {/* Desktop: path + terminal toggle */}
         <div className="hidden md:flex items-center gap-2">
           {project && (
             <span className="font-mono text-xs text-muted-foreground truncate max-w-64">
@@ -702,38 +732,10 @@ export function SessionView({
         </div>
       </header>
 
-      {/* Mobile tab bar — only shown when a session is active */}
-      {sessionId && (
-        <div className="flex shrink-0 items-center gap-1 border-b border-border bg-background px-2 py-1 md:hidden">
-          <button
-            onClick={() => setMobilePanel("agent")}
-            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
-              mobilePanel === "agent"
-                ? "bg-accent text-foreground"
-                : "text-muted-foreground"
-            }`}
-          >
-            <MessageSquare className="h-3.5 w-3.5" />
-            Agent
-          </button>
-          <button
-            onClick={() => setMobilePanel("terminal")}
-            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
-              mobilePanel === "terminal"
-                ? "bg-accent text-foreground"
-                : "text-muted-foreground"
-            }`}
-          >
-            <TerminalSquare className="h-3.5 w-3.5" />
-            Terminal
-          </button>
-        </div>
-      )}
-
       {/* Main content area: chat + terminal side by side on desktop, tabbed on mobile */}
       <div className="flex flex-1 min-h-0">
         {/* Chat panel — hidden on mobile when terminal tab is active */}
-        <div className={`flex-col min-h-0 min-w-0 ${
+        <div className={`flex-col min-h-0 min-w-0 w-full ${
           sessionId && mobilePanel === "terminal" ? "hidden md:flex" : "flex"
         } ${sessionId && terminalOpen ? "md:w-1/2 md:border-r md:border-border" : "flex-1"}`}>
           {/* Messages / Events area */}
