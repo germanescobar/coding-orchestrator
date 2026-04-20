@@ -1,10 +1,14 @@
 import express from "express";
 import cors from "cors";
+import http from "node:http";
+import { WebSocketServer, WebSocket } from "ws";
 import { projectsRouter } from "./routes/projects.js";
 import { sessionsRouter } from "./routes/sessions.js";
 import { modelsRouter } from "./routes/models.js";
 import { apiKeysRouter } from "./routes/api-keys.js";
 import { getAgentProviders } from "./lib/agents.js";
+import { getProject } from "./lib/projects.js";
+import { ptyManager } from "./lib/pty-manager.js";
 
 const app = express();
 app.use(cors());
@@ -21,7 +25,68 @@ app.get("/api/agent-providers", (_req, res) => {
   res.json(providers);
 });
 
+const server = http.createServer(app);
+
+// WebSocket server for terminal connections
+const wss = new WebSocketServer({ server, path: "/ws/terminal" });
+
+wss.on("connection", (ws: WebSocket) => {
+  let sessionId: string | null = null;
+  let unsubscribe: (() => void) | null = null;
+
+  ws.on("message", async (raw: Buffer) => {
+    let msg: { type: string; [key: string]: unknown };
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.type === "attach") {
+      const sid = msg.sessionId as string;
+      const projectId = msg.projectId as string;
+      if (!sid || !projectId) return;
+
+      const project = await getProject(projectId);
+      if (!project) {
+        ws.send(JSON.stringify({ type: "error", message: "Project not found" }));
+        return;
+      }
+
+      sessionId = sid;
+      const result = ptyManager.getOrCreate(sid, project.path);
+
+      if (result.error) {
+        ws.send(JSON.stringify({ type: "error", message: `Failed to spawn terminal: ${result.error}` }));
+        return;
+      }
+
+      // Send buffered output so the terminal restores its state
+      if (result.buffer) {
+        ws.send(JSON.stringify({ type: "output", data: result.buffer }));
+      }
+
+      // Forward new PTY output to this WebSocket client
+      unsubscribe = ptyManager.onData(sid, (data: string) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "output", data }));
+        }
+      });
+
+      ws.send(JSON.stringify({ type: "attached" }));
+    } else if (msg.type === "input" && sessionId) {
+      ptyManager.write(sessionId, msg.data as string);
+    } else if (msg.type === "resize" && sessionId) {
+      ptyManager.resize(sessionId, msg.cols as number, msg.rows as number);
+    }
+  });
+
+  ws.on("close", () => {
+    unsubscribe?.();
+  });
+});
+
 const PORT = 3100;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });

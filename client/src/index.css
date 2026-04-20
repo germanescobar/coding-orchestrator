@@ -130,3 +130,37 @@
     @apply font-sans;
     }
 }
+
+/* Terminal panel padding and touch scrolling */
+.terminal-panel .xterm-screen {
+  padding: 8px 12px;
+}
+
+.terminal-panel .xterm-viewport {
+  overscroll-behavior: contain;
+}
+
+/* Terminal mobile controls — hidden on desktop, shown on touch/small screens */
+.terminal-mobile-controls {
+  display: none;
+}
+
+@media (pointer: coarse), (max-width: 767px) {
+  .terminal-panel .xterm-viewport {
+    touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .terminal-mobile-controls {
+    display: block;
+  }
+}
+
+/* Terminal key buttons: compact touch targets for the toolbar */
+.terminal-key-btn {
+  min-height: 36px !important;
+  min-width: unset !important;
+  height: 36px;
+  line-height: 1;
+  font-size: 0.8125rem;
+}

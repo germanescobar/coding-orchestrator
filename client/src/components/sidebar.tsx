@@ -30,6 +30,7 @@ interface SidebarProps {
   projects: Project[];
   activeProjectId: string | null;
   activeSessionId?: string;
+  completedSessions?: Set<string>;
   onSelectProject: (projectId: string) => void;
   onSelectSession: (projectId: string, sessionId: string) => void;
   onNewThread: (projectId: string) => void;
@@ -53,6 +54,7 @@ export function Sidebar({
   onNewProject,
   onProjectsChanged,
   onSettings,
+  completedSessions,
 }: SidebarProps) {
   const [projectData, setProjectData] = useState<ProjectWithSessions[]>([]);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(new Set());
@@ -205,6 +207,9 @@ export function Sidebar({
                               <span className="truncate">
                                 {session.title || session.id.slice(0, 8)}
                               </span>
+                              {completedSessions?.has(session.id) && (
+                                <span className="h-2 w-2 shrink-0 rounded-full bg-green-500" />
+                              )}
                             </span>
                             <span className="shrink-0 text-xs text-muted-foreground group-hover/session:hidden">
                               {formatTime(session.lastActiveAt)}

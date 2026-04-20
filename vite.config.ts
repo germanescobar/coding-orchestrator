@@ -17,6 +17,10 @@ export default defineConfig({
     port: 4500,
     proxy: {
       "/api": "http://localhost:3100",
+      "/ws": {
+        target: "http://localhost:3100",
+        ws: true,
+      },
     },
   },
   build: {

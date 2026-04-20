@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { Menu, X } from "lucide-react";
+import { toast } from "sonner";
 import { fetchProjects, type Project } from "./api.ts";
 import { Sidebar } from "./components/sidebar.tsx";
 import { SettingsDialog } from "./components/settings-dialog.tsx";
@@ -28,6 +29,7 @@ export function App() {
   });
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [completedSessions, setCompletedSessions] = useState<Set<string>>(new Set());
 
   const setView = (v: View) => {
     setViewState(v);
@@ -51,6 +53,12 @@ export function App() {
   const handleSelectSession = (projectId: string, sessionId: string) => {
     setActiveProjectId(projectId);
     setView({ page: "session", projectId, sessionId });
+    setCompletedSessions((prev) => {
+      if (!prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(sessionId);
+      return next;
+    });
     closeSidebar();
   };
 
@@ -86,6 +94,7 @@ export function App() {
           projects={projects}
           activeProjectId={activeProjectId}
           activeSessionId={view.page === "session" ? view.sessionId : undefined}
+          completedSessions={completedSessions}
           onSelectProject={handleSelectProject}
           onSelectSession={handleSelectSession}
           onNewThread={handleNewThread}
@@ -143,8 +152,18 @@ export function App() {
             project={projects.find((p) => p.id === view.projectId)}
             onSessionCreated={(sessionId) => {
               setView({ page: "session", projectId: view.projectId, sessionId });
-              // Bump projects to trigger sidebar session refresh
               loadProjects();
+            }}
+            onBackgroundComplete={(sessionId) => {
+              setCompletedSessions((prev) => new Set(prev).add(sessionId));
+              loadProjects();
+              toast.success("Session completed", {
+                description: "A background session has finished.",
+                action: {
+                  label: "View",
+                  onClick: () => handleSelectSession(view.projectId, sessionId),
+                },
+              });
             }}
           />
         )}

@@ -190,7 +190,7 @@ export function startSession(
 ): EventSource {
   const params = new URLSearchParams({ message });
   if (options?.resumeSessionId) params.set("resumeSessionId", options.resumeSessionId);
-  if (options?.model) params.set("model", options.model);
+  if (options?.model != null) params.set("model", options.model);
   if (options?.provider) params.set("provider", options.provider);
   return new EventSource(
     `${BASE}/projects/${projectId}/sessions/stream?${params}`

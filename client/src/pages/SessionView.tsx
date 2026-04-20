@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from "react";
-import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight } from "lucide-react";
+import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Terminal, type TerminalHandle } from "@/components/terminal";
+import { TerminalMobileControls } from "@/components/terminal-mobile-controls";
 import {
   fetchEvents,
   fetchModels,
@@ -22,6 +24,7 @@ interface SessionViewProps {
   sessionId?: string;
   project?: Project;
   onSessionCreated: (sessionId: string) => void;
+  onBackgroundComplete?: (sessionId: string) => void;
 }
 
 type StreamItem =
@@ -384,6 +387,7 @@ export function SessionView({
   sessionId,
   project,
   onSessionCreated,
+  onBackgroundComplete,
 }: SessionViewProps) {
   const [message, setMessage] = useState("");
   const [pendingMessage, setPendingMessage] = useState<string | null>(null);
@@ -398,16 +402,26 @@ export function SessionView({
   const [selectedProvider, setSelectedProvider] = useState<string>("ada");
   const [providerResolved, setProviderResolved] = useState(!sessionId);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(true);
+  const [mobilePanel, setMobilePanel] = useState<"agent" | "terminal">("agent");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<TerminalHandle | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const providerPickerRef = useRef<HTMLDivElement>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const currentSessionIdRef = useRef(sessionId);
+  const sendContextRef = useRef<{ sessionId: string | undefined; projectId: string } | null>(null);
 
   const loadModels = (provider?: string) => {
     fetchModels(provider ?? selectedProvider)
       .then((m) => {
         setModels(m);
-        setSelectedModel(m.length > 0 ? m[0].id : "");
+        // Only reset to the first model if the current selection isn't in the list
+        setSelectedModel((prev) => {
+          if (prev && m.some((model) => model.id === prev)) return prev;
+          return m.length > 0 ? m[0].id : "";
+        });
       })
       .catch(() => {});
   };
@@ -422,13 +436,15 @@ export function SessionView({
       .catch(() => {});
   }, []);
 
-  // When loading an existing session, lock the provider to what was used originally
+  // When loading an existing session, restore the provider and model that were used
   useEffect(() => {
     if (sessionId) {
+      setProviderResolved(false);
       fetchSession(projectId, sessionId)
         .then((session) => {
-          if (session.provider) {
-            setSelectedProvider(session.provider);
+          setSelectedProvider(session.provider || "ada");
+          if (session.model) {
+            setSelectedModel(session.model);
           }
         })
         .catch(() => {})
@@ -446,6 +462,31 @@ export function SessionView({
       setProviderResolved(true);
     }
   }, [projectId, sessionId]);
+
+  // Track current session and manage stream visibility on session switch
+  useEffect(() => {
+    const prevSessionId = currentSessionIdRef.current;
+    currentSessionIdRef.current = sessionId;
+
+    if (eventSourceRef.current && sendContextRef.current) {
+      if (sessionId !== sendContextRef.current.sessionId) {
+        // Navigated away from the streaming session — hide streaming UI
+        setStreaming(false);
+        setPendingMessage(null);
+        setStreamItems([]);
+      } else if (prevSessionId !== sessionId) {
+        // Navigated back to the streaming session — restore indicator
+        setStreaming(true);
+      }
+    }
+  }, [sessionId]);
+
+  // Cleanup EventSource on unmount
+  useEffect(() => {
+    return () => {
+      eventSourceRef.current?.close();
+    };
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -482,18 +523,26 @@ export function SessionView({
     let detectedSessionId = sessionId;
     let runFailed = false;
 
+    // Track which session this stream belongs to
+    sendContextRef.current = { sessionId, projectId };
+
     const es = startSession(projectId, sentMessage, {
       resumeSessionId: sessionId,
-      model: selectedModel || undefined,
+      model: selectedModel,
       provider: selectedProvider || undefined,
     });
+    eventSourceRef.current = es;
+
+    // Check if the user is still viewing the session this stream belongs to
+    const isVisible = () =>
+      currentSessionIdRef.current === sendContextRef.current?.sessionId;
 
     es.onmessage = (event) => {
       const data = JSON.parse(event.data) as SessionStreamEvent;
       if (data.type === "started" || data.type === "stderr") {
         if (data.type === "stderr") {
           const text = data.text.trim();
-          if (text) {
+          if (text && isVisible()) {
             setStreamItems((prev) => [...prev, { type: "error", text }]);
           }
         }
@@ -502,43 +551,49 @@ export function SessionView({
         if (adaEvent.type === "run.started") {
           detectedSessionId = adaEvent.sessionId;
         } else if (adaEvent.type === "assistant.text") {
-          if (adaEvent.text) {
+          if (adaEvent.text && isVisible()) {
             setStreamItems((prev) => [
               ...prev,
               { type: "assistant", text: adaEvent.text },
             ]);
           }
         } else if (adaEvent.type === "assistant.reasoning") {
-          if (adaEvent.text) {
+          if (adaEvent.text && isVisible()) {
             setStreamItems((prev) => [
               ...prev,
               { type: "reasoning", text: adaEvent.text },
             ]);
           }
         } else if (adaEvent.type === "tool.call") {
-          setStreamItems((prev) => [
-            ...prev,
-            { type: "tool_call", name: adaEvent.name, input: adaEvent.input },
-          ]);
+          if (isVisible()) {
+            setStreamItems((prev) => [
+              ...prev,
+              { type: "tool_call", name: adaEvent.name, input: adaEvent.input },
+            ]);
+          }
         } else if (adaEvent.type === "tool.result") {
-          setStreamItems((prev) => [
-            ...prev,
-            {
-              type: "tool_result",
-              name: adaEvent.name,
-              content: adaEvent.content,
-              isError: adaEvent.isError,
-            },
-          ]);
+          if (isVisible()) {
+            setStreamItems((prev) => [
+              ...prev,
+              {
+                type: "tool_result",
+                name: adaEvent.name,
+                content: adaEvent.content,
+                isError: adaEvent.isError,
+              },
+            ]);
+          }
         } else if (adaEvent.type === "run.failed") {
           runFailed = true;
-          setStreamItems((prev) => [
-            ...prev,
-            { type: "error", text: adaEvent.error },
-          ]);
+          if (isVisible()) {
+            setStreamItems((prev) => [
+              ...prev,
+              { type: "error", text: adaEvent.error },
+            ]);
+          }
         } else if (adaEvent.type === "run.completed") {
           if (adaEvent.sessionId) detectedSessionId = adaEvent.sessionId;
-          if (adaEvent.status === "max_iterations" || adaEvent.stopReason === "max_turns") {
+          if ((adaEvent.status === "max_iterations" || adaEvent.stopReason === "max_turns") && isVisible()) {
             setStreamItems((prev) => [
               ...prev,
               {
@@ -550,36 +605,53 @@ export function SessionView({
         }
       } else if (data.type === "done") {
         es.close();
-        setStreaming(false);
-        setPendingMessage(null);
-        if (detectedSessionId) {
-          onSessionCreated(detectedSessionId);
-          fetchEvents(projectId, detectedSessionId)
-            .then((evts) => {
-              setEvents(evts);
-              // Only clear stream items if persisted events were loaded
-              // (Codex doesn't write to Ada's event store)
-              if (evts.length > 0 && !runFailed && (data.exitCode ?? 1) === 0) {
-                setStreamItems([]);
-              }
-            })
-            .catch(() => {
-              // Keep any streamed content visible if events fail to load.
-            });
+        eventSourceRef.current = null;
+        const wasVisible = isVisible();
+        sendContextRef.current = null;
+
+        if (wasVisible) {
+          setStreaming(false);
+          setPendingMessage(null);
+          if (detectedSessionId) {
+            onSessionCreated(detectedSessionId);
+            fetchEvents(projectId, detectedSessionId)
+              .then((evts) => {
+                setEvents(evts);
+                if (evts.length > 0 && !runFailed && (data.exitCode ?? 1) === 0) {
+                  setStreamItems([]);
+                }
+              })
+              .catch(() => {});
+          }
+        } else {
+          // Stream completed while user was viewing another session
+          if (detectedSessionId && onBackgroundComplete) {
+            onBackgroundComplete(detectedSessionId);
+          }
         }
       } else if (data.type === "error") {
         const text = data.text.trim();
-        setStreamItems((prev) => [...prev, { type: "error", text }]);
         es.close();
-        setStreaming(false);
-        setPendingMessage(null);
+        eventSourceRef.current = null;
+        const wasVisible = isVisible();
+        sendContextRef.current = null;
+        if (wasVisible) {
+          setStreamItems((prev) => [...prev, { type: "error", text }]);
+          setStreaming(false);
+          setPendingMessage(null);
+        }
       }
     };
 
     es.onerror = () => {
+      const wasVisible = isVisible();
       es.close();
-      setStreaming(false);
-      setPendingMessage(null);
+      eventSourceRef.current = null;
+      sendContextRef.current = null;
+      if (wasVisible) {
+        setStreaming(false);
+        setPendingMessage(null);
+      }
     };
   };
 
@@ -614,239 +686,303 @@ export function SessionView({
               {project.path}
             </span>
           )}
+          {sessionId && (
+            <button
+              onClick={() => setTerminalOpen(!terminalOpen)}
+              className={`ml-2 rounded-md p-1.5 transition-colors ${
+                terminalOpen
+                  ? "bg-accent text-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
+              }`}
+              title={terminalOpen ? "Hide terminal" : "Show terminal"}
+            >
+              <TerminalSquare className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </header>
 
-      {/* Messages / Events area */}
-      <div className="flex-1 overflow-y-auto min-h-0">
-        <div className="mx-auto max-w-3xl px-3 py-4 md:px-4 md:py-6">
-          {!sessionId && events.length === 0 && streamItems.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-20">
-              <h2 className="text-lg font-medium text-muted-foreground">
-                Start a new thread
-              </h2>
-              <p className="mt-1 text-sm text-muted-foreground/70">
-                Send a message to begin working with the coding agent
-              </p>
-            </div>
-          )}
-
-          {/* Event timeline */}
-          <div className="space-y-4">
-            {events.map((event) => (
-              <EventBlock
-                key={event.id}
-                event={event}
-                copiedId={copiedId}
-                onCopy={copyEventData}
-              />
-            ))}
-          </div>
-
-          {/* Pending user message */}
-          {pendingMessage && (
-            <div className="flex justify-end mt-4">
-              <div className="max-w-[85%] rounded-2xl bg-secondary px-4 py-3 text-sm">
-                {pendingMessage}
-              </div>
-            </div>
-          )}
-
-          {/* Stream output */}
-          {streamItems.length > 0 && (
-            <div className="mt-4 space-y-3">
-              {streamItems.map((item, i) => {
-                if (item.type === "assistant") {
-                  return <AssistantBlock key={i} text={item.text} />;
-                }
-
-                if (item.type === "reasoning") {
-                  return <ReasoningBlock key={i} text={item.text} />;
-                }
-
-                if (item.type === "tool_call") {
-                  const inputPreview = Object.entries(item.input)
-                    .map(([k, v]) => {
-                      const val = typeof v === "string" ? v : JSON.stringify(v);
-                      return `${k}: ${val.length > 60 ? val.slice(0, 60) + "..." : val}`;
-                    })
-                    .join(", ");
-
-                  return (
-                    <LiveToolCallBlock
-                      key={i}
-                      input={item.input}
-                      inputPreview={inputPreview}
-                      tool={item.name}
-                    />
-                  );
-                }
-
-                if (item.type === "tool_result") {
-                  return (
-                    <LiveToolResultBlock
-                      key={i}
-                      content={item.content}
-                      isError={item.isError}
-                      tool={item.name}
-                    />
-                  );
-                }
-
-                if (item.type === "error") {
-                  return <ErrorBlock key={i} text={item.text} />;
-                }
-
-                return null;
-              })}
-            </div>
-          )}
-
-          {streaming && (
-            <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              <span>Working...</span>
-            </div>
-          )}
-
-          <div ref={bottomRef} />
+      {/* Mobile tab bar — only shown when a session is active */}
+      {sessionId && (
+        <div className="flex shrink-0 items-center gap-1 border-b border-border bg-background px-2 py-1 md:hidden">
+          <button
+            onClick={() => setMobilePanel("agent")}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              mobilePanel === "agent"
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground"
+            }`}
+          >
+            <MessageSquare className="h-3.5 w-3.5" />
+            Agent
+          </button>
+          <button
+            onClick={() => setMobilePanel("terminal")}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              mobilePanel === "terminal"
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground"
+            }`}
+          >
+            <TerminalSquare className="h-3.5 w-3.5" />
+            Terminal
+          </button>
         </div>
-      </div>
+      )}
 
-      {/* Input */}
-      <div className="shrink-0 border-t border-border bg-background px-3 pb-3 pt-2 md:px-4 md:pb-4 md:pt-3">
-        <div className="mx-auto max-w-3xl">
-          <form onSubmit={handleSend}>
-            <div className="rounded-xl border border-border bg-input p-3">
-              <textarea
-                ref={textareaRef}
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={
-                  sessionId
-                    ? "Ask for follow-up changes"
-                    : "Describe what you want to build..."
-                }
-                rows={1}
-                disabled={streaming}
-                className="w-full resize-none bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
-              />
-              <div className="mt-2 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  {/* Agent provider picker */}
-                  <div className="relative" ref={providerPickerRef}>
-                    <button
-                      type="button"
-                      onClick={() => !sessionId && setShowProviderPicker(!showProviderPicker)}
-                      disabled={!!sessionId}
-                      className={`flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground transition-colors ${
-                        sessionId ? "opacity-50 cursor-not-allowed" : "hover:bg-accent hover:text-foreground"
-                      }`}
-                    >
-                      {agentProviders.find((p) => p.id === selectedProvider)?.name ?? selectedProvider}
-                      {!sessionId && <ChevronDown className="h-3 w-3" />}
-                    </button>
-                    {showProviderPicker && (
-                      <div className="absolute bottom-full left-0 mb-1 w-40 rounded-lg border border-border bg-popover p-1 shadow-lg">
-                        {agentProviders.map((p) => (
-                          <button
-                            key={p.id}
-                            type="button"
-                            onClick={() => {
-                              setSelectedProvider(p.id);
-                              setShowProviderPicker(false);
-                            }}
-                            className={`flex w-full items-center rounded-md px-3 py-2 text-sm text-left transition-colors ${
-                              selectedProvider === p.id
-                                ? "bg-accent text-accent-foreground"
-                                : "text-popover-foreground hover:bg-accent"
-                            }`}
-                          >
-                            {p.name}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <span className="text-muted-foreground/40">|</span>
-                  {/* Model picker */}
-                  <div className="relative" ref={modelPickerRef}>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (!showModelPicker && models.length === 0) loadModels(selectedProvider);
-                        setShowModelPicker(!showModelPicker);
-                      }}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
-                    >
-                      {selectedModelName || "Select model"}
-                      <ChevronDown className="h-3 w-3" />
-                    </button>
-                    {showModelPicker && (
-                      <div className="absolute bottom-full left-0 mb-1 w-96 max-h-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-lg">
-                        {models.length === 0 ? (
-                          <div className="px-3 py-2 text-xs text-muted-foreground">
-                            No models found. Check ollama or add API keys in Settings.
-                          </div>
-                        ) : (
-                          Object.entries(
-                            models.reduce<Record<string, Model[]>>((acc, m) => {
-                              const provider = m.provider || "ollama";
-                              if (!acc[provider]) acc[provider] = [];
-                              acc[provider].push(m);
-                              return acc;
-                            }, {})
-                          ).map(([provider, providerModels]) => (
-                            <div key={provider}>
-                              <div className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                                {provider}
-                              </div>
-                              {providerModels.map((model) => (
-                                <button
-                                  key={model.id}
-                                  type="button"
-                                  onClick={() => {
-                                    setSelectedModel(model.id);
-                                    setShowModelPicker(false);
-                                  }}
-                                  className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-left transition-colors ${
-                                    selectedModel === model.id
-                                      ? "bg-accent text-accent-foreground"
-                                      : "text-popover-foreground hover:bg-accent"
-                                  }`}
-                                >
-                                  <span className="font-mono text-xs">{model.name}</span>
-                                  {model.size && (
-                                    <span className="ml-auto text-xs text-muted-foreground">
-                                      {model.size}
-                                    </span>
-                                  )}
-                                </button>
-                              ))}
-                            </div>
-                          ))
-                        )}
-                      </div>
-                    )}
+      {/* Main content area: chat + terminal side by side on desktop, tabbed on mobile */}
+      <div className="flex flex-1 min-h-0">
+        {/* Chat panel — hidden on mobile when terminal tab is active */}
+        <div className={`flex-col min-h-0 min-w-0 ${
+          sessionId && mobilePanel === "terminal" ? "hidden md:flex" : "flex"
+        } ${sessionId && terminalOpen ? "md:w-1/2 md:border-r md:border-border" : "flex-1"}`}>
+          {/* Messages / Events area */}
+          <div className="flex-1 overflow-y-auto min-h-0">
+            <div className="mx-auto max-w-3xl px-3 py-4 md:px-4 md:py-6">
+              {!sessionId && events.length === 0 && streamItems.length === 0 && (
+                <div className="flex flex-col items-center justify-center py-20">
+                  <h2 className="text-lg font-medium text-muted-foreground">
+                    Start a new thread
+                  </h2>
+                  <p className="mt-1 text-sm text-muted-foreground/70">
+                    Send a message to begin working with the coding agent
+                  </p>
+                </div>
+              )}
+
+              {/* Event timeline */}
+              <div className="space-y-4">
+                {events.map((event) => (
+                  <EventBlock
+                    key={event.id}
+                    event={event}
+                    copiedId={copiedId}
+                    onCopy={copyEventData}
+                  />
+                ))}
+              </div>
+
+              {/* Pending user message */}
+              {pendingMessage && (
+                <div className="flex justify-end mt-4">
+                  <div className="max-w-[85%] rounded-2xl bg-secondary px-4 py-3 text-sm">
+                    {pendingMessage}
                   </div>
                 </div>
-                <Button
-                  type="submit"
-                  size="icon"
-                  disabled={streaming || !message.trim()}
-                  className="h-8 w-8 rounded-full bg-foreground text-background hover:bg-foreground/90"
-                >
-                  {streaming ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <ArrowUp className="h-4 w-4" />
-                  )}
-                </Button>
-              </div>
+              )}
+
+              {/* Stream output */}
+              {streamItems.length > 0 && (
+                <div className="mt-4 space-y-3">
+                  {streamItems.map((item, i) => {
+                    if (item.type === "assistant") {
+                      return <AssistantBlock key={i} text={item.text} />;
+                    }
+
+                    if (item.type === "reasoning") {
+                      return <ReasoningBlock key={i} text={item.text} />;
+                    }
+
+                    if (item.type === "tool_call") {
+                      const inputPreview = Object.entries(item.input)
+                        .map(([k, v]) => {
+                          const val = typeof v === "string" ? v : JSON.stringify(v);
+                          return `${k}: ${val.length > 60 ? val.slice(0, 60) + "..." : val}`;
+                        })
+                        .join(", ");
+
+                      return (
+                        <LiveToolCallBlock
+                          key={i}
+                          input={item.input}
+                          inputPreview={inputPreview}
+                          tool={item.name}
+                        />
+                      );
+                    }
+
+                    if (item.type === "tool_result") {
+                      return (
+                        <LiveToolResultBlock
+                          key={i}
+                          content={item.content}
+                          isError={item.isError}
+                          tool={item.name}
+                        />
+                      );
+                    }
+
+                    if (item.type === "error") {
+                      return <ErrorBlock key={i} text={item.text} />;
+                    }
+
+                    return null;
+                  })}
+                </div>
+              )}
+
+              {streaming && (
+                <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span>Working...</span>
+                </div>
+              )}
+
+              <div ref={bottomRef} />
             </div>
-          </form>
+          </div>
+
+          {/* Input */}
+          <div className="shrink-0 border-t border-border bg-background px-3 pb-3 pt-2 md:px-4 md:pb-4 md:pt-3">
+            <div className="mx-auto max-w-3xl">
+              <form onSubmit={handleSend}>
+                <div className="rounded-xl border border-border bg-input p-3">
+                  <textarea
+                    ref={textareaRef}
+                    value={message}
+                    onChange={(e) => setMessage(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    placeholder={
+                      sessionId
+                        ? "Ask for follow-up changes"
+                        : "Describe what you want to build..."
+                    }
+                    rows={1}
+                    disabled={streaming}
+                    className="w-full resize-none bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
+                  />
+                  <div className="mt-2 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      {/* Agent provider picker */}
+                      <div className="relative" ref={providerPickerRef}>
+                        <button
+                          type="button"
+                          onClick={() => !sessionId && setShowProviderPicker(!showProviderPicker)}
+                          disabled={!!sessionId}
+                          className={`flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground transition-colors ${
+                            sessionId ? "opacity-50 cursor-not-allowed" : "hover:bg-accent hover:text-foreground"
+                          }`}
+                        >
+                          {agentProviders.find((p) => p.id === selectedProvider)?.name ?? selectedProvider}
+                          {!sessionId && <ChevronDown className="h-3 w-3" />}
+                        </button>
+                        {showProviderPicker && (
+                          <div className="absolute bottom-full left-0 mb-1 w-40 rounded-lg border border-border bg-popover p-1 shadow-lg">
+                            {agentProviders.map((p) => (
+                              <button
+                                key={p.id}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedProvider(p.id);
+                                  setShowProviderPicker(false);
+                                }}
+                                className={`flex w-full items-center rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                                  selectedProvider === p.id
+                                    ? "bg-accent text-accent-foreground"
+                                    : "text-popover-foreground hover:bg-accent"
+                                }`}
+                              >
+                                {p.name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <span className="text-muted-foreground/40">|</span>
+                      {/* Model picker */}
+                      <div className="relative" ref={modelPickerRef}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!showModelPicker && models.length === 0) loadModels(selectedProvider);
+                            setShowModelPicker(!showModelPicker);
+                          }}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                        >
+                          {selectedModelName || "Select model"}
+                          <ChevronDown className="h-3 w-3" />
+                        </button>
+                        {showModelPicker && (
+                          <div className="absolute bottom-full left-0 mb-1 w-96 max-h-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-lg">
+                            {models.length === 0 ? (
+                              <div className="px-3 py-2 text-xs text-muted-foreground">
+                                No models found. Check ollama or add API keys in Settings.
+                              </div>
+                            ) : (
+                              Object.entries(
+                                models.reduce<Record<string, Model[]>>((acc, m) => {
+                                  const provider = m.provider || "ollama";
+                                  if (!acc[provider]) acc[provider] = [];
+                                  acc[provider].push(m);
+                                  return acc;
+                                }, {})
+                              ).map(([provider, providerModels]) => (
+                                <div key={provider}>
+                                  <div className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                                    {provider}
+                                  </div>
+                                  {providerModels.map((model) => (
+                                    <button
+                                      key={model.id}
+                                      type="button"
+                                      onClick={() => {
+                                        setSelectedModel(model.id);
+                                        setShowModelPicker(false);
+                                      }}
+                                      className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                                        selectedModel === model.id
+                                          ? "bg-accent text-accent-foreground"
+                                          : "text-popover-foreground hover:bg-accent"
+                                      }`}
+                                    >
+                                      <span className="font-mono text-xs">{model.name}</span>
+                                      {model.size && (
+                                        <span className="ml-auto text-xs text-muted-foreground">
+                                          {model.size}
+                                        </span>
+                                      )}
+                                    </button>
+                                  ))}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <Button
+                      type="submit"
+                      size="icon"
+                      disabled={streaming || !message.trim()}
+                      className="h-8 w-8 rounded-full bg-foreground text-background hover:bg-foreground/90"
+                    >
+                      {streaming ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <ArrowUp className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              </form>
+            </div>
+          </div>
         </div>
+
+        {/* Terminal panel — desktop: side panel; mobile: full screen when terminal tab active */}
+        {sessionId && (terminalOpen || mobilePanel === "terminal") && (
+          <div className={`flex flex-col min-h-0 min-w-0 overflow-hidden ${
+            mobilePanel === "terminal" ? "flex-1 md:w-1/2" : "hidden md:flex md:w-1/2"
+          }`}>
+            <div className="hidden md:flex h-9 shrink-0 items-center justify-between border-b border-border bg-[#1c1c1e] px-3">
+              <span className="text-xs font-medium text-muted-foreground">Terminal</span>
+            </div>
+            <div className="flex-1 min-h-0">
+              <Terminal ref={terminalRef} sessionId={sessionId} projectId={projectId} />
+            </div>
+            <TerminalMobileControls terminalRef={terminalRef} />
+          </div>
+        )}
       </div>
     </>
   );
