@@ -131,8 +131,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
         wsRef.current = null;
       }
 
+      term.writeln("\x1b[90mConnecting...\x1b[0m");
+
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws/terminal`);
+      // In dev, connect directly to the Express server (port 3100) to avoid
+      // Vite proxy issues with WebSocket upgrades from external devices.
+      const host = window.location.hostname;
+      const port = import.meta.env.DEV ? "3100" : window.location.port;
+      const wsUrl = `${protocol}//${host}:${port}/ws/terminal`;
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -155,6 +162,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
         const msg = JSON.parse(event.data);
         if (msg.type === "output") {
           term.write(msg.data);
+        } else if (msg.type === "error") {
+          term.writeln(`\x1b[31mError: ${msg.message}\x1b[0m`);
+        }
+      };
+
+      ws.onerror = () => {
+        term.writeln("\x1b[31mWebSocket connection failed.\x1b[0m");
+      };
+
+      ws.onclose = (event) => {
+        if (event.code !== 1000) {
+          term.writeln(`\x1b[31mConnection lost (code ${event.code}).\x1b[0m`);
         }
       };
 
