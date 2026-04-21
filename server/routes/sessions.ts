@@ -67,11 +67,11 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
 
   const projectPath = project.path;
 
-  /** Write the user message + create session file once we know the sessionId. */
+  /** Write the user message + create/update session file once we know the sessionId. */
   async function persistSessionStart(sessionId: string) {
     streamSessionId = sessionId;
-    // Write user message
-    if (!userMessageWritten) {
+    // Write user message (only for non-Ada providers that don't persist their own events)
+    if (shouldPersist && !userMessageWritten) {
       userMessageWritten = true;
       await appendEvent(projectPath, sessionId, {
         id: randomUUID(),
@@ -81,16 +81,17 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
         data: { text: message },
       });
     }
-    // Create or update session file
-    const title = message.length > 60 ? message.slice(0, 60) + "..." : message;
+    // Merge with existing session file (preserve title/createdAt from earlier messages)
+    const existing = await getSession(projectPath, sessionId);
+    const title = existing?.title || (message.length > 60 ? message.slice(0, 60) + "..." : message);
     await saveSession(projectPath, {
       id: sessionId,
       title,
       workingDirectory: projectPath,
-      model: model ?? "",
+      model: model ?? existing?.model ?? "",
       provider: providerId,
-      messages: [],
-      createdAt: new Date().toISOString(),
+      messages: existing?.messages ?? [],
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
       lastActiveAt: new Date().toISOString(),
       status: "active",
     });
@@ -117,7 +118,17 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     appendEvent(projectPath, streamSessionId, agentEvent).catch(() => {});
   }
 
-  res.write(`data: ${JSON.stringify({ type: "started" })}\n\n`);
+  // Track whether the SSE client is still connected so we avoid writing
+  // to a closed response while letting the child process finish its work.
+  let clientConnected = true;
+
+  function sseSend(obj: Record<string, unknown>) {
+    if (clientConnected) {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    }
+  }
+
+  sseSend({ type: "started" });
 
   // Forward stderr text and keep fallback approval handling for older prompts.
   child.stderr?.on("data", (data: Buffer) => {
@@ -132,7 +143,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       .trim();
     if (!filtered) return;
 
-    res.write(`data: ${JSON.stringify({ type: "stderr", text: filtered })}\n\n`);
+    sseSend({ type: "stderr", text: filtered });
 
     if (raw.includes("[y/n]")) {
       child.stdin?.write("y\n");
@@ -155,26 +166,22 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
         try {
           const event = provider.parseEvent(line);
           if (event) {
-            // Persist events for non-Ada providers
-            if (shouldPersist) {
-              if (event.type === "run.started") {
-                persistSessionStart(event.sessionId).catch(() => {});
-              } else if (event.type !== "run.completed" && event.type !== "run.failed") {
-                persistAgentEvent(event);
-              }
+            // Always persist session metadata on run.started so
+            // provider/model are available when loading any session.
+            // Only persist individual events for non-Ada providers.
+            if (event.type === "run.started") {
+              persistSessionStart(event.sessionId).catch(() => {});
+            } else if (shouldPersist && event.type !== "run.completed" && event.type !== "run.failed") {
+              persistAgentEvent(event);
             }
-            res.write(
-              `data: ${JSON.stringify({ type: "ada_event", event })}\n\n`
-            );
+            sseSend({ type: "ada_event", event });
           }
         } catch {
-          res.write(
-            `data: ${JSON.stringify({
-              type: "error",
-              text: `Failed to parse ${provider.name} stream JSON line.`,
-              raw: line,
-            })}\n\n`
-          );
+          sseSend({
+            type: "error",
+            text: `Failed to parse ${provider.name} stream JSON line.`,
+            raw: line,
+          });
         }
       }
 
@@ -191,18 +198,14 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
           if (shouldPersist && event.type !== "run.completed" && event.type !== "run.failed") {
             persistAgentEvent(event);
           }
-          res.write(
-            `data: ${JSON.stringify({ type: "ada_event", event })}\n\n`
-          );
+          sseSend({ type: "ada_event", event });
         }
       } catch {
-        res.write(
-          `data: ${JSON.stringify({
-            type: "error",
-            text: `Failed to parse final ${provider.name} stream JSON line.`,
-            raw: lastLine,
-          })}\n\n`
-        );
+        sseSend({
+          type: "error",
+          text: `Failed to parse final ${provider.name} stream JSON line.`,
+          raw: lastLine,
+        });
       }
     }
 
@@ -216,21 +219,21 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       }).catch(() => {});
     }
 
-    res.write(
-      `data: ${JSON.stringify({ type: "done", exitCode: code })}\n\n`
-    );
-    res.end();
+    sseSend({ type: "done", exitCode: code });
+    if (clientConnected) res.end();
   });
 
   child.on("error", (err) => {
-    res.write(
-      `data: ${JSON.stringify({ type: "error", text: err.message })}\n\n`
-    );
-    res.end();
+    sseSend({ type: "error", text: err.message });
+    if (clientConnected) res.end();
   });
 
+  // When the client disconnects (e.g. session switch drops the SSE
+  // connection), do NOT kill the child — let the agent finish its work.
+  // Events are persisted to disk and will be visible when the user
+  // navigates back to the session.
   req.on("close", () => {
-    child.kill();
+    clientConnected = false;
   });
 });
 

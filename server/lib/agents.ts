@@ -65,11 +65,13 @@ const adaProvider: AgentProvider = {
   name: "Ada",
 
   spawn({ message, cwd, env, resumeSessionId, model }) {
-    const cmdArgs = ["--stream-json", "--auto-approve"];
-    if (model) cmdArgs.push("--model", model);
+    const cmdArgs = ["--stream-json", "--auto-approve", "--model", model || ""];
 
     const args = ["chat", message];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
+
+    const fullCmd = `ada ${[...cmdArgs, ...args].join(" ")}`;
+    console.log(`[ada] ${fullCmd.slice(0, 100)}...`);
 
     return spawn("ada", [...cmdArgs, ...args], {
       cwd,
@@ -98,8 +100,7 @@ const codexProvider: AgentProvider = {
   spawn({ message, cwd, env, resumeSessionId, model }) {
     codexThreadId = "";
     // Flags must come before the prompt argument
-    const flags = ["--json", "--full-auto", "--skip-git-repo-check"];
-    if (model) flags.push("--model", model);
+    const flags = ["--json", "--full-auto", "--skip-git-repo-check", "--model", model || ""];
 
     let args: string[];
     if (resumeSessionId) {
@@ -107,6 +108,9 @@ const codexProvider: AgentProvider = {
     } else {
       args = ["exec", ...flags, message];
     }
+
+    const fullCmd = `codex ${args.join(" ")}`;
+    console.log(`[codex] ${fullCmd.slice(0, 100)}...`);
 
     return spawn("codex", args, {
       cwd,
