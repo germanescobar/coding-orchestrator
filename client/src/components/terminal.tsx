@@ -131,8 +131,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
         wsRef.current = null;
       }
 
-      term.writeln("\x1b[90mConnecting...\x1b[0m");
-
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       // In dev, connect directly to the Express server (port 3100) to avoid
       // Vite proxy issues with WebSocket upgrades from external devices.
