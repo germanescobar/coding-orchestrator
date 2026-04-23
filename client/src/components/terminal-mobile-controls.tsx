@@ -15,26 +15,11 @@ type MobileTerminalAction =
       kind: "input";
     };
 
-// Type | Esc Tab ↵ ⌫ | ← ↑ ↓ → | ^C ^D
+// Esc Tab ⌫ | ← ↑ ↓ → | ^C ^D
 const MOBILE_TERMINAL_ACTION_GROUPS: MobileTerminalAction[][] = [
-  [
-    {
-      id: "focus",
-      label: "Type",
-      title: "Focus the terminal keyboard",
-      kind: "focus",
-    },
-  ],
   [
     { id: "escape", label: "Esc", title: "Send Escape", kind: "input" },
     { id: "tab", label: "Tab", title: "Send Tab", kind: "input" },
-    {
-      id: "enter",
-      label: "Enter",
-      symbol: "\u21b5",
-      title: "Send Enter",
-      kind: "input",
-    },
     {
       id: "backspace",
       label: "Bksp",
