@@ -11,12 +11,16 @@ import {
   fetchModels,
   fetchAgentProviders,
   fetchSession,
+  fetchSessionRuntime,
   startSession,
+  submitSessionUserInput,
   type Project,
   type AgentEvent,
   type AgentProviderInfo,
   type Model,
+  type PlanStep,
   type SessionStreamEvent,
+  type UserInputQuestion,
 } from "../api.ts";
 
 interface SessionViewProps {
@@ -32,6 +36,10 @@ type StreamItem =
   | { type: "reasoning"; text: string }
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; name?: string; content: string; isError: boolean }
+  | { type: "plan_updated"; explanation: string | null; plan: PlanStep[] }
+  | { type: "plan_delta"; id: string; delta: string }
+  | { type: "user_input_requested"; id: string; questions: UserInputQuestion[] }
+  | { type: "thread_status"; status: string; activeFlags: string[] }
   | { type: "error"; text: string };
 
 function getRunStatusText(
@@ -43,6 +51,38 @@ function getRunStatusText(
   }
 
   return "Done.";
+}
+
+function getLatestPendingUserInputRequest(
+  events: AgentEvent[]
+): UserInputQuestion[] | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event.type === "user_input_response") return null;
+    if (event.type === "user_input_requested") {
+      const questions =
+        ((event.data.questions as UserInputQuestion[] | undefined) ?? []).filter(
+          Boolean
+        );
+      return questions.length > 0 ? questions : null;
+    }
+  }
+
+  return null;
+}
+
+function hasMatchingPersistedUserMessage(
+  events: AgentEvent[],
+  pendingMessage: string | null
+): boolean {
+  if (!pendingMessage) return false;
+
+  return events.some(
+    (event) =>
+      event.type === "user_message" &&
+      typeof event.data.text === "string" &&
+      event.data.text === pendingMessage
+  );
 }
 
 function EventBlock({
@@ -156,6 +196,26 @@ function EventBlock({
         tool={tool}
       />
     );
+  }
+
+  if (event.type === "plan_updated") {
+    const explanation = (data.explanation as string | null | undefined) ?? null;
+    const plan = ((data.plan as PlanStep[] | undefined) ?? []).filter(Boolean);
+    return <PlanUpdatedBlock explanation={explanation} plan={plan} />;
+  }
+
+  if (event.type === "plan_delta") {
+    return null;
+  }
+
+  if (event.type === "user_input_requested") {
+    const questions = ((data.questions as UserInputQuestion[] | undefined) ?? []).filter(Boolean);
+    if (questions.length === 0) return null;
+    return <UserInputRequestedBlock questions={questions} />;
+  }
+
+  if (event.type === "thread_status") {
+    return null;
   }
 
   // policy_decision: show only if interesting (deny or ask)
@@ -369,6 +429,143 @@ function ToolResultBlock({
   );
 }
 
+function PlanUpdatedBlock({
+  explanation,
+  plan,
+}: {
+  explanation: string | null;
+  plan: PlanStep[];
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="flex items-center gap-2">
+        <Badge variant="secondary" className="text-[10px]">
+          <span className="text-emerald-400">plan</span>
+        </Badge>
+        <span className="text-xs text-muted-foreground">
+          {plan.length} step{plan.length === 1 ? "" : "s"}
+        </span>
+      </div>
+      {explanation ? (
+        <p className="mt-3 text-sm text-muted-foreground">{explanation}</p>
+      ) : null}
+      <div className="mt-3 space-y-2">
+        {plan.map((item, index) => (
+          <div
+            key={`${item.step}-${index}`}
+            className="flex items-start gap-3 rounded-md border border-border/70 px-3 py-2"
+          >
+            <Badge
+              variant="secondary"
+              className="mt-0.5 shrink-0 text-[10px] uppercase"
+            >
+              {item.status.replace("_", " ")}
+            </Badge>
+            <span className="text-sm text-foreground">{item.step}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function UserInputRequestedBlock({
+  answers,
+  questions,
+  onAnswerSelect,
+  onSubmit,
+  submitting = false,
+}: {
+  answers?: Record<string, string>;
+  questions: UserInputQuestion[];
+  onAnswerSelect?: (questionId: string, answer: string) => void;
+  onSubmit?: () => void;
+  submitting?: boolean;
+}) {
+  const allAnswered = questions.every((question) => Boolean(answers?.[question.id]));
+
+  return (
+    <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+      <div className="flex items-center gap-2">
+        <Badge variant="secondary" className="text-[10px]">
+          <span className="text-amber-400">waiting</span>
+        </Badge>
+        <span className="text-sm text-foreground">Codex requested user input</span>
+      </div>
+      <div className="mt-3 space-y-3">
+        {questions.map((question) => (
+          <div key={question.id} className="rounded-md border border-border/70 p-3">
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">
+              {question.header}
+            </div>
+            <div className="mt-1 text-sm text-foreground">{question.question}</div>
+            <div className="mt-2 space-y-2">
+              {question.options.map((option) => (
+                <button
+                  key={`${question.id}-${option.label}`}
+                  type="button"
+                  onClick={() => onAnswerSelect?.(question.id, option.label)}
+                  disabled={!onAnswerSelect || submitting}
+                  className={`w-full rounded-md px-3 py-2 text-left transition-colors ${
+                    answers?.[question.id] === option.label
+                      ? "bg-accent text-accent-foreground"
+                      : "bg-background/70"
+                  } ${onAnswerSelect ? "hover:bg-accent/70" : "cursor-default"}`}
+                >
+                  <div className="text-sm text-foreground">{option.label}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {option.description}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      {onSubmit ? (
+        <div className="mt-4 flex justify-end">
+          <Button
+            type="button"
+            size="sm"
+            onClick={onSubmit}
+            disabled={!allAnswered || submitting}
+          >
+            {submitting ? "Submitting..." : "Continue"}
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ThreadStatusBlock({
+  status,
+  activeFlags,
+}: {
+  status: string;
+  activeFlags: string[];
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card p-3">
+      <div className="flex items-center gap-2">
+        <Badge variant="secondary" className="text-[10px]">
+          <span className="text-cyan-400">thread</span>
+        </Badge>
+        <span className="text-sm text-foreground">{status}</span>
+      </div>
+      {activeFlags.length > 0 ? (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {activeFlags.map((flag) => (
+            <Badge key={flag} variant="secondary" className="text-[10px]">
+              {flag}
+            </Badge>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ErrorBlock({ text }: { text: string }) {
   return (
     <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3">
@@ -397,13 +594,17 @@ export function SessionView({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>("");
+  const [selectedMode, setSelectedMode] = useState<"default" | "plan">("default");
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [activeStreamSessionId, setActiveStreamSessionId] = useState<string | null>(sessionId ?? null);
   const [agentProviders, setAgentProviders] = useState<AgentProviderInfo[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<string>("ada");
   const [providerResolved, setProviderResolved] = useState(!sessionId);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(true);
   const [mobilePanel, setMobilePanel] = useState<"agent" | "terminal">("agent");
+  const [userInputDraft, setUserInputDraft] = useState<Record<string, string>>({});
+  const [submittingUserInput, setSubmittingUserInput] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<TerminalHandle | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -412,6 +613,14 @@ export function SessionView({
   const eventSourceRef = useRef<EventSource | null>(null);
   const currentSessionIdRef = useRef(sessionId);
   const sendContextRef = useRef<{ sessionId: string | undefined; projectId: string } | null>(null);
+
+  const attachToSession = (nextSessionId: string) => {
+    setActiveStreamSessionId(nextSessionId);
+    sendContextRef.current = { sessionId: nextSessionId, projectId };
+    if (currentSessionIdRef.current !== nextSessionId) {
+      onSessionCreated(nextSessionId);
+    }
+  };
 
   const loadModels = (provider?: string) => {
     fetchModels(provider ?? selectedProvider)
@@ -431,6 +640,12 @@ export function SessionView({
   }, [selectedProvider, providerResolved]);
 
   useEffect(() => {
+    if (selectedProvider !== "codex" && selectedMode !== "default") {
+      setSelectedMode("default");
+    }
+  }, [selectedMode, selectedProvider]);
+
+  useEffect(() => {
     fetchAgentProviders()
       .then((p) => setAgentProviders(p))
       .catch(() => {});
@@ -440,28 +655,73 @@ export function SessionView({
   useEffect(() => {
     if (sessionId) {
       setProviderResolved(false);
-      fetchSession(projectId, sessionId)
-        .then((session) => {
-          setSelectedProvider(session.provider || "ada");
-          if (session.model) {
-            setSelectedModel(session.model);
+      Promise.allSettled([
+        fetchSession(projectId, sessionId),
+        fetchEvents(projectId, sessionId),
+        fetchSessionRuntime(projectId, sessionId),
+      ])
+        .then(([sessionResult, eventsResult, runtimeResult]) => {
+          if (sessionResult.status === "fulfilled") {
+            const session = sessionResult.value;
+            setSelectedProvider(session.provider || "ada");
+            setSelectedMode(session.mode || "default");
+            if (session.model) {
+              setSelectedModel(session.model);
+            }
+          }
+
+          if (eventsResult.status === "fulfilled") {
+            setEvents(eventsResult.value);
+          }
+
+          if (runtimeResult.status === "fulfilled") {
+            setStreaming(runtimeResult.value.active);
+          } else {
+            setStreaming(false);
           }
         })
-        .catch(() => {})
         .finally(() => setProviderResolved(true));
-      fetchEvents(projectId, sessionId)
-        .then((evts) => {
-          setEvents(evts);
-        })
-        .catch(() => {
-          // Keep current stream items visible if events cannot be loaded yet.
-        });
     } else {
       setEvents([]);
       setStreamItems([]);
+      setStreaming(false);
       setProviderResolved(true);
+      setSelectedMode("default");
     }
+    setActiveStreamSessionId(sessionId ?? null);
+    setUserInputDraft({});
   }, [projectId, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || eventSourceRef.current) return;
+    if (!streaming) return;
+
+    let cancelled = false;
+    const interval = window.setInterval(async () => {
+      try {
+        const [evts, runtime] = await Promise.all([
+          fetchEvents(projectId, sessionId),
+          fetchSessionRuntime(projectId, sessionId),
+        ]);
+        if (cancelled) return;
+        setEvents(evts);
+        if (!runtime.active) {
+          setStreaming(false);
+          setPendingMessage(null);
+          setStreamItems([]);
+        }
+      } catch {
+        if (!cancelled) {
+          setStreaming(false);
+        }
+      }
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [projectId, sessionId, streaming]);
 
   // Track current session and manage stream visibility on session switch
   useEffect(() => {
@@ -530,11 +790,13 @@ export function SessionView({
       resumeSessionId: sessionId,
       model: selectedModel,
       provider: selectedProvider || undefined,
+      mode: selectedProvider === "codex" ? selectedMode : "default",
     });
     eventSourceRef.current = es;
 
     // Check if the user is still viewing the session this stream belongs to
     const isVisible = () =>
+      currentSessionIdRef.current == null ||
       currentSessionIdRef.current === sendContextRef.current?.sessionId;
 
     es.onmessage = (event) => {
@@ -550,6 +812,7 @@ export function SessionView({
         const adaEvent = data.event;
         if (adaEvent.type === "run.started") {
           detectedSessionId = adaEvent.sessionId;
+          attachToSession(adaEvent.sessionId);
         } else if (adaEvent.type === "assistant.text") {
           if (adaEvent.text && isVisible()) {
             setStreamItems((prev) => [
@@ -583,6 +846,60 @@ export function SessionView({
               },
             ]);
           }
+        } else if (adaEvent.type === "plan.updated") {
+          if (isVisible()) {
+            setStreamItems((prev) => [
+              ...prev,
+              {
+                type: "plan_updated",
+                explanation: adaEvent.explanation,
+                plan: adaEvent.plan,
+              },
+            ]);
+          }
+        } else if (adaEvent.type === "plan.delta") {
+          if (isVisible()) {
+            setStreamItems((prev) => {
+              const lastItem = prev[prev.length - 1];
+              if (
+                lastItem?.type === "plan_delta" &&
+                lastItem.id === adaEvent.id
+              ) {
+                return [
+                  ...prev.slice(0, -1),
+                  {
+                    type: "plan_delta",
+                    id: adaEvent.id,
+                    delta: `${lastItem.delta}${adaEvent.delta}`,
+                  },
+                ];
+              }
+
+              return [
+                ...prev,
+                {
+                  type: "plan_delta",
+                  id: adaEvent.id,
+                  delta: adaEvent.delta,
+                },
+              ];
+            });
+          }
+        } else if (adaEvent.type === "user.input_requested") {
+          setUserInputDraft({});
+          if (isVisible()) {
+            setStreamItems((prev) => [
+              ...prev,
+              {
+                type: "user_input_requested",
+                id: adaEvent.id,
+                questions: adaEvent.questions,
+              },
+            ]);
+          }
+        } else if (adaEvent.type === "thread.status") {
+          // Thread status changes are useful internally, but they're noisy in
+          // the visible transcript when there's no actionable information.
         } else if (adaEvent.type === "run.failed") {
           runFailed = true;
           if (isVisible()) {
@@ -612,8 +929,8 @@ export function SessionView({
         if (wasVisible) {
           setStreaming(false);
           setPendingMessage(null);
+          setActiveStreamSessionId(detectedSessionId || null);
           if (detectedSessionId) {
-            onSessionCreated(detectedSessionId);
             fetchEvents(projectId, detectedSessionId)
               .then((evts) => {
                 setEvents(evts);
@@ -668,8 +985,61 @@ export function SessionView({
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  const handleStructuredUserInputSubmit = async (
+    questions: UserInputQuestion[]
+  ) => {
+    const targetSessionId = activeStreamSessionId ?? sessionId;
+    if (!targetSessionId) return;
+
+    const answers = Object.fromEntries(
+      questions.map((question) => [question.id, userInputDraft[question.id]])
+    );
+
+    setSubmittingUserInput(true);
+    try {
+      await submitSessionUserInput(projectId, targetSessionId, answers);
+      setUserInputDraft({});
+    } catch (error) {
+      setStreamItems((prev) => [
+        ...prev,
+        {
+          type: "error",
+          text: error instanceof Error ? error.message : "Failed to submit user input",
+        },
+      ]);
+    } finally {
+      setSubmittingUserInput(false);
+    }
+  };
+
   const selectedModelName =
     models.find((m) => m.id === selectedModel)?.name ?? selectedModel;
+  const latestStructuredInputRequestFromStream =
+    [...streamItems]
+      .reverse()
+      .find(
+        (item): item is Extract<StreamItem, { type: "user_input_requested" }> =>
+          item.type === "user_input_requested"
+      ) ?? null;
+  const latestStructuredInputRequest =
+    latestStructuredInputRequestFromStream
+      ? latestStructuredInputRequestFromStream
+      : streaming
+        ? (() => {
+            const questions = getLatestPendingUserInputRequest(events);
+            return questions
+              ? {
+                  type: "user_input_requested" as const,
+                  id: "persisted-user-input-request",
+                  questions,
+                }
+              : null;
+          })()
+        : null;
+  const showPendingMessage = !hasMatchingPersistedUserMessage(
+    events,
+    pendingMessage
+  );
 
   return (
     <>
@@ -765,7 +1135,7 @@ export function SessionView({
               </div>
 
               {/* Pending user message */}
-              {pendingMessage && (
+              {pendingMessage && showPendingMessage && (
                 <div className="flex justify-end mt-4">
                   <div className="max-w-[85%] rounded-2xl bg-secondary px-4 py-3 text-sm">
                     {pendingMessage}
@@ -814,12 +1184,87 @@ export function SessionView({
                       );
                     }
 
+                    if (item.type === "plan_updated") {
+                      return (
+                        <PlanUpdatedBlock
+                          key={i}
+                          explanation={item.explanation}
+                          plan={item.plan}
+                        />
+                      );
+                    }
+
+                    if (item.type === "plan_delta") {
+                      return (
+                        <div
+                          key={i}
+                          className="rounded-lg border border-border bg-card/70 px-4 py-3 text-sm text-muted-foreground"
+                        >
+                          {item.delta}
+                        </div>
+                      );
+                    }
+
+                    if (item.type === "user_input_requested") {
+                      return (
+                        <UserInputRequestedBlock
+                          key={i}
+                          answers={
+                            latestStructuredInputRequest?.id === item.id
+                              ? userInputDraft
+                              : undefined
+                          }
+                          questions={item.questions}
+                          onAnswerSelect={
+                            latestStructuredInputRequest?.id === item.id
+                              ? (questionId, answer) =>
+                                  setUserInputDraft((prev) => ({
+                                    ...prev,
+                                    [questionId]: answer,
+                                  }))
+                              : undefined
+                          }
+                          onSubmit={
+                            latestStructuredInputRequest?.id === item.id
+                              ? () => handleStructuredUserInputSubmit(item.questions)
+                              : undefined
+                          }
+                          submitting={submittingUserInput}
+                        />
+                      );
+                    }
+
+                    if (item.type === "thread_status") {
+                      return null;
+                    }
+
                     if (item.type === "error") {
                       return <ErrorBlock key={i} text={item.text} />;
                     }
 
                     return null;
                   })}
+                </div>
+              )}
+
+              {streamItems.length === 0 && latestStructuredInputRequest && (
+                <div className="mt-4">
+                  <UserInputRequestedBlock
+                    answers={userInputDraft}
+                    questions={latestStructuredInputRequest.questions}
+                    onAnswerSelect={(questionId, answer) =>
+                      setUserInputDraft((prev) => ({
+                        ...prev,
+                        [questionId]: answer,
+                      }))
+                    }
+                    onSubmit={() =>
+                      handleStructuredUserInputSubmit(
+                        latestStructuredInputRequest.questions
+                      )
+                    }
+                    submitting={submittingUserInput}
+                  />
                 </div>
               )}
 
@@ -891,6 +1336,37 @@ export function SessionView({
                         )}
                       </div>
                       <span className="text-muted-foreground/40">|</span>
+                      {selectedProvider === "codex" && (
+                        <>
+                          <div className="flex items-center rounded-md border border-border bg-background/60 p-0.5">
+                            <button
+                              type="button"
+                              onClick={() => setSelectedMode("default")}
+                              disabled={streaming}
+                              className={`rounded px-2 py-1 text-xs transition-colors ${
+                                selectedMode === "default"
+                                  ? "bg-accent text-accent-foreground"
+                                  : "text-muted-foreground"
+                              } ${streaming ? "cursor-not-allowed opacity-50" : ""}`}
+                            >
+                              Default
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedMode("plan")}
+                              disabled={streaming}
+                              className={`rounded px-2 py-1 text-xs transition-colors ${
+                                selectedMode === "plan"
+                                  ? "bg-accent text-accent-foreground"
+                                  : "text-muted-foreground"
+                              } ${streaming ? "cursor-not-allowed opacity-50" : ""}`}
+                            >
+                              Plan
+                            </button>
+                          </div>
+                          <span className="text-muted-foreground/40">|</span>
+                        </>
+                      )}
                       {/* Model picker */}
                       <div className="relative" ref={modelPickerRef}>
                         <button

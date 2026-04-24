@@ -13,10 +13,15 @@ export interface Session {
   workingDirectory: string;
   model: string;
   provider?: string;
+  mode?: "default" | "plan";
   messages: unknown[];
   createdAt: string;
   lastActiveAt: string;
   status: string;
+}
+
+export interface SessionRuntime {
+  active: boolean;
 }
 
 export interface AgentEvent {
@@ -25,6 +30,25 @@ export interface AgentEvent {
   timestamp: string;
   type: string;
   data: Record<string, unknown>;
+}
+
+export type PlanStepStatus = "pending" | "in_progress" | "completed";
+
+export interface PlanStep {
+  step: string;
+  status: PlanStepStatus;
+}
+
+export interface UserInputOption {
+  label: string;
+  description: string;
+}
+
+export interface UserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: UserInputOption[];
 }
 
 export type AdaStreamEvent =
@@ -55,6 +79,27 @@ export type AdaStreamEvent =
       name: string;
       content: string;
       isError: boolean;
+    }
+  | {
+      type: "plan.updated";
+      explanation: string | null;
+      plan: PlanStep[];
+    }
+  | {
+      type: "plan.delta";
+      id: string;
+      delta: string;
+    }
+  | {
+      type: "user.input_requested";
+      id: string;
+      questions: UserInputQuestion[];
+    }
+  | {
+      type: "thread.status";
+      threadId: string;
+      status: string;
+      activeFlags?: string[];
     }
   | {
       type: "run.completed";
@@ -113,6 +158,16 @@ export async function fetchSession(
   return res.json();
 }
 
+export async function fetchSessionRuntime(
+  projectId: string,
+  sessionId: string
+): Promise<SessionRuntime> {
+  const res = await fetch(
+    `${BASE}/projects/${projectId}/sessions/${sessionId}/runtime`
+  );
+  return res.json();
+}
+
 export async function archiveSession(
   projectId: string,
   sessionId: string
@@ -131,6 +186,18 @@ export async function fetchEvents(
     `${BASE}/projects/${projectId}/sessions/${sessionId}/events`
   );
   return res.json();
+}
+
+export async function submitSessionUserInput(
+  projectId: string,
+  sessionId: string,
+  answers: Record<string, string | string[]>
+): Promise<void> {
+  await fetch(`${BASE}/projects/${projectId}/sessions/${sessionId}/user-input`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answers }),
+  });
 }
 
 export interface Model {
@@ -186,12 +253,18 @@ export async function deleteProviderKey(providerId: string): Promise<void> {
 export function startSession(
   projectId: string,
   message: string,
-  options?: { resumeSessionId?: string; model?: string; provider?: string }
+  options?: {
+    resumeSessionId?: string;
+    model?: string;
+    provider?: string;
+    mode?: "default" | "plan";
+  }
 ): EventSource {
   const params = new URLSearchParams({ message });
   if (options?.resumeSessionId) params.set("resumeSessionId", options.resumeSessionId);
   if (options?.model != null) params.set("model", options.model);
   if (options?.provider) params.set("provider", options.provider);
+  if (options?.mode) params.set("mode", options.mode);
   return new EventSource(
     `${BASE}/projects/${projectId}/sessions/stream?${params}`
   );
