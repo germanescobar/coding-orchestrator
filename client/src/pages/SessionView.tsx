@@ -53,6 +53,27 @@ function normalizeToolResultContent(content: unknown): string {
   }
 }
 
+function truncateInlineText(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}...`;
+}
+
+function buildToolInputPreview(input?: Record<string, unknown>): string {
+  if (!input) return "";
+
+  return Object.entries(input)
+    .map(([key, value]) => {
+      const stringValue =
+        typeof value === "string" ? value : JSON.stringify(value);
+      const maxLength = key === "cmd" || key === "command" ? 120 : 60;
+      return `${key}: ${truncateInlineText(stringValue, maxLength)}`;
+    })
+    .join(", ");
+}
+
+const COMPOSER_MAX_LINES = 5;
+
 function getRunStatusText(
   stopReason: "completed" | "max_iterations" | string,
   status: "completed" | "max_iterations"
@@ -175,14 +196,7 @@ function EventBlock({
     const tool = data.tool as string | undefined;
     const input = data.input as Record<string, unknown> | undefined;
     if (!tool) return null;
-    const inputPreview = input
-      ? Object.entries(input)
-          .map(([k, v]) => {
-            const val = typeof v === "string" ? v : JSON.stringify(v);
-            return `${k}: ${val.length > 60 ? val.slice(0, 60) + "..." : val}`;
-          })
-          .join(", ")
-      : "";
+    const inputPreview = buildToolInputPreview(input);
     return (
       <ToolCallBlock
         expanded={expanded}
@@ -361,6 +375,8 @@ function ToolCallBlock({
   onToggle: () => void;
   tool: string;
 }) {
+  const toolLabel = truncateInlineText(tool, 80);
+
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       <button
@@ -375,9 +391,14 @@ function ToolCallBlock({
         <Badge variant="secondary" className="shrink-0 text-[10px]">
           <span className="text-yellow-400">tool_call</span>
         </Badge>
-        <span className="font-mono text-xs text-foreground">{tool}</span>
+        <span
+          className="min-w-0 max-w-80 truncate font-mono text-xs text-foreground"
+          title={tool}
+        >
+          {toolLabel}
+        </span>
         {!expanded && inputPreview && (
-          <span className="truncate text-xs text-muted-foreground">
+          <span className="min-w-0 truncate text-xs text-muted-foreground">
             {inputPreview}
           </span>
         )}
@@ -406,6 +427,8 @@ function ToolResultBlock({
   onToggle: () => void;
   tool?: string;
 }) {
+  const toolLabel = tool ? truncateInlineText(tool, 80) : null;
+
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       <button
@@ -425,11 +448,16 @@ function ToolResultBlock({
             tool_result
           </span>
         </Badge>
-        {tool && (
-          <span className="font-mono text-xs text-foreground">{tool}</span>
+        {tool && toolLabel && (
+          <span
+            className="min-w-0 max-w-80 truncate font-mono text-xs text-foreground"
+            title={tool}
+          >
+            {toolLabel}
+          </span>
         )}
         {!expanded && (
-          <span className="truncate text-xs text-muted-foreground">
+          <span className="min-w-0 truncate text-xs text-muted-foreground">
             {content.slice(0, 120)}
             {isLong ? "..." : ""}
           </span>
@@ -628,6 +656,29 @@ export function SessionView({
   const eventSourceRef = useRef<EventSource | null>(null);
   const currentSessionIdRef = useRef(sessionId);
   const sendContextRef = useRef<{ sessionId: string | undefined; projectId: string } | null>(null);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = "auto";
+
+    const computedStyle = window.getComputedStyle(textarea);
+    const lineHeight = Number.parseFloat(computedStyle.lineHeight) || 20;
+    const borderHeight =
+      Number.parseFloat(computedStyle.borderTopWidth) +
+      Number.parseFloat(computedStyle.borderBottomWidth);
+    const paddingHeight =
+      Number.parseFloat(computedStyle.paddingTop) +
+      Number.parseFloat(computedStyle.paddingBottom);
+    const maxHeight =
+      lineHeight * COMPOSER_MAX_LINES + paddingHeight + borderHeight;
+    const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY =
+      textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [message]);
 
   const attachToSession = (nextSessionId: string) => {
     setActiveStreamSessionId(nextSessionId);
@@ -1170,12 +1221,7 @@ export function SessionView({
                     }
 
                     if (item.type === "tool_call") {
-                      const inputPreview = Object.entries(item.input)
-                        .map(([k, v]) => {
-                          const val = typeof v === "string" ? v : JSON.stringify(v);
-                          return `${k}: ${val.length > 60 ? val.slice(0, 60) + "..." : val}`;
-                        })
-                        .join(", ");
+                      const inputPreview = buildToolInputPreview(item.input);
 
                       return (
                         <LiveToolCallBlock
@@ -1310,7 +1356,8 @@ export function SessionView({
                     }
                     rows={1}
                     disabled={streaming}
-                    className="w-full resize-none bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
+                    className="w-full resize-none overflow-y-auto bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
+                    style={{ maxHeight: "calc(1.25rem * 5)" }}
                   />
                   <div className="mt-2 flex items-center justify-between">
                     <div className="flex items-center gap-2">
