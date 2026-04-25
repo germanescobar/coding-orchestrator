@@ -42,6 +42,17 @@ type StreamItem =
   | { type: "thread_status"; status: string; activeFlags: string[] }
   | { type: "error"; text: string };
 
+function normalizeToolResultContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+
+  try {
+    return JSON.stringify(content, null, 2);
+  } catch {
+    return String(content);
+  }
+}
+
 function getRunStatusText(
   stopReason: "completed" | "max_iterations" | string,
   status: "completed" | "max_iterations"
@@ -182,7 +193,7 @@ function EventBlock({
   // tool_result: show truncated, expandable
   if (event.type === "tool_result") {
     const tool = data.tool as string | undefined;
-    const content = data.content as string | undefined;
+    const content = normalizeToolResultContent(data.content);
     const isError = data.isError as boolean | undefined;
     if (!content) return null;
     const isLong = content.length > 200;
@@ -836,12 +847,13 @@ export function SessionView({
           }
         } else if (adaEvent.type === "tool.result") {
           if (isVisible()) {
+            const content = normalizeToolResultContent(adaEvent.content);
             setStreamItems((prev) => [
               ...prev,
               {
                 type: "tool_result",
                 name: adaEvent.name,
-                content: adaEvent.content,
+                content,
                 isError: adaEvent.isError,
               },
             ]);
@@ -1024,18 +1036,16 @@ export function SessionView({
   const latestStructuredInputRequest =
     latestStructuredInputRequestFromStream
       ? latestStructuredInputRequestFromStream
-      : streaming
-        ? (() => {
-            const questions = getLatestPendingUserInputRequest(events);
-            return questions
-              ? {
-                  type: "user_input_requested" as const,
-                  id: "persisted-user-input-request",
-                  questions,
-                }
-              : null;
-          })()
-        : null;
+      : (() => {
+          const questions = getLatestPendingUserInputRequest(events);
+          return questions
+            ? {
+                type: "user_input_requested" as const,
+                id: "persisted-user-input-request",
+                questions,
+              }
+            : null;
+        })();
   const showPendingMessage = !hasMatchingPersistedUserMessage(
     events,
     pendingMessage

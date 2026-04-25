@@ -95,6 +95,17 @@ export interface AgentProvider {
   parseEvent(line: string): AgentStreamEvent | null;
 }
 
+function normalizeToolResultContent(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Ada provider
 // ---------------------------------------------------------------------------
@@ -239,12 +250,13 @@ function mapCodexEvent(event: Record<string, unknown>): AgentStreamEvent | null 
           (item.tool as string) ??
           (item.command as string) ??
           itemType;
-        const content =
-          (item.aggregated_output as string) ??
-          (item.output as string) ??
-          (item.content as string) ??
-          (item.result as string) ??
-          JSON.stringify(item);
+        const rawContent =
+          item.aggregated_output ??
+          item.output ??
+          item.content ??
+          item.result ??
+          item;
+        const content = normalizeToolResultContent(rawContent);
         const isError = (item.exit_code as number) !== 0 && item.exit_code != null;
         return { type: "tool.result", id: itemId, name, content, isError };
       }
@@ -421,11 +433,12 @@ function mapCodexAppServerEvent(
         };
       }
 
-      const content =
-        (item.aggregatedOutput as string | undefined) ??
-        (item.result as string | undefined) ??
-        (item.text as string | undefined) ??
-        JSON.stringify(item);
+      const rawContent =
+        item.aggregatedOutput ??
+        item.result ??
+        item.text ??
+        item;
+      const content = normalizeToolResultContent(rawContent);
       const status = item.status as string | undefined;
       const exitCode = item.exitCode as number | null | undefined;
       const isError =

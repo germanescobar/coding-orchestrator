@@ -193,11 +193,25 @@ export async function submitSessionUserInput(
   sessionId: string,
   answers: Record<string, string | string[]>
 ): Promise<void> {
-  await fetch(`${BASE}/projects/${projectId}/sessions/${sessionId}/user-input`, {
+  const res = await fetch(`${BASE}/projects/${projectId}/sessions/${sessionId}/user-input`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ answers }),
   });
+
+  if (!res.ok) {
+    let message = "Failed to submit user input";
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body.error) {
+        message = body.error;
+      }
+    } catch {
+      // Ignore JSON parsing errors and use the default message.
+    }
+
+    throw new Error(message);
+  }
 }
 
 export interface Model {
