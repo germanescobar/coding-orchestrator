@@ -7,6 +7,7 @@ export interface SessionState {
   workingDirectory: string;
   model: string;
   provider?: string;
+  mode?: "default" | "plan";
   messages: unknown[];
   createdAt: string;
   lastActiveAt: string;

@@ -9,9 +9,17 @@ import {
   Trash2,
   MessageSquare,
   Archive,
+  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { fetchSessions, deleteProject, archiveSession, type Project, type Session } from "../api.ts";
+import {
+  fetchSessions,
+  fetchSessionRuntime,
+  deleteProject,
+  archiveSession,
+  type Project,
+  type Session,
+} from "../api.ts";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -58,6 +66,35 @@ export function Sidebar({
 }: SidebarProps) {
   const [projectData, setProjectData] = useState<ProjectWithSessions[]>([]);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(new Set());
+  const [activeSessionIds, setActiveSessionIds] = useState<Set<string>>(new Set());
+
+  const refreshActiveSessions = async (projectsToLoad: Project[]) => {
+    const sessionsByProject = await Promise.all(
+      projectsToLoad.map(async (project) => ({
+        projectId: project.id,
+        sessions: await fetchSessions(project.id),
+      }))
+    );
+
+    const activeEntries = await Promise.all(
+      sessionsByProject.flatMap(({ projectId, sessions }) =>
+        sessions
+          .filter((session) => !archivedIds.has(session.id))
+          .map(async (session) => ({
+            sessionId: session.id,
+            runtime: await fetchSessionRuntime(projectId, session.id),
+          }))
+      )
+    );
+
+    setActiveSessionIds(
+      new Set(
+        activeEntries
+          .filter(({ runtime }) => runtime.active)
+          .map(({ sessionId }) => sessionId)
+      )
+    );
+  };
 
   useEffect(() => {
     const load = async () => {
@@ -73,10 +110,21 @@ export function Sidebar({
         })
       );
       setProjectData(data);
+      await refreshActiveSessions(projects);
     };
-    load();
+    load().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projects, activeProjectId, activeSessionId]);
+  }, [projects, activeProjectId, activeSessionId, archivedIds]);
+
+  useEffect(() => {
+    if (activeSessionIds.size === 0) return;
+
+    const interval = window.setInterval(() => {
+      refreshActiveSessions(projects).catch(() => {});
+    }, 2000);
+
+    return () => window.clearInterval(interval);
+  }, [activeSessionIds, projects, archivedIds]);
 
   const toggleProject = (id: string) => {
     setProjectData((prev) =>
@@ -196,13 +244,13 @@ export function Sidebar({
                               onSelectSession(project.id, session.id)
                             }
                             className={cn(
-                              "flex flex-1 items-center justify-between rounded-md px-4 py-1.5 text-sm transition-colors min-w-0",
+                              "flex flex-1 items-center justify-between gap-3 rounded-md px-4 py-1.5 text-sm transition-colors min-w-0",
                               session.id === activeSessionId
                                 ? "bg-sidebar-accent text-sidebar-foreground"
                                 : "text-sidebar-foreground/80 hover:bg-sidebar-accent"
                             )}
                           >
-                            <span className="flex items-center gap-2 truncate">
+                            <span className="flex min-w-0 flex-1 items-center gap-2 truncate pr-2">
                               <MessageSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                               <span className="truncate">
                                 {session.title || session.id.slice(0, 8)}
@@ -211,9 +259,13 @@ export function Sidebar({
                                 <span className="h-2 w-2 shrink-0 rounded-full bg-green-500" />
                               )}
                             </span>
-                            <span className="shrink-0 text-xs text-muted-foreground group-hover/session:hidden">
-                              {formatTime(session.lastActiveAt)}
-                            </span>
+                            {activeSessionIds.has(session.id) ? (
+                              <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground group-hover/session:hidden" />
+                            ) : (
+                              <span className="shrink-0 text-xs text-muted-foreground group-hover/session:hidden">
+                                {formatTime(session.lastActiveAt)}
+                              </span>
+                            )}
                             <span
                               role="button"
                               tabIndex={0}

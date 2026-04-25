@@ -1,9 +1,15 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { getProject } from "../lib/projects.js";
 import { getSessions, getSession, getEvents, archiveSession, saveSession, appendEvent, type AgentEvent } from "../lib/sessions.js";
 import { getApiKeyEnvVars } from "../lib/api-keys.js";
 import { getAgentProvider, type AgentStreamEvent } from "../lib/agents.js";
+import { codexAppServerManager } from "../lib/codex-app-server.js";
+import {
+  getSessionRuntime,
+  markSessionActive,
+  markSessionInactive,
+} from "../lib/session-runtime.js";
 
 // Strip ANSI escape codes (color, cursor, etc.)
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
@@ -25,6 +31,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
   const resumeSessionId = req.query.resumeSessionId as string | undefined;
   const model = req.query.model as string | undefined;
   const providerId = (req.query.provider as string) || "ada";
+  const mode = (req.query.mode as "default" | "plan" | undefined) || "default";
 
   const provider = getAgentProvider(providerId);
   if (!provider) {
@@ -34,6 +41,18 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
 
   if (!message) {
     res.status(400).json({ error: "message query param is required" });
+    return;
+  }
+
+  if (providerId === "codex") {
+    await streamCodexPlanSession(req, res, {
+      projectPath: project.path,
+      message,
+      resumeSessionId,
+      model,
+      mode,
+      providerId,
+    });
     return;
   }
 
@@ -51,9 +70,11 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     env: apiKeyEnv,
     resumeSessionId,
     model,
+    mode,
   });
 
   let stdoutBuffer = "";
+  let eventProcessing = Promise.resolve();
   // For non-Ada providers, we persist events ourselves since they don't
   // write to .coding-agent/events/ like Ada does.
   const shouldPersist = providerId !== "ada";
@@ -70,6 +91,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
   /** Write the user message + create/update session file once we know the sessionId. */
   async function persistSessionStart(sessionId: string) {
     streamSessionId = sessionId;
+    markSessionActive(sessionId);
     // Write user message (only for non-Ada providers that don't persist their own events)
     if (shouldPersist && !userMessageWritten) {
       userMessageWritten = true;
@@ -90,6 +112,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       workingDirectory: projectPath,
       model: model ?? existing?.model ?? "",
       provider: providerId,
+      mode,
       messages: existing?.messages ?? [],
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       lastActiveAt: new Date().toISOString(),
@@ -100,20 +123,13 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
   /** Convert a normalized agent event to a persisted AgentEvent and append it. */
   function persistAgentEvent(event: AgentStreamEvent) {
     if (!streamSessionId) return;
+    if (event.type === "thread.status" || event.type === "plan.delta") return;
     const agentEvent: AgentEvent = {
       id: randomUUID(),
       sessionId: streamSessionId,
       timestamp: new Date().toISOString(),
-      type: event.type === "assistant.text" ? "assistant_response"
-        : event.type === "assistant.reasoning" ? "assistant_reasoning"
-        : event.type === "tool.call" ? "tool_call"
-        : event.type === "tool.result" ? "tool_result"
-        : event.type,
-      data: event.type === "assistant.text" ? { content: [{ type: "text", text: (event as { text: string }).text }] }
-        : event.type === "assistant.reasoning" ? { content: [{ type: "reasoning", text: (event as { text: string }).text }] }
-        : event.type === "tool.call" ? { tool: (event as { name: string; input: unknown }).name, input: (event as { input: unknown }).input }
-        : event.type === "tool.result" ? { tool: (event as { name: string; content: string; isError: boolean }).name, content: (event as { content: string }).content, isError: (event as { isError: boolean }).isError }
-        : (event as Record<string, unknown>),
+      type: getPersistedEventType(event),
+      data: getPersistedEventData(event),
     };
     appendEvent(projectPath, streamSessionId, agentEvent).catch(() => {});
   }
@@ -166,15 +182,23 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
         try {
           const event = provider.parseEvent(line);
           if (event) {
-            // Always persist session metadata on run.started so
-            // provider/model are available when loading any session.
-            // Only persist individual events for non-Ada providers.
-            if (event.type === "run.started") {
-              persistSessionStart(event.sessionId).catch(() => {});
-            } else if (shouldPersist && event.type !== "run.completed" && event.type !== "run.failed") {
-              persistAgentEvent(event);
-            }
-            sseSend({ type: "ada_event", event });
+            eventProcessing = eventProcessing
+              .then(async () => {
+                // Always persist session metadata on run.started so
+                // provider/model are available when loading any session.
+                // Only persist individual events for non-Ada providers.
+                if (event.type === "run.started") {
+                  await persistSessionStart(event.sessionId);
+                } else if (
+                  shouldPersist &&
+                  event.type !== "run.completed" &&
+                  event.type !== "run.failed"
+                ) {
+                  persistAgentEvent(event);
+                }
+                sseSend({ type: "ada_event", event });
+              })
+              .catch(() => {});
           }
         } catch {
           sseSend({
@@ -190,6 +214,9 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
   });
 
   child.on("close", (code) => {
+    eventProcessing
+      .catch(() => {})
+      .then(() => {
     const lastLine = stdoutBuffer.trim();
     if (lastLine.length > 0) {
       try {
@@ -209,8 +236,9 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       }
     }
 
-    // Update session lastActiveAt (read existing to preserve title/createdAt)
-    if (shouldPersist && streamSessionId) {
+    // Update runtime state and lastActiveAt once the stream closes.
+    if (streamSessionId) {
+      markSessionInactive(streamSessionId);
       getSession(projectPath, streamSessionId).then((existing) => {
         if (existing) {
           existing.lastActiveAt = new Date().toISOString();
@@ -221,9 +249,13 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
 
     sseSend({ type: "done", exitCode: code });
     if (clientConnected) res.end();
+      });
   });
 
   child.on("error", (err) => {
+    if (streamSessionId) {
+      markSessionInactive(streamSessionId);
+    }
     sseSend({ type: "error", text: err.message });
     if (clientConnected) res.end();
   });
@@ -236,6 +268,242 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     clientConnected = false;
   });
 });
+
+async function streamCodexPlanSession(
+  req: Request,
+  res: Response,
+  options: {
+    projectPath: string;
+    message: string;
+    resumeSessionId?: string;
+    model?: string;
+    mode: "default" | "plan";
+    providerId: string;
+  }
+) {
+  const { projectPath, message, resumeSessionId, model, mode, providerId } = options;
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  let clientConnected = true;
+  let streamSessionId = resumeSessionId ?? "";
+  let userMessageWritten = false;
+  let finished = false;
+  let eventProcessing = Promise.resolve();
+
+  function sseSend(obj: Record<string, unknown>) {
+    if (clientConnected) {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    }
+  }
+
+  async function persistSessionStart(sessionId: string) {
+    streamSessionId = sessionId;
+    markSessionActive(sessionId);
+    if (!userMessageWritten) {
+      userMessageWritten = true;
+      await appendEvent(projectPath, sessionId, {
+        id: randomUUID(),
+        sessionId,
+        timestamp: new Date().toISOString(),
+        type: "user_message",
+        data: { text: message },
+      });
+    }
+
+    const existing = await getSession(projectPath, sessionId);
+    const title = existing?.title || (message.length > 60 ? `${message.slice(0, 60)}...` : message);
+    await saveSession(projectPath, {
+      id: sessionId,
+      title,
+      workingDirectory: projectPath,
+      model: model ?? existing?.model ?? "",
+      provider: providerId,
+      mode,
+      messages: existing?.messages ?? [],
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+      status: "active",
+    });
+  }
+
+  function persistAgentEvent(event: AgentStreamEvent) {
+    if (!streamSessionId) return;
+    const agentEvent: AgentEvent = {
+      id: randomUUID(),
+      sessionId: streamSessionId,
+      timestamp: new Date().toISOString(),
+      type: getPersistedEventType(event),
+      data: getPersistedEventData(event),
+    };
+    appendEvent(projectPath, streamSessionId, agentEvent).catch(() => {});
+  }
+
+  async function touchSession() {
+    if (!streamSessionId) return;
+    const existing = await getSession(projectPath, streamSessionId);
+    if (!existing) return;
+    existing.lastActiveAt = new Date().toISOString();
+    await saveSession(projectPath, existing);
+  }
+
+  const handleEvent = (event: AgentStreamEvent) => {
+    eventProcessing = eventProcessing
+      .then(async () => {
+        if (event.type === "run.started") {
+          await persistSessionStart(event.sessionId);
+        } else if (
+          event.type !== "run.completed" &&
+          event.type !== "run.failed" &&
+          event.type !== "thread.status" &&
+          event.type !== "plan.delta"
+        ) {
+          persistAgentEvent(event);
+        }
+
+        sseSend({ type: "ada_event", event });
+
+        if (event.type === "run.completed" || event.type === "run.failed") {
+          finished = true;
+          markSessionInactive(streamSessionId || event.sessionId);
+          await touchSession();
+          sseSend({
+            type: "done",
+            exitCode: event.type === "run.completed" ? 0 : 1,
+          });
+          if (clientConnected) res.end();
+        }
+      })
+      .catch(() => {});
+  };
+
+  sseSend({ type: "started" });
+
+  req.on("close", () => {
+    clientConnected = false;
+  });
+
+  try {
+    await codexAppServerManager.startPlanTurn(
+      {
+        message,
+        cwd: projectPath,
+        env: await getApiKeyEnvVars(),
+        resumeSessionId,
+        model,
+        mode,
+      },
+      handleEvent
+    );
+    await eventProcessing;
+  } catch (error) {
+    if (!finished) {
+      if (streamSessionId) {
+        markSessionInactive(streamSessionId);
+      }
+      sseSend({
+        type: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
+      sseSend({ type: "done", exitCode: 1 });
+      if (clientConnected) res.end();
+    }
+  }
+}
+
+function getPersistedEventType(event: AgentStreamEvent): string {
+  switch (event.type) {
+    case "assistant.text":
+      return "assistant_response";
+    case "assistant.reasoning":
+      return "assistant_reasoning";
+    case "tool.call":
+      return "tool_call";
+    case "tool.result":
+      return "tool_result";
+    case "plan.updated":
+      return "plan_updated";
+    case "plan.delta":
+      return "plan_delta";
+    case "user.input_requested":
+      return "user_input_requested";
+    case "thread.status":
+      return "thread_status";
+    default:
+      return event.type;
+  }
+}
+
+function getPersistedEventData(event: AgentStreamEvent): Record<string, unknown> {
+  switch (event.type) {
+    case "assistant.text":
+      return { content: [{ type: "text", text: event.text }] };
+    case "assistant.reasoning":
+      return { content: [{ type: "reasoning", text: event.text }] };
+    case "tool.call":
+      return { tool: event.name, input: event.input };
+    case "tool.result":
+      return { tool: event.name, content: event.content, isError: event.isError };
+    case "plan.updated":
+      return { explanation: event.explanation, plan: event.plan };
+    case "plan.delta":
+      return { itemId: event.id, delta: event.delta };
+    case "user.input_requested":
+      return { itemId: event.id, questions: event.questions };
+    case "thread.status":
+      return {
+        threadId: event.threadId,
+        status: event.status,
+        activeFlags: event.activeFlags ?? [],
+      };
+    default:
+      return event as Record<string, unknown>;
+  }
+}
+
+sessionsRouter.post(
+  "/:projectId/sessions/:sessionId/user-input",
+  async (req, res) => {
+    const project = await getProject(req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const answers = req.body.answers as Record<string, string | string[]> | undefined;
+    if (!answers || typeof answers !== "object") {
+      res.status(400).json({ error: "answers is required" });
+      return;
+    }
+
+    try {
+      await codexAppServerManager.submitUserInput(req.params.sessionId, answers);
+      await appendEvent(project.path, req.params.sessionId, {
+        id: randomUUID(),
+        sessionId: req.params.sessionId,
+        timestamp: new Date().toISOString(),
+        type: "user_input_response",
+        data: { answers },
+      });
+
+      const existing = await getSession(project.path, req.params.sessionId);
+      if (existing) {
+        existing.lastActiveAt = new Date().toISOString();
+        await saveSession(project.path, existing);
+      }
+
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+);
 
 // Archive a session
 sessionsRouter.post(
@@ -280,6 +548,25 @@ sessionsRouter.get("/:projectId/sessions/:sessionId", async (req, res) => {
   }
   res.json(session);
 });
+
+sessionsRouter.get(
+  "/:projectId/sessions/:sessionId/runtime",
+  async (req, res) => {
+    const project = await getProject(req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const session = await getSession(project.path, req.params.sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    res.json(getSessionRuntime(req.params.sessionId));
+  }
+);
 
 // Get events for a session
 sessionsRouter.get(
