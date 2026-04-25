@@ -88,12 +88,16 @@ function hasMatchingPersistedUserMessage(
 ): boolean {
   if (!pendingMessage) return false;
 
-  return events.some(
-    (event) =>
-      event.type === "user_message" &&
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event.type !== "user_message") continue;
+    return (
       typeof event.data.text === "string" &&
       event.data.text === pendingMessage
-  );
+    );
+  }
+
+  return false;
 }
 
 function EventBlock({

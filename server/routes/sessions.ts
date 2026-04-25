@@ -236,8 +236,8 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       }
     }
 
-    // Update session lastActiveAt (read existing to preserve title/createdAt)
-    if (shouldPersist && streamSessionId) {
+    // Update runtime state and lastActiveAt once the stream closes.
+    if (streamSessionId) {
       markSessionInactive(streamSessionId);
       getSession(projectPath, streamSessionId).then((existing) => {
         if (existing) {
