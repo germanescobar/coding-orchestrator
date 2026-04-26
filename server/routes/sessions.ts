@@ -146,6 +146,10 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
 
   sseSend({ type: "started" });
 
+  if (resumeSessionId && shouldPersist) {
+    persistSessionStart(resumeSessionId).catch(() => {});
+  }
+
   // Forward stderr text and keep fallback approval handling for older prompts.
   child.stderr?.on("data", (data: Buffer) => {
     const raw = data.toString();
@@ -382,6 +386,10 @@ async function streamCodexPlanSession(
   };
 
   sseSend({ type: "started" });
+
+  if (resumeSessionId) {
+    persistSessionStart(resumeSessionId).catch(() => {});
+  }
 
   req.on("close", () => {
     clientConnected = false;

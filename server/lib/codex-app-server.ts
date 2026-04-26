@@ -107,6 +107,9 @@ export class CodexAppServerManager {
 
     runtime.cwd = options.cwd;
     runtime.mode = options.mode ?? "plan";
+    // `run.started` is a turn-level event in our UI/persistence layer, so we
+    // need to re-emit it for every follow-up turn on an existing thread.
+    runtime.startedEmitted = false;
     runtime.turnInProgress = true;
     runtime.pendingUserInput = undefined;
     runtime.listeners.add(listener);
