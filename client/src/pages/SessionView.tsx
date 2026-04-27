@@ -31,7 +31,7 @@ interface SessionViewProps {
   onBackgroundComplete?: (sessionId: string) => void;
 }
 
-type StreamItem =
+type StreamItem = (
   | { type: "assistant"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
@@ -40,7 +40,8 @@ type StreamItem =
   | { type: "plan_delta"; id: string; delta: string }
   | { type: "user_input_requested"; id: string; questions: UserInputQuestion[] }
   | { type: "thread_status"; status: string; activeFlags: string[] }
-  | { type: "error"; text: string };
+  | { type: "error"; text: string }
+) & { at: number };
 
 function normalizeToolResultContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -121,6 +122,169 @@ function hasMatchingPersistedUserMessage(
   return false;
 }
 
+type EventRenderItem =
+  | { kind: "working_group"; key: string; events: AgentEvent[] }
+  | { kind: "event"; key: string; event: AgentEvent };
+
+type StreamRenderItem =
+  | { kind: "working_group"; key: string; items: StreamItem[]; startIndex: number }
+  | { kind: "item"; key: string; item: StreamItem; index: number };
+
+const WORKING_EVENT_TYPES = new Set([
+  "tool_call",
+  "tool_result",
+  "assistant_reasoning",
+  "assistant.reasoning",
+  "plan_updated",
+  "plan_delta",
+  "policy_decision",
+  "thread_status",
+]);
+
+const WORKING_STREAM_TYPES = new Set([
+  "tool_call",
+  "tool_result",
+  "reasoning",
+  "plan_updated",
+  "plan_delta",
+  "thread_status",
+]);
+
+function isWorkingEvent(event: AgentEvent): boolean {
+  return WORKING_EVENT_TYPES.has(event.type);
+}
+
+function isWorkingStreamItem(item: StreamItem): boolean {
+  return WORKING_STREAM_TYPES.has(item.type);
+}
+
+function groupEventsForRender(events: AgentEvent[]): EventRenderItem[] {
+  const result: EventRenderItem[] = [];
+  let group: AgentEvent[] = [];
+
+  const flush = () => {
+    if (group.length === 0) return;
+    result.push({
+      kind: "working_group",
+      key: `working-group-${group[0].id}`,
+      events: group,
+    });
+    group = [];
+  };
+
+  for (const event of events) {
+    if (isWorkingEvent(event)) {
+      group.push(event);
+    } else {
+      flush();
+      result.push({ kind: "event", key: event.id, event });
+    }
+  }
+  flush();
+  return result;
+}
+
+function groupStreamItemsForRender(items: StreamItem[]): StreamRenderItem[] {
+  const result: StreamRenderItem[] = [];
+  let group: StreamItem[] = [];
+  let groupStart = 0;
+
+  const flush = () => {
+    if (group.length === 0) return;
+    result.push({
+      kind: "working_group",
+      key: `stream-working-group-${groupStart}`,
+      items: group,
+      startIndex: groupStart,
+    });
+    group = [];
+  };
+
+  items.forEach((item, index) => {
+    if (isWorkingStreamItem(item)) {
+      if (group.length === 0) groupStart = index;
+      group.push(item);
+    } else {
+      flush();
+      result.push({ kind: "item", key: `stream-${index}`, item, index });
+    }
+  });
+  flush();
+  return result;
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function WorkingShell({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="rounded-lg bg-muted/30 overflow-hidden">
+      {children}
+    </div>
+  );
+}
+
+function WorkingBlock({
+  startMs,
+  endMs,
+  live,
+  stepCount,
+  children,
+}: {
+  startMs: number;
+  endMs?: number;
+  live?: boolean;
+  stepCount: number;
+  children: React.ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!live) return;
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [live]);
+
+  const elapsed = (live ? now : endMs ?? now) - startMs;
+  const stepLabel = stepCount > 0 ? ` · ${stepCount} step${stepCount === 1 ? "" : "s"}` : "";
+
+  return (
+    <div className="rounded-lg bg-muted/30 overflow-hidden">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/50 transition-colors"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+        ) : (
+          <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+        )}
+        {live ? (
+          <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground/60" />
+        ) : null}
+        <span className="text-xs text-muted-foreground">
+          {live ? "Working for" : "Worked for"} {formatDuration(elapsed)}
+          {stepLabel}
+        </span>
+      </button>
+      {expanded && (
+        <div className="border-t border-border/30 py-1">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EventBlock({
   event,
   copiedId,
@@ -179,91 +343,17 @@ function EventBlock({
     );
   }
 
-  if (
-    event.type === "assistant_reasoning" ||
-    event.type === "assistant.reasoning"
-  ) {
-    const text =
-      (data.text as string | undefined) ??
-      (data.content as string | undefined) ??
-      "";
-    if (!text) return null;
-    return <ReasoningBlock text={text} />;
-  }
-
-  // tool_call: show tool name + input, expandable
-  if (event.type === "tool_call") {
-    const tool = data.tool as string | undefined;
-    const input = data.input as Record<string, unknown> | undefined;
-    if (!tool) return null;
-    const inputPreview = buildToolInputPreview(input);
-    return (
-      <ToolCallBlock
-        expanded={expanded}
-        input={input}
-        inputPreview={inputPreview}
-        onToggle={() => setExpanded(!expanded)}
-        tool={tool}
-      />
-    );
-  }
-
-  // tool_result: show truncated, expandable
-  if (event.type === "tool_result") {
-    const tool = data.tool as string | undefined;
-    const content = normalizeToolResultContent(data.content);
-    const isError = data.isError as boolean | undefined;
-    if (!content) return null;
-    const isLong = content.length > 200;
-    return (
-      <ToolResultBlock
-        content={content}
-        expanded={expanded}
-        isError={isError ?? false}
-        isLong={isLong}
-        onToggle={() => setExpanded(!expanded)}
-        tool={tool}
-      />
-    );
-  }
-
-  if (event.type === "plan_updated") {
-    const explanation = (data.explanation as string | null | undefined) ?? null;
-    const plan = ((data.plan as PlanStep[] | undefined) ?? []).filter(Boolean);
-    return <PlanUpdatedBlock explanation={explanation} plan={plan} />;
-  }
-
-  if (event.type === "plan_delta") {
+  // Working-group events are rendered inside WorkingBlock at the parent level.
+  if (isWorkingEvent(event)) {
     return null;
   }
+  // Silence unused-warning suppression (expanded used by fallback case below).
+  void expanded;
 
   if (event.type === "user_input_requested") {
     const questions = ((data.questions as UserInputQuestion[] | undefined) ?? []).filter(Boolean);
     if (questions.length === 0) return null;
     return <UserInputRequestedBlock questions={questions} />;
-  }
-
-  if (event.type === "thread_status") {
-    return null;
-  }
-
-  // policy_decision: show only if interesting (deny or ask)
-  if (event.type === "policy_decision") {
-    const decision = data.decision as string | undefined;
-    if (decision === "allow") return null;
-    const tool = data.tool as string | undefined;
-    return (
-      <div className="rounded-lg border border-border bg-card p-3">
-        <div className="flex items-center gap-2">
-          <Badge variant="secondary" className="shrink-0 text-[10px]">
-            <span className="text-purple-400">policy</span>
-          </Badge>
-          <span className="text-xs text-muted-foreground">
-            {tool}: <span className="font-medium text-foreground">{decision}</span>
-          </span>
-        </div>
-      </div>
-    );
   }
 
   // session_start / session_end: compact
@@ -331,29 +421,29 @@ function ReasoningBlock({ text }: { text: string }) {
   const preview = text.replace(/\s+/g, " ").trim();
 
   return (
-    <div className="rounded-lg border border-border/70 bg-card/60 overflow-hidden">
+    <div>
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-center gap-2 p-3 text-left min-w-0"
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left min-w-0 hover:bg-muted/50 transition-colors"
       >
         {expanded ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground/60" />
         ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
         )}
-        <Badge variant="secondary" className="shrink-0 text-[10px]">
-          <span className="text-sky-400">reasoning</span>
-        </Badge>
+        <span className="shrink-0 text-xs text-muted-foreground/80">
+          thought
+        </span>
         {!expanded && preview && (
-          <span className="truncate text-xs text-muted-foreground">
+          <span className="min-w-0 truncate text-xs text-muted-foreground/60">
             {preview.slice(0, 120)}
             {preview.length > 120 ? "..." : ""}
           </span>
         )}
       </button>
       {expanded && (
-        <div className="border-t border-border px-4 py-3">
-          <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words text-muted-foreground">
+        <div className="px-4 py-2 bg-background/30">
+          <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words text-muted-foreground/80 text-[13px]">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
           </div>
         </div>
@@ -362,49 +452,43 @@ function ReasoningBlock({ text }: { text: string }) {
   );
 }
 
-function ToolCallBlock({
-  expanded,
+function ToolCallRow({
   input,
   inputPreview,
-  onToggle,
   tool,
 }: {
-  expanded: boolean;
   input?: Record<string, unknown>;
   inputPreview: string;
-  onToggle: () => void;
   tool: string;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const toolLabel = truncateInlineText(tool, 80);
 
   return (
-    <div className="rounded-lg border border-border bg-card overflow-hidden">
+    <div>
       <button
-        onClick={onToggle}
-        className="flex w-full items-center gap-2 p-3 text-left min-w-0"
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left min-w-0 hover:bg-muted/50 transition-colors"
       >
         {expanded ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground/60" />
         ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
         )}
-        <Badge variant="secondary" className="shrink-0 text-[10px]">
-          <span className="text-yellow-400">tool_call</span>
-        </Badge>
         <span
-          className="min-w-0 max-w-80 truncate font-mono text-xs text-foreground"
+          className="min-w-0 max-w-60 truncate font-mono text-xs text-muted-foreground/80"
           title={tool}
         >
           {toolLabel}
         </span>
         {!expanded && inputPreview && (
-          <span className="min-w-0 truncate text-xs text-muted-foreground">
+          <span className="min-w-0 truncate text-xs text-muted-foreground/60">
             {inputPreview}
           </span>
         )}
       </button>
       {expanded && input && (
-        <pre className="border-t border-border px-4 py-3 text-xs text-muted-foreground font-mono whitespace-pre-wrap overflow-x-auto">
+        <pre className="px-4 py-2 text-[11px] text-muted-foreground/80 font-mono whitespace-pre-wrap overflow-x-auto bg-background/30">
           {JSON.stringify(input, null, 2)}
         </pre>
       )}
@@ -412,64 +496,170 @@ function ToolCallBlock({
   );
 }
 
-function ToolResultBlock({
+function ToolResultRow({
   content,
-  expanded,
   isError,
   isLong,
-  onToggle,
   tool,
 }: {
   content: string;
-  expanded: boolean;
   isError: boolean;
   isLong: boolean;
-  onToggle: () => void;
   tool?: string;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const toolLabel = tool ? truncateInlineText(tool, 80) : null;
 
   return (
-    <div className="rounded-lg border border-border bg-card overflow-hidden">
+    <div>
       <button
-        onClick={onToggle}
-        className="flex w-full items-center gap-2 p-3 text-left min-w-0"
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left min-w-0 hover:bg-muted/50 transition-colors"
       >
         {expanded ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground/60" />
         ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
         )}
-        <Badge
-          variant={isError ? "destructive" : "secondary"}
-          className="shrink-0 text-[10px]"
+        <span
+          className={`shrink-0 text-[10px] leading-none ${
+            isError ? "text-red-400/80" : "text-muted-foreground/50"
+          }`}
         >
-          <span className={isError ? "text-red-400" : "text-orange-400"}>
-            tool_result
-          </span>
-        </Badge>
+          {isError ? "✗" : "↳"}
+        </span>
         {tool && toolLabel && (
           <span
-            className="min-w-0 max-w-80 truncate font-mono text-xs text-foreground"
+            className="min-w-0 max-w-60 truncate font-mono text-xs text-muted-foreground/80"
             title={tool}
           >
             {toolLabel}
           </span>
         )}
         {!expanded && (
-          <span className="min-w-0 truncate text-xs text-muted-foreground">
+          <span
+            className={`min-w-0 truncate text-xs ${
+              isError ? "text-red-400/80" : "text-muted-foreground/60"
+            }`}
+          >
             {content.slice(0, 120)}
             {isLong ? "..." : ""}
           </span>
         )}
       </button>
       {expanded && (
-        <pre className="border-t border-border px-4 py-3 text-xs text-muted-foreground font-mono whitespace-pre-wrap overflow-x-auto max-h-96 overflow-y-auto">
+        <pre className="px-4 py-2 text-[11px] text-muted-foreground/80 font-mono whitespace-pre-wrap overflow-x-auto max-h-96 overflow-y-auto bg-background/30">
           {content}
         </pre>
       )}
     </div>
   );
+}
+
+function WorkingChildEvent({ event }: { event: AgentEvent }) {
+  const data = event.data;
+
+  if (event.type === "tool_call") {
+    const tool = data.tool as string | undefined;
+    const input = data.input as Record<string, unknown> | undefined;
+    if (!tool) return null;
+    return (
+      <ToolCallRow
+        input={input}
+        inputPreview={buildToolInputPreview(input)}
+        tool={tool}
+      />
+    );
+  }
+
+  if (event.type === "tool_result") {
+    const tool = data.tool as string | undefined;
+    const content = normalizeToolResultContent(data.content);
+    const isError = data.isError as boolean | undefined;
+    if (!content) return null;
+    return (
+      <ToolResultRow
+        content={content}
+        isError={isError ?? false}
+        isLong={content.length > 200}
+        tool={tool}
+      />
+    );
+  }
+
+  if (
+    event.type === "assistant_reasoning" ||
+    event.type === "assistant.reasoning"
+  ) {
+    const text =
+      (data.text as string | undefined) ??
+      (data.content as string | undefined) ??
+      "";
+    if (!text) return null;
+    return <ReasoningBlock text={text} />;
+  }
+
+  if (event.type === "plan_updated") {
+    const explanation = (data.explanation as string | null | undefined) ?? null;
+    const plan = ((data.plan as PlanStep[] | undefined) ?? []).filter(Boolean);
+    return <PlanUpdatedBlock explanation={explanation} plan={plan} />;
+  }
+
+  if (event.type === "policy_decision") {
+    const decision = data.decision as string | undefined;
+    if (decision === "allow") return null;
+    const tool = data.tool as string | undefined;
+    return (
+      <div className="rounded-lg border border-border bg-card p-3">
+        <div className="flex items-center gap-2">
+          <Badge variant="secondary" className="shrink-0 text-[10px]">
+            <span className="text-purple-400">policy</span>
+          </Badge>
+          <span className="text-xs text-muted-foreground">
+            {tool}: <span className="font-medium text-foreground">{decision}</span>
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function WorkingChildStreamItem({ item }: { item: StreamItem }) {
+  if (item.type === "tool_call") {
+    return (
+      <ToolCallRow
+        input={item.input}
+        inputPreview={buildToolInputPreview(item.input)}
+        tool={item.name}
+      />
+    );
+  }
+  if (item.type === "tool_result") {
+    return (
+      <ToolResultRow
+        content={item.content}
+        isError={item.isError}
+        isLong={item.content.length > 200}
+        tool={item.name}
+      />
+    );
+  }
+  if (item.type === "reasoning") {
+    return <ReasoningBlock text={item.text} />;
+  }
+  if (item.type === "plan_updated") {
+    return <PlanUpdatedBlock explanation={item.explanation} plan={item.plan} />;
+  }
+  if (item.type === "plan_delta") {
+    return (
+      <div className="rounded-lg border border-border bg-card/70 px-4 py-3 text-sm text-muted-foreground">
+        {item.delta}
+      </div>
+    );
+  }
+  return null;
 }
 
 function PlanUpdatedBlock({
@@ -871,7 +1061,7 @@ export function SessionView({
         if (data.type === "stderr") {
           const text = data.text.trim();
           if (text && isVisible()) {
-            setStreamItems((prev) => [...prev, { type: "error", text }]);
+            setStreamItems((prev) => [...prev, { type: "error", text, at: Date.now() }]);
           }
         }
       } else if (data.type === "ada_event") {
@@ -883,21 +1073,21 @@ export function SessionView({
           if (adaEvent.text && isVisible()) {
             setStreamItems((prev) => [
               ...prev,
-              { type: "assistant", text: adaEvent.text },
+              { type: "assistant", text: adaEvent.text, at: Date.now() },
             ]);
           }
         } else if (adaEvent.type === "assistant.reasoning") {
           if (adaEvent.text && isVisible()) {
             setStreamItems((prev) => [
               ...prev,
-              { type: "reasoning", text: adaEvent.text },
+              { type: "reasoning", text: adaEvent.text, at: Date.now() },
             ]);
           }
         } else if (adaEvent.type === "tool.call") {
           if (isVisible()) {
             setStreamItems((prev) => [
               ...prev,
-              { type: "tool_call", name: adaEvent.name, input: adaEvent.input },
+              { type: "tool_call", name: adaEvent.name, input: adaEvent.input, at: Date.now() },
             ]);
           }
         } else if (adaEvent.type === "tool.result") {
@@ -910,6 +1100,7 @@ export function SessionView({
                 name: adaEvent.name,
                 content,
                 isError: adaEvent.isError,
+                at: Date.now(),
               },
             ]);
           }
@@ -921,6 +1112,7 @@ export function SessionView({
                 type: "plan_updated",
                 explanation: adaEvent.explanation,
                 plan: adaEvent.plan,
+                at: Date.now(),
               },
             ]);
           }
@@ -938,6 +1130,7 @@ export function SessionView({
                     type: "plan_delta",
                     id: adaEvent.id,
                     delta: `${lastItem.delta}${adaEvent.delta}`,
+                    at: lastItem.at,
                   },
                 ];
               }
@@ -948,6 +1141,7 @@ export function SessionView({
                   type: "plan_delta",
                   id: adaEvent.id,
                   delta: adaEvent.delta,
+                  at: Date.now(),
                 },
               ];
             });
@@ -961,6 +1155,7 @@ export function SessionView({
                 type: "user_input_requested",
                 id: adaEvent.id,
                 questions: adaEvent.questions,
+                at: Date.now(),
               },
             ]);
           }
@@ -972,7 +1167,7 @@ export function SessionView({
           if (isVisible()) {
             setStreamItems((prev) => [
               ...prev,
-              { type: "error", text: adaEvent.error },
+              { type: "error", text: adaEvent.error, at: Date.now() },
             ]);
           }
         } else if (adaEvent.type === "run.completed") {
@@ -983,6 +1178,7 @@ export function SessionView({
               {
                 type: "error",
                 text: getRunStatusText(adaEvent.stopReason, adaEvent.status),
+                at: Date.now(),
               },
             ]);
           }
@@ -1020,7 +1216,7 @@ export function SessionView({
         const wasVisible = isVisible();
         sendContextRef.current = null;
         if (wasVisible) {
-          setStreamItems((prev) => [...prev, { type: "error", text }]);
+          setStreamItems((prev) => [...prev, { type: "error", text, at: Date.now() }]);
           setStreaming(false);
           setPendingMessage(null);
         }
@@ -1072,6 +1268,7 @@ export function SessionView({
         {
           type: "error",
           text: error instanceof Error ? error.message : "Failed to submit user input",
+          at: Date.now(),
         },
       ]);
     } finally {
@@ -1189,14 +1386,45 @@ export function SessionView({
 
               {/* Event timeline */}
               <div className="space-y-4">
-                {events.map((event) => (
-                  <EventBlock
-                    key={event.id}
-                    event={event}
-                    copiedId={copiedId}
-                    onCopy={copyEventData}
-                  />
-                ))}
+                {groupEventsForRender(events).map((renderItem) => {
+                  if (renderItem.kind === "working_group") {
+                    const groupEvents = renderItem.events;
+                    if (groupEvents.length === 1) {
+                      return (
+                        <WorkingShell key={renderItem.key}>
+                          <WorkingChildEvent event={groupEvents[0]} />
+                        </WorkingShell>
+                      );
+                    }
+                    const startMs = Date.parse(groupEvents[0].timestamp);
+                    const endMs = Date.parse(
+                      groupEvents[groupEvents.length - 1].timestamp
+                    );
+                    const stepCount = groupEvents.filter(
+                      (e) => e.type === "tool_call"
+                    ).length;
+                    return (
+                      <WorkingBlock
+                        key={renderItem.key}
+                        startMs={startMs}
+                        endMs={endMs}
+                        stepCount={stepCount}
+                      >
+                        {groupEvents.map((event) => (
+                          <WorkingChildEvent key={event.id} event={event} />
+                        ))}
+                      </WorkingBlock>
+                    );
+                  }
+                  return (
+                    <EventBlock
+                      key={renderItem.key}
+                      event={renderItem.event}
+                      copiedId={copiedId}
+                      onCopy={copyEventData}
+                    />
+                  );
+                })}
               </div>
 
               {/* Pending user message */}
@@ -1209,66 +1437,53 @@ export function SessionView({
               )}
 
               {/* Stream output */}
-              {streamItems.length > 0 && (
+              {streamItems.length > 0 && (() => {
+                const streamGroups = groupStreamItemsForRender(streamItems);
+                return (
                 <div className="mt-4 space-y-3">
-                  {streamItems.map((item, i) => {
-                    if (item.type === "assistant") {
-                      return <AssistantBlock key={i} text={item.text} />;
-                    }
-
-                    if (item.type === "reasoning") {
-                      return <ReasoningBlock key={i} text={item.text} />;
-                    }
-
-                    if (item.type === "tool_call") {
-                      const inputPreview = buildToolInputPreview(item.input);
-
+                  {streamGroups.map((render, idx) => {
+                    if (render.kind === "working_group") {
+                      if (render.items.length === 1) {
+                        return (
+                          <WorkingShell key={render.key}>
+                            <WorkingChildStreamItem item={render.items[0]} />
+                          </WorkingShell>
+                        );
+                      }
+                      const startMs = render.items[0].at;
+                      const endMs = render.items[render.items.length - 1].at;
+                      const stepCount = render.items.filter(
+                        (it) => it.type === "tool_call"
+                      ).length;
+                      const live = streaming && idx === streamGroups.length - 1;
                       return (
-                        <LiveToolCallBlock
-                          key={i}
-                          input={item.input}
-                          inputPreview={inputPreview}
-                          tool={item.name}
-                        />
-                      );
-                    }
-
-                    if (item.type === "tool_result") {
-                      return (
-                        <LiveToolResultBlock
-                          key={i}
-                          content={item.content}
-                          isError={item.isError}
-                          tool={item.name}
-                        />
-                      );
-                    }
-
-                    if (item.type === "plan_updated") {
-                      return (
-                        <PlanUpdatedBlock
-                          key={i}
-                          explanation={item.explanation}
-                          plan={item.plan}
-                        />
-                      );
-                    }
-
-                    if (item.type === "plan_delta") {
-                      return (
-                        <div
-                          key={i}
-                          className="rounded-lg border border-border bg-card/70 px-4 py-3 text-sm text-muted-foreground"
+                        <WorkingBlock
+                          key={render.key}
+                          startMs={startMs}
+                          endMs={live ? undefined : endMs}
+                          live={live}
+                          stepCount={stepCount}
                         >
-                          {item.delta}
-                        </div>
+                          {render.items.map((item, j) => (
+                            <WorkingChildStreamItem
+                              key={`${render.startIndex}-${j}`}
+                              item={item}
+                            />
+                          ))}
+                        </WorkingBlock>
                       );
+                    }
+
+                    const item = render.item;
+
+                    if (item.type === "assistant") {
+                      return <AssistantBlock key={render.key} text={item.text} />;
                     }
 
                     if (item.type === "user_input_requested") {
                       return (
                         <UserInputRequestedBlock
-                          key={i}
+                          key={render.key}
                           answers={
                             latestStructuredInputRequest?.id === item.id
                               ? userInputDraft
@@ -1299,13 +1514,14 @@ export function SessionView({
                     }
 
                     if (item.type === "error") {
-                      return <ErrorBlock key={i} text={item.text} />;
+                      return <ErrorBlock key={render.key} text={item.text} />;
                     }
 
                     return null;
                   })}
                 </div>
-              )}
+              );
+              })()}
 
               {streamItems.length === 0 && latestStructuredInputRequest && (
                 <div className="mt-4">
@@ -1527,47 +1743,3 @@ export function SessionView({
   );
 }
 
-function LiveToolCallBlock({
-  input,
-  inputPreview,
-  tool,
-}: {
-  input: Record<string, unknown>;
-  inputPreview: string;
-  tool: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-
-  return (
-    <ToolCallBlock
-      expanded={expanded}
-      input={input}
-      inputPreview={inputPreview}
-      onToggle={() => setExpanded(!expanded)}
-      tool={tool}
-    />
-  );
-}
-
-function LiveToolResultBlock({
-  content,
-  isError,
-  tool,
-}: {
-  content: string;
-  isError: boolean;
-  tool?: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-
-  return (
-    <ToolResultBlock
-      content={content}
-      expanded={expanded}
-      isError={isError}
-      isLong={content.length > 200}
-      onToggle={() => setExpanded(!expanded)}
-      tool={tool}
-    />
-  );
-}
