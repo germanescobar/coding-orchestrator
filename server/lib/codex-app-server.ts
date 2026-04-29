@@ -31,6 +31,7 @@ interface SessionRuntime {
   turnInProgress: boolean;
   listeners: Set<(event: AgentStreamEvent) => void>;
   pendingUserInput?: PendingUserInputRequest;
+  parseEvent: (line: string) => AgentStreamEvent | null;
   currentTurn?: {
     resolve: () => void;
     reject: (error: Error) => void;
@@ -202,6 +203,7 @@ export class CodexAppServerManager {
       startedEmitted: false,
       turnInProgress: false,
       listeners: new Set(),
+      parseEvent: this.codexProvider?.createParser?.() ?? (() => null),
     };
     this.sessions.set(runtime.sessionId, runtime);
     return runtime;
@@ -231,6 +233,7 @@ export class CodexAppServerManager {
       startedEmitted: false,
       turnInProgress: false,
       listeners: new Set(),
+      parseEvent: this.codexProvider?.createParser?.() ?? (() => null),
     };
     this.sessions.set(runtime.sessionId, runtime);
     return runtime;
@@ -335,7 +338,7 @@ export class CodexAppServerManager {
 
       if (message.id !== undefined) {
         if (message.method === "item/tool/requestUserInput" && runtime) {
-          const mappedEvent = this.codexProvider?.parseEvent(JSON.stringify(message));
+          const mappedEvent = runtime.parseEvent(JSON.stringify(message));
           if (mappedEvent?.type === "user.input_requested") {
             runtime.pendingUserInput = {
               requestId: message.id,
@@ -351,8 +354,8 @@ export class CodexAppServerManager {
         return;
       }
 
-      if (!runtime || !this.codexProvider) return;
-      const mappedEvent = this.codexProvider.parseEvent(JSON.stringify(message));
+      if (!runtime) return;
+      const mappedEvent = runtime.parseEvent(JSON.stringify(message));
       if (!mappedEvent) return;
       if (mappedEvent.type === "run.started" && runtime.startedEmitted) return;
       if (mappedEvent.type === "run.started") {

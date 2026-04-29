@@ -93,6 +93,7 @@ export interface AgentProvider {
   name: string;
   spawn(opts: SpawnOptions): ChildProcess;
   parseEvent(line: string): AgentStreamEvent | null;
+  createParser?(): (line: string) => AgentStreamEvent | null;
 }
 
 function normalizeToolResultContent(value: unknown): string {
@@ -141,14 +142,11 @@ const adaProvider: AgentProvider = {
 // Codex provider
 // ---------------------------------------------------------------------------
 
-let codexThreadId = "";
-
 const codexProvider: AgentProvider = {
   id: "codex",
   name: "Codex",
 
   spawn({ message, cwd, env, resumeSessionId, model, mode }) {
-    codexThreadId = "";
     // Flags must come before the prompt argument
     const flags = ["--json", "--full-auto", "--skip-git-repo-check", "--model", model || ""];
     if (mode === "plan") {
@@ -172,9 +170,18 @@ const codexProvider: AgentProvider = {
     });
   },
 
+  createParser() {
+    const state = { threadId: "" };
+    return (line: string): AgentStreamEvent | null => {
+      const event = JSON.parse(line);
+      return mapCodexEvent(event, state);
+    };
+  },
+
   parseEvent(line: string): AgentStreamEvent | null {
+    const state = { threadId: "" };
     const event = JSON.parse(line);
-    return mapCodexEvent(event);
+    return mapCodexEvent(event, state);
   },
 };
 
@@ -182,20 +189,20 @@ const codexProvider: AgentProvider = {
  * Map a Codex JSONL event to our normalized AgentStreamEvent format.
  * Returns null for events we don't surface to the UI.
  */
-function mapCodexEvent(event: Record<string, unknown>): AgentStreamEvent | null {
+function mapCodexEvent(event: Record<string, unknown>, state: { threadId: string }): AgentStreamEvent | null {
   const method = event.method as string | undefined;
   const params = event.params as Record<string, unknown> | undefined;
   if (method && params) {
-    return mapCodexAppServerEvent(method, params);
+    return mapCodexAppServerEvent(method, params, state);
   }
 
   const type = event.type as string;
 
   if (type === "thread.started") {
-    codexThreadId = event.thread_id as string;
+    state.threadId = event.thread_id as string;
     return {
       type: "run.started",
-      sessionId: codexThreadId,
+      sessionId: state.threadId,
       model: "",
       workingDirectory: "",
       timestamp: new Date().toISOString(),
@@ -268,7 +275,7 @@ function mapCodexEvent(event: Record<string, unknown>): AgentStreamEvent | null 
   if (type === "turn.completed") {
     return {
       type: "run.completed",
-      sessionId: codexThreadId,
+      sessionId: state.threadId,
       status: "completed",
       stopReason: "completed",
       timestamp: new Date().toISOString(),
@@ -282,7 +289,7 @@ function mapCodexEvent(event: Record<string, unknown>): AgentStreamEvent | null 
       "Unknown error";
     return {
       type: "run.failed",
-      sessionId: "",
+      sessionId: state.threadId,
       error,
       timestamp: new Date().toISOString(),
     };
@@ -294,7 +301,8 @@ function mapCodexEvent(event: Record<string, unknown>): AgentStreamEvent | null 
 
 function mapCodexAppServerEvent(
   method: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  state: { threadId: string }
 ): AgentStreamEvent | null {
   if (method === "thread/started") {
     const thread = params.thread as Record<string, unknown> | undefined;
@@ -303,7 +311,7 @@ function mapCodexAppServerEvent(
       (thread?.id as string | undefined) ??
       "";
     if (!threadId) return null;
-    codexThreadId = threadId;
+    state.threadId = threadId;
     return {
       type: "run.started",
       sessionId: threadId,
@@ -314,7 +322,7 @@ function mapCodexAppServerEvent(
   }
 
   if (method === "thread/status/changed") {
-    const threadId = (params.threadId as string | undefined) ?? codexThreadId;
+    const threadId = (params.threadId as string | undefined) ?? state.threadId;
     const status = getThreadStatusName(params.status);
     const activeFlags = getThreadActiveFlags(params.status);
     if (!threadId || !status) return null;
@@ -421,10 +429,12 @@ function mapCodexAppServerEvent(
         itemType;
 
       if (!isCompleted) {
-        const input =
-          (item.arguments as Record<string, unknown> | undefined) ??
-          (item.commandActions as Record<string, unknown> | undefined) ??
-          {};
+        const input: Record<string, unknown> =
+          itemType === "fileChange"
+            ? { changes: (item.changes as unknown[] | undefined) ?? [] }
+            : (item.arguments as Record<string, unknown> | undefined) ??
+              (item.commandActions as Record<string, unknown> | undefined) ??
+              {};
         return {
           type: "tool.call",
           id: itemId,
@@ -434,10 +444,12 @@ function mapCodexAppServerEvent(
       }
 
       const rawContent =
-        item.aggregatedOutput ??
-        item.result ??
-        item.text ??
-        item;
+        itemType === "fileChange"
+          ? { changes: (item.changes as unknown[] | undefined) ?? [] }
+          : item.aggregatedOutput ??
+            item.result ??
+            item.text ??
+            item;
       const content = normalizeToolResultContent(rawContent);
       const status = item.status as string | undefined;
       const exitCode = item.exitCode as number | null | undefined;
@@ -459,7 +471,7 @@ function mapCodexAppServerEvent(
   if (method === "turn/completed") {
     return {
       type: "run.completed",
-      sessionId: (params.threadId as string | undefined) ?? codexThreadId,
+      sessionId: (params.threadId as string | undefined) ?? state.threadId,
       status: "completed",
       stopReason: "completed",
       timestamp: new Date().toISOString(),
