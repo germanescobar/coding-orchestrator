@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, createContext, useContext } from "react";
+import { diffLines } from "diff";
 import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -71,6 +72,244 @@ function buildToolInputPreview(input?: Record<string, unknown>): string {
       return `${key}: ${truncateInlineText(stringValue, maxLength)}`;
     })
     .join(", ");
+}
+
+// ---------------------------------------------------------------------------
+// Diff utilities
+// ---------------------------------------------------------------------------
+
+interface DiffLine {
+  kind: "add" | "del" | "ctx";
+  text: string;
+}
+
+interface DiffFile {
+  path: string;
+  op: "add" | "delete" | "update";
+  lines: DiffLine[];
+}
+
+function extractPatchText(input: Record<string, unknown>): string | null {
+  const candidates: string[] = [];
+  const collect = (v: unknown) => {
+    if (typeof v === "string") candidates.push(v);
+    else if (Array.isArray(v)) v.forEach(collect);
+  };
+  Object.values(input).forEach(collect);
+  return candidates.find((s) => s.includes("*** Begin Patch")) ?? null;
+}
+
+function parseApplyPatch(input: Record<string, unknown>): DiffFile[] {
+  const patchText = extractPatchText(input);
+  if (!patchText) return [];
+
+  const match = patchText.match(/\*\*\* Begin Patch\n([\s\S]*?)\*\*\* End Patch/);
+  if (!match) return [];
+
+  const files: DiffFile[] = [];
+  const sections = match[1].split(/(?=\*\*\* (?:Add|Delete|Update) File:)/);
+
+  for (const section of sections) {
+    if (!section.trim()) continue;
+
+    const addM = section.match(/^\*\*\* Add File: (.+)\n([\s\S]*)/);
+    if (addM) {
+      const lines = addM[2]
+        .split("\n")
+        .filter((l) => l.startsWith("+"))
+        .map((l) => ({ kind: "add" as const, text: l.slice(1) }));
+      files.push({ path: addM[1].trim(), op: "add", lines });
+      continue;
+    }
+
+    const delM = section.match(/^\*\*\* Delete File: (.+)/);
+    if (delM) {
+      files.push({ path: delM[1].trim(), op: "delete", lines: [] });
+      continue;
+    }
+
+    const updM = section.match(/^\*\*\* Update File: (.+)\n([\s\S]*)/);
+    if (updM) {
+      const lines: DiffLine[] = [];
+      for (const raw of updM[2].split("\n")) {
+        if (raw.startsWith("@@")) lines.push({ kind: "ctx", text: raw });
+        else if (raw.startsWith("+")) lines.push({ kind: "add", text: raw.slice(1) });
+        else if (raw.startsWith("-")) lines.push({ kind: "del", text: raw.slice(1) });
+        else if (raw.startsWith(" ")) lines.push({ kind: "ctx", text: raw.slice(1) });
+      }
+      files.push({ path: updM[1].trim(), op: "update", lines });
+    }
+  }
+
+  return files;
+}
+
+function parseStrReplaceDiff(input: Record<string, unknown>): DiffFile[] {
+  const command = input.command as string | undefined;
+  const path = (input.path as string | undefined) ?? "";
+
+  if (command === "str_replace") {
+    const oldStr = (input.old_string as string | undefined) ?? "";
+    const newStr = (input.new_string as string | undefined) ?? "";
+    const lines: DiffLine[] = [];
+    for (const change of diffLines(oldStr, newStr)) {
+      const text = change.value.replace(/\n$/, "");
+      for (const line of text.split("\n")) {
+        if (change.added) lines.push({ kind: "add", text: line });
+        else if (change.removed) lines.push({ kind: "del", text: line });
+        else lines.push({ kind: "ctx", text: line });
+      }
+    }
+    return [{ path, op: "update", lines }];
+  }
+
+  if (command === "create" || command === "write") {
+    const content = ((input.file_text ?? input.content ?? "") as string).replace(/\n$/, "");
+    const lines = content.split("\n").map((text) => ({ kind: "add" as const, text }));
+    return [{ path, op: "add", lines }];
+  }
+
+  return [];
+}
+
+function parseWriteFileDiff(input: Record<string, unknown>): DiffFile[] {
+  const path = (input.path ?? input.file_path ?? "") as string;
+  const content = ((input.content ?? input.file_text ?? "") as string).replace(/\n$/, "");
+  if (!content) return [];
+  const lines = content.split("\n").map((text) => ({ kind: "add" as const, text }));
+  return [{ path, op: "add", lines }];
+}
+
+function parseUnifiedDiff(diffText: string, path: string, op: "add" | "delete" | "update"): DiffFile {
+  const lines: DiffLine[] = [];
+  for (const raw of diffText.split("\n")) {
+    if (raw.startsWith("@@")) lines.push({ kind: "ctx", text: raw });
+    else if (raw.startsWith("+")) lines.push({ kind: "add", text: raw.slice(1) });
+    else if (raw.startsWith("-")) lines.push({ kind: "del", text: raw.slice(1) });
+    else if (raw.startsWith(" ")) lines.push({ kind: "ctx", text: raw.slice(1) });
+    // skip "\ No newline at end of file" markers
+  }
+  return { path, op, lines };
+}
+
+interface CodexFileChange {
+  path: string;
+  kind?: { type?: string; move_path?: string | null };
+  diff?: string;
+}
+
+function parseFileChangeDiff(input: Record<string, unknown>): DiffFile[] {
+  const changes = input.changes as CodexFileChange[] | undefined;
+  if (!Array.isArray(changes) || changes.length === 0) return [];
+  return changes
+    .filter((c) => c.path)
+    .map((c) => {
+      const op = c.kind?.type === "add" ? "add" : c.kind?.type === "delete" ? "delete" : "update";
+      return c.diff ? parseUnifiedDiff(c.diff, c.path, op) : { path: c.path, op, lines: [] };
+    });
+}
+
+function parseDiffFromToolCall(tool: string, input?: Record<string, unknown>): DiffFile[] {
+  if (!input) return [];
+  const t = tool.toLowerCase();
+  if (t === "apply_patch" || t === "applypatch") return parseApplyPatch(input);
+  if (t === "str_replace_based_edit_tool" || t === "str_replace_editor") return parseStrReplaceDiff(input);
+  if (t === "write_file" || t === "create_file" || t === "edit_file") return parseWriteFileDiff(input);
+  if (t === "filechange" || t === "file_change") return parseFileChangeDiff(input);
+  return [];
+}
+
+const ProjectRootContext = createContext<string | undefined>(undefined);
+
+function relativizePath(path: string, root: string | undefined): string {
+  if (!root) return path;
+  const trimmedRoot = root.replace(/\/+$/, "");
+  if (path === trimmedRoot) return ".";
+  const prefix = trimmedRoot + "/";
+  if (path.startsWith(prefix)) return path.slice(prefix.length);
+  return path;
+}
+
+function summarizeDiffFiles(files: DiffFile[]): { added: number; deleted: number } {
+  let added = 0;
+  let deleted = 0;
+  for (const f of files) {
+    for (const line of f.lines) {
+      if (line.kind === "add") added += 1;
+      else if (line.kind === "del") deleted += 1;
+    }
+  }
+  return { added, deleted };
+}
+
+function DiffBlock({ files }: { files: DiffFile[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const projectRoot = useContext(ProjectRootContext);
+  const { added, deleted } = summarizeDiffFiles(files);
+  const summary =
+    files.length === 1
+      ? relativizePath(files[0].path, projectRoot)
+      : `${files.length} files changed`;
+
+  return (
+    <div>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left min-w-0 hover:bg-muted/50 transition-colors"
+      >
+        {expanded ? (
+          <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+        ) : (
+          <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+        )}
+        <span className="min-w-0 truncate font-mono text-xs text-muted-foreground/80">
+          {summary}
+        </span>
+        <span className="shrink-0 font-mono text-xs">
+          <span className="text-green-400/90">+{added}</span>{" "}
+          <span className="text-red-400/90">-{deleted}</span>
+        </span>
+      </button>
+      {expanded && <DiffView files={files} />}
+    </div>
+  );
+}
+
+function DiffView({ files }: { files: DiffFile[] }) {
+  const projectRoot = useContext(ProjectRootContext);
+  return (
+    <div className="px-3 py-2 space-y-2">
+      {files.map((file, i) => (
+        <div key={i}>
+          <div className="pb-1 font-mono text-[10px] text-muted-foreground/70">
+            {file.op === "add" ? "new file" : file.op === "delete" ? "deleted" : "modified"}{" "}
+            <span className="text-muted-foreground/90">{relativizePath(file.path, projectRoot)}</span>
+          </div>
+          {file.op !== "delete" && file.lines.length > 0 && (
+            <div className="rounded overflow-x-auto bg-background/40 font-mono text-[11px]">
+              {file.lines.map((line, j) => (
+                <div
+                  key={j}
+                  className={
+                    line.kind === "add"
+                      ? "bg-green-950/40 text-green-300/90"
+                      : line.kind === "del"
+                      ? "bg-red-950/40 text-red-300/90"
+                      : "text-muted-foreground/50"
+                  }
+                >
+                  <span className="select-none px-1.5 opacity-60">
+                    {line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}
+                  </span>
+                  <span className="whitespace-pre">{line.text}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 const COMPOSER_MAX_LINES = 5;
@@ -463,6 +702,12 @@ function ToolCallRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const toolLabel = truncateInlineText(tool, 80);
+  const diffFiles = parseDiffFromToolCall(tool, input);
+  const hasDiff = diffFiles.length > 0;
+
+  if (hasDiff) {
+    return <DiffBlock files={diffFiles} />;
+  }
 
   return (
     <div>
@@ -510,6 +755,19 @@ function ToolResultRow({
   const [expanded, setExpanded] = useState(false);
   const toolLabel = tool ? truncateInlineText(tool, 80) : null;
 
+  const t = tool?.toLowerCase();
+  const isFileChangeResult = t === "filechange" || t === "file_change";
+  if (isFileChangeResult) {
+    try {
+      const files = parseFileChangeDiff(JSON.parse(content) as Record<string, unknown>);
+      if (files.some((f) => f.lines.length > 0)) return null;
+    } catch {
+      // Fall through to default rendering if content isn't parseable.
+    }
+  }
+
+  const collapsedPreview = content.slice(0, 120) + (isLong ? "..." : "");
+
   return (
     <div>
       <button
@@ -542,8 +800,7 @@ function ToolResultRow({
               isError ? "text-red-400/80" : "text-muted-foreground/60"
             }`}
           >
-            {content.slice(0, 120)}
-            {isLong ? "..." : ""}
+            {collapsedPreview}
           </span>
         )}
       </button>
@@ -839,6 +1096,8 @@ export function SessionView({
   const [userInputDraft, setUserInputDraft] = useState<Record<string, string>>({});
   const [submittingUserInput, setSubmittingUserInput] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const terminalRef = useRef<TerminalHandle | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
@@ -1005,8 +1264,21 @@ export function SessionView({
   }, []);
 
   useEffect(() => {
+    stickToBottomRef.current = true;
+    bottomRef.current?.scrollIntoView({ behavior: "auto" });
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [events, streamItems]);
+
+  const handleScroll = () => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 80;
+  };
 
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
@@ -1371,7 +1643,12 @@ export function SessionView({
           sessionId && mobilePanel === "terminal" ? "hidden md:flex" : "flex"
         } ${sessionId && terminalOpen ? "md:w-1/2 md:border-r md:border-border" : "flex-1"}`}>
           {/* Messages / Events area */}
-          <div className="flex-1 overflow-y-auto min-h-0">
+          <div
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            className="flex-1 overflow-y-auto min-h-0"
+          >
+            <ProjectRootContext.Provider value={project?.path}>
             <div className="mx-auto max-w-3xl px-3 py-4 md:px-4 md:py-6">
               {!sessionId && events.length === 0 && streamItems.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-20">
@@ -1553,6 +1830,7 @@ export function SessionView({
 
               <div ref={bottomRef} />
             </div>
+            </ProjectRootContext.Provider>
           </div>
 
           {/* Input */}

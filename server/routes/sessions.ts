@@ -387,10 +387,6 @@ async function streamCodexPlanSession(
 
   sseSend({ type: "started" });
 
-  if (resumeSessionId) {
-    persistSessionStart(resumeSessionId).catch(() => {});
-  }
-
   req.on("close", () => {
     clientConnected = false;
   });
