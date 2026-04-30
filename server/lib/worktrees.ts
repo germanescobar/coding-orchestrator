@@ -1,0 +1,170 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { v4 as uuidv4 } from "uuid";
+import { getProject, type Project } from "./projects.js";
+import { orchestratorHome, worktreesRegistryFile } from "./paths.js";
+
+export interface Worktree {
+  id: string;
+  projectId: string;
+  name: string;
+  path: string;
+  branch?: string;
+  isMain: boolean;
+  portOffset?: number;
+  createdAt: string;
+  setupRanAt?: string;
+  setupExitCode?: number;
+  setupLogPath?: string;
+}
+
+const MAIN_WORKTREE_NAME = "main";
+
+async function ensureHome() {
+  await fs.mkdir(orchestratorHome(), { recursive: true });
+}
+
+async function readRegistry(): Promise<Worktree[]> {
+  try {
+    const content = await fs.readFile(worktreesRegistryFile(), "utf-8");
+    return JSON.parse(content) as Worktree[];
+  } catch {
+    return [];
+  }
+}
+
+async function writeRegistry(worktrees: Worktree[]): Promise<void> {
+  await ensureHome();
+  await fs.writeFile(
+    worktreesRegistryFile(),
+    JSON.stringify(worktrees, null, 2)
+  );
+}
+
+function buildMainWorktree(project: Project): Worktree {
+  return {
+    id: uuidv4(),
+    projectId: project.id,
+    name: MAIN_WORKTREE_NAME,
+    path: project.path,
+    isMain: true,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Ensure a project has a main worktree row. Returns the registry after
+ * lazy-creating the row if it was missing.
+ */
+async function ensureMainInRegistry(
+  project: Project,
+  registry: Worktree[]
+): Promise<{ registry: Worktree[]; main: Worktree; created: boolean }> {
+  const existing = registry.find(
+    (w) => w.projectId === project.id && w.isMain
+  );
+  if (existing) return { registry, main: existing, created: false };
+
+  const main = buildMainWorktree(project);
+  const next = [...registry, main];
+  await writeRegistry(next);
+  return { registry: next, main, created: true };
+}
+
+export async function ensureMainWorktree(project: Project): Promise<Worktree> {
+  const registry = await readRegistry();
+  const { main } = await ensureMainInRegistry(project, registry);
+  return main;
+}
+
+export async function getProjectWorktrees(
+  projectId: string
+): Promise<Worktree[]> {
+  const project = await getProject(projectId);
+  if (!project) return [];
+  const registry = await readRegistry();
+  const { registry: next } = await ensureMainInRegistry(project, registry);
+  return next.filter((w) => w.projectId === projectId);
+}
+
+export async function getWorktree(
+  projectId: string,
+  worktreeId: string
+): Promise<Worktree | null> {
+  const worktrees = await getProjectWorktrees(projectId);
+  if (worktreeId === MAIN_WORKTREE_NAME) {
+    return worktrees.find((w) => w.isMain) ?? null;
+  }
+  return worktrees.find((w) => w.id === worktreeId) ?? null;
+}
+
+/**
+ * Resolve a worktree from a query string. Defaults to the project's main
+ * worktree when no id is provided. Accepts the literal alias "main".
+ */
+export async function resolveWorktree(
+  projectId: string,
+  worktreeIdParam?: string | string[]
+): Promise<Worktree | null> {
+  const project = await getProject(projectId);
+  if (!project) return null;
+  const id = Array.isArray(worktreeIdParam)
+    ? worktreeIdParam[0]
+    : worktreeIdParam;
+  if (!id || id === MAIN_WORKTREE_NAME) {
+    return ensureMainWorktree(project);
+  }
+  return getWorktree(projectId, id);
+}
+
+export async function addWorktree(
+  worktree: Omit<Worktree, "id" | "createdAt"> & { id?: string }
+): Promise<Worktree> {
+  const registry = await readRegistry();
+  const record: Worktree = {
+    id: worktree.id ?? uuidv4(),
+    createdAt: new Date().toISOString(),
+    ...worktree,
+  };
+  registry.push(record);
+  await writeRegistry(registry);
+  return record;
+}
+
+export async function updateWorktree(
+  worktreeId: string,
+  patch: Partial<Worktree>
+): Promise<Worktree | null> {
+  const registry = await readRegistry();
+  const idx = registry.findIndex((w) => w.id === worktreeId);
+  if (idx === -1) return null;
+  const updated: Worktree = { ...registry[idx], ...patch, id: registry[idx].id };
+  registry[idx] = updated;
+  await writeRegistry(registry);
+  return updated;
+}
+
+export async function removeWorktree(worktreeId: string): Promise<boolean> {
+  const registry = await readRegistry();
+  const next = registry.filter((w) => w.id !== worktreeId);
+  if (next.length === registry.length) return false;
+  await writeRegistry(next);
+  return true;
+}
+
+/** Monotonic per-project port offset: max existing + 1, starting at 1. */
+export async function nextPortOffset(projectId: string): Promise<number> {
+  const registry = await readRegistry();
+  const used = registry
+    .filter((w) => w.projectId === projectId && typeof w.portOffset === "number")
+    .map((w) => w.portOffset as number);
+  if (used.length === 0) return 1;
+  return Math.max(...used) + 1;
+}
+
+export function isMainWorktreeName(name: string): boolean {
+  return name === MAIN_WORKTREE_NAME;
+}
+
+export const WORKTREE_NAME_REGEX = /^[a-z0-9][a-z0-9._-]*$/;
+export const WORKTREE_NAME_MAX_LENGTH = 64;

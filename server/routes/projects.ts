@@ -1,5 +1,6 @@
 import { Router } from "express";
-import { getProjects, addProject, deleteProject } from "../lib/projects.js";
+import { getProjects, addProject, updateProject, deleteProject } from "../lib/projects.js";
+import { ensureMainWorktree } from "../lib/worktrees.js";
 
 export const projectsRouter = Router();
 
@@ -15,15 +16,31 @@ projectsRouter.get("/", async (_req, res) => {
 
 projectsRouter.post("/", async (req, res) => {
   try {
-    const { name, path } = req.body as { name: string; path: string };
+    const { name, path, setupCommands } = req.body as { name: string; path: string; setupCommands?: string };
     if (!name || !path) {
       res.status(400).json({ error: "name and path are required" });
       return;
     }
-    const project = await addProject(name, path);
+    const project = await addProject(name, path, setupCommands);
+    await ensureMainWorktree(project);
     res.status(201).json(project);
   } catch (err) {
     console.error("POST /projects error:", err);
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+projectsRouter.put("/:id", async (req, res) => {
+  try {
+    const { name, setupCommands } = req.body as { name?: string; setupCommands?: string };
+    const updated = await updateProject(req.params.id, { name, setupCommands });
+    if (!updated) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    res.json(updated);
+  } catch (err) {
+    console.error("PUT /projects/:id error:", err);
     res.status(500).json({ error: (err as Error).message });
   }
 });

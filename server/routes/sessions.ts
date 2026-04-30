@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { getProject } from "../lib/projects.js";
+import { resolveWorktree } from "../lib/worktrees.js";
 import { getSessions, getSession, getEvents, archiveSession, saveSession, appendEvent, type AgentEvent } from "../lib/sessions.js";
 import { getApiKeyEnvVars } from "../lib/api-keys.js";
 import { getAgentProvider, type AgentStreamEvent } from "../lib/agents.js";
@@ -27,6 +28,15 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     return;
   }
 
+  const worktree = await resolveWorktree(
+    req.params.projectId,
+    req.query.worktreeId as string | undefined
+  );
+  if (!worktree) {
+    res.status(404).json({ error: "Worktree not found" });
+    return;
+  }
+
   const message = req.query.message as string;
   const resumeSessionId = req.query.resumeSessionId as string | undefined;
   const model = req.query.model as string | undefined;
@@ -46,7 +56,8 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
 
   if (providerId === "codex") {
     await streamCodexPlanSession(req, res, {
-      projectPath: project.path,
+      worktreePath: worktree.path,
+      worktreeId: worktree.id,
       message,
       resumeSessionId,
       model,
@@ -66,7 +77,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
 
   const child = provider.spawn({
     message,
-    cwd: project.path,
+    cwd: worktree.path,
     env: apiKeyEnv,
     resumeSessionId,
     model,
@@ -86,7 +97,8 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     child.stdin?.end();
   }
 
-  const projectPath = project.path;
+  const worktreePath = worktree.path;
+  const worktreeId = worktree.id;
 
   /** Write the user message + create/update session file once we know the sessionId. */
   async function persistSessionStart(sessionId: string) {
@@ -95,7 +107,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     // Write user message (only for non-Ada providers that don't persist their own events)
     if (shouldPersist && !userMessageWritten) {
       userMessageWritten = true;
-      await appendEvent(projectPath, sessionId, {
+      await appendEvent(worktreePath, sessionId, {
         id: randomUUID(),
         sessionId,
         timestamp: new Date().toISOString(),
@@ -104,12 +116,13 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       });
     }
     // Merge with existing session file (preserve title/createdAt from earlier messages)
-    const existing = await getSession(projectPath, sessionId);
+    const existing = await getSession(worktreePath, sessionId);
     const title = existing?.title || (message.length > 60 ? message.slice(0, 60) + "..." : message);
-    await saveSession(projectPath, {
+    await saveSession(worktreePath, {
       id: sessionId,
       title,
-      workingDirectory: projectPath,
+      workingDirectory: worktreePath,
+      worktreeId,
       model: model ?? existing?.model ?? "",
       provider: providerId,
       mode,
@@ -131,7 +144,7 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       type: getPersistedEventType(event),
       data: getPersistedEventData(event),
     };
-    appendEvent(projectPath, streamSessionId, agentEvent).catch(() => {});
+    appendEvent(worktreePath, streamSessionId, agentEvent).catch(() => {});
   }
 
   // Track whether the SSE client is still connected so we avoid writing
@@ -243,10 +256,10 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     // Update runtime state and lastActiveAt once the stream closes.
     if (streamSessionId) {
       markSessionInactive(streamSessionId);
-      getSession(projectPath, streamSessionId).then((existing) => {
+      getSession(worktreePath, streamSessionId).then((existing) => {
         if (existing) {
           existing.lastActiveAt = new Date().toISOString();
-          saveSession(projectPath, existing);
+          saveSession(worktreePath, existing);
         }
       }).catch(() => {});
     }
@@ -277,7 +290,8 @@ async function streamCodexPlanSession(
   req: Request,
   res: Response,
   options: {
-    projectPath: string;
+    worktreePath: string;
+    worktreeId: string;
     message: string;
     resumeSessionId?: string;
     model?: string;
@@ -285,7 +299,7 @@ async function streamCodexPlanSession(
     providerId: string;
   }
 ) {
-  const { projectPath, message, resumeSessionId, model, mode, providerId } = options;
+  const { worktreePath, worktreeId, message, resumeSessionId, model, mode, providerId } = options;
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -310,7 +324,7 @@ async function streamCodexPlanSession(
     markSessionActive(sessionId);
     if (!userMessageWritten) {
       userMessageWritten = true;
-      await appendEvent(projectPath, sessionId, {
+      await appendEvent(worktreePath, sessionId, {
         id: randomUUID(),
         sessionId,
         timestamp: new Date().toISOString(),
@@ -319,12 +333,13 @@ async function streamCodexPlanSession(
       });
     }
 
-    const existing = await getSession(projectPath, sessionId);
+    const existing = await getSession(worktreePath, sessionId);
     const title = existing?.title || (message.length > 60 ? `${message.slice(0, 60)}...` : message);
-    await saveSession(projectPath, {
+    await saveSession(worktreePath, {
       id: sessionId,
       title,
-      workingDirectory: projectPath,
+      workingDirectory: worktreePath,
+      worktreeId,
       model: model ?? existing?.model ?? "",
       provider: providerId,
       mode,
@@ -344,15 +359,15 @@ async function streamCodexPlanSession(
       type: getPersistedEventType(event),
       data: getPersistedEventData(event),
     };
-    appendEvent(projectPath, streamSessionId, agentEvent).catch(() => {});
+    appendEvent(worktreePath, streamSessionId, agentEvent).catch(() => {});
   }
 
   async function touchSession() {
     if (!streamSessionId) return;
-    const existing = await getSession(projectPath, streamSessionId);
+    const existing = await getSession(worktreePath, streamSessionId);
     if (!existing) return;
     existing.lastActiveAt = new Date().toISOString();
-    await saveSession(projectPath, existing);
+    await saveSession(worktreePath, existing);
   }
 
   const handleEvent = (event: AgentStreamEvent) => {
@@ -395,7 +410,7 @@ async function streamCodexPlanSession(
     await codexAppServerManager.startPlanTurn(
       {
         message,
-        cwd: projectPath,
+        cwd: worktreePath,
         env: await getApiKeyEnvVars(),
         resumeSessionId,
         model,
@@ -470,11 +485,79 @@ function getPersistedEventData(event: AgentStreamEvent): Record<string, unknown>
 }
 
 sessionsRouter.post(
+  "/:projectId/sessions/:sessionId/stop",
+  async (req, res) => {
+    const project = await getProject(req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    try {
+      await codexAppServerManager.stopSession(req.params.sessionId);
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+);
+
+sessionsRouter.post(
+  "/:projectId/sessions/:sessionId/steer",
+  async (req, res) => {
+    const project = await getProject(req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
+
+    const message = req.body.message as string | undefined;
+    if (!message || typeof message !== "string") {
+      res.status(400).json({ error: "message is required" });
+      return;
+    }
+
+    try {
+      await codexAppServerManager.steerSession(req.params.sessionId, message);
+      await appendEvent(worktree.path, req.params.sessionId, {
+        id: randomUUID(),
+        sessionId: req.params.sessionId,
+        timestamp: new Date().toISOString(),
+        type: "user_message",
+        data: { text: message },
+      });
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+);
+
+sessionsRouter.post(
   "/:projectId/sessions/:sessionId/user-input",
   async (req, res) => {
     const project = await getProject(req.params.projectId);
     if (!project) {
       res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
       return;
     }
 
@@ -486,7 +569,7 @@ sessionsRouter.post(
 
     try {
       await codexAppServerManager.submitUserInput(req.params.sessionId, answers);
-      await appendEvent(project.path, req.params.sessionId, {
+      await appendEvent(worktree.path, req.params.sessionId, {
         id: randomUUID(),
         sessionId: req.params.sessionId,
         timestamp: new Date().toISOString(),
@@ -494,10 +577,10 @@ sessionsRouter.post(
         data: { answers },
       });
 
-      const existing = await getSession(project.path, req.params.sessionId);
+      const existing = await getSession(worktree.path, req.params.sessionId);
       if (existing) {
         existing.lastActiveAt = new Date().toISOString();
-        await saveSession(project.path, existing);
+        await saveSession(worktree.path, existing);
       }
 
       res.json({ ok: true });
@@ -518,7 +601,15 @@ sessionsRouter.post(
       res.status(404).json({ error: "Project not found" });
       return;
     }
-    const archived = await archiveSession(project.path, req.params.sessionId);
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
+    const archived = await archiveSession(worktree.path, req.params.sessionId);
     if (!archived) {
       res.status(404).json({ error: "Session not found" });
       return;
@@ -534,7 +625,15 @@ sessionsRouter.get("/:projectId/sessions", async (req, res) => {
     res.status(404).json({ error: "Project not found" });
     return;
   }
-  const sessions = await getSessions(project.path);
+  const worktree = await resolveWorktree(
+    req.params.projectId,
+    req.query.worktreeId as string | undefined
+  );
+  if (!worktree) {
+    res.status(404).json({ error: "Worktree not found" });
+    return;
+  }
+  const sessions = await getSessions(worktree.path);
   res.json(sessions);
 });
 
@@ -545,7 +644,15 @@ sessionsRouter.get("/:projectId/sessions/:sessionId", async (req, res) => {
     res.status(404).json({ error: "Project not found" });
     return;
   }
-  const session = await getSession(project.path, req.params.sessionId);
+  const worktree = await resolveWorktree(
+    req.params.projectId,
+    req.query.worktreeId as string | undefined
+  );
+  if (!worktree) {
+    res.status(404).json({ error: "Worktree not found" });
+    return;
+  }
+  const session = await getSession(worktree.path, req.params.sessionId);
   if (!session) {
     res.status(404).json({ error: "Session not found" });
     return;
@@ -561,8 +668,16 @@ sessionsRouter.get(
       res.status(404).json({ error: "Project not found" });
       return;
     }
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
 
-    const session = await getSession(project.path, req.params.sessionId);
+    const session = await getSession(worktree.path, req.params.sessionId);
     if (!session) {
       res.status(404).json({ error: "Session not found" });
       return;
@@ -581,7 +696,15 @@ sessionsRouter.get(
       res.status(404).json({ error: "Project not found" });
       return;
     }
-    const events = await getEvents(project.path, req.params.sessionId);
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
+    const events = await getEvents(worktree.path, req.params.sessionId);
     res.json(events);
   }
 );

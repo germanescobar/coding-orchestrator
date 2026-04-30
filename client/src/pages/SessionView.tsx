@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, createContext, useContext } from "react";
 import { diffLines } from "diff";
-import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare } from "lucide-react";
+import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,8 @@ import {
   fetchSession,
   fetchSessionRuntime,
   startSession,
+  stopSession,
+  steerSession,
   submitSessionUserInput,
   type Project,
   type AgentEvent,
@@ -27,6 +29,7 @@ import {
 interface SessionViewProps {
   projectId: string;
   sessionId?: string;
+  worktreeId?: string;
   project?: Project;
   onSessionCreated: (sessionId: string) => void;
   onBackgroundComplete?: (sessionId: string) => void;
@@ -34,6 +37,7 @@ interface SessionViewProps {
 
 type StreamItem = (
   | { type: "assistant"; text: string }
+  | { type: "user_message"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; name?: string; content: string; isError: boolean }
@@ -1072,6 +1076,7 @@ function ErrorBlock({ text }: { text: string }) {
 export function SessionView({
   projectId,
   sessionId,
+  worktreeId,
   project,
   onSessionCreated,
   onBackgroundComplete,
@@ -1171,9 +1176,9 @@ export function SessionView({
     if (sessionId) {
       setProviderResolved(false);
       Promise.allSettled([
-        fetchSession(projectId, sessionId),
-        fetchEvents(projectId, sessionId),
-        fetchSessionRuntime(projectId, sessionId),
+        fetchSession(projectId, sessionId, worktreeId),
+        fetchEvents(projectId, sessionId, worktreeId),
+        fetchSessionRuntime(projectId, sessionId, worktreeId),
       ])
         .then(([sessionResult, eventsResult, runtimeResult]) => {
           if (sessionResult.status === "fulfilled") {
@@ -1205,7 +1210,7 @@ export function SessionView({
     }
     setActiveStreamSessionId(sessionId ?? null);
     setUserInputDraft({});
-  }, [projectId, sessionId]);
+  }, [projectId, sessionId, worktreeId]);
 
   useEffect(() => {
     if (!sessionId || eventSourceRef.current) return;
@@ -1215,8 +1220,8 @@ export function SessionView({
     const interval = window.setInterval(async () => {
       try {
         const [evts, runtime] = await Promise.all([
-          fetchEvents(projectId, sessionId),
-          fetchSessionRuntime(projectId, sessionId),
+          fetchEvents(projectId, sessionId, worktreeId),
+          fetchSessionRuntime(projectId, sessionId, worktreeId),
         ]);
         if (cancelled) return;
         setEvents(evts);
@@ -1319,6 +1324,7 @@ export function SessionView({
       model: selectedModel,
       provider: selectedProvider || undefined,
       mode: selectedProvider === "codex" ? selectedMode : "default",
+      worktreeId,
     });
     eventSourceRef.current = es;
 
@@ -1466,7 +1472,7 @@ export function SessionView({
           setPendingMessage(null);
           setActiveStreamSessionId(detectedSessionId || null);
           if (detectedSessionId) {
-            fetchEvents(projectId, detectedSessionId)
+            fetchEvents(projectId, detectedSessionId, worktreeId)
               .then((evts) => {
                 setEvents(evts);
                 if (evts.length > 0 && !runFailed && (data.exitCode ?? 1) === 0) {
@@ -1507,10 +1513,45 @@ export function SessionView({
     };
   };
 
+  const handleStop = async () => {
+    const targetSessionId = activeStreamSessionId ?? sessionId;
+    if (!targetSessionId) return;
+    try {
+      await stopSession(projectId, targetSessionId, worktreeId);
+    } catch (err) {
+      setStreamItems((prev) => [
+        ...prev,
+        { type: "error", text: err instanceof Error ? err.message : "Failed to stop session", at: Date.now() },
+      ]);
+    }
+  };
+
+  const handleSteer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!message.trim()) return;
+    const targetSessionId = activeStreamSessionId ?? sessionId;
+    if (!targetSessionId) return;
+    const steerText = message;
+    setMessage("");
+    setStreamItems((prev) => [...prev, { type: "user_message", text: steerText, at: Date.now() }]);
+    try {
+      await steerSession(projectId, targetSessionId, steerText, worktreeId);
+    } catch (err) {
+      setStreamItems((prev) => [
+        ...prev,
+        { type: "error", text: err instanceof Error ? err.message : "Failed to steer session", at: Date.now() },
+      ]);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend(e);
+      if (streaming && selectedProvider === "codex") {
+        handleSteer(e as unknown as React.FormEvent);
+      } else {
+        handleSend(e);
+      }
     }
   };
 
@@ -1532,7 +1573,7 @@ export function SessionView({
 
     setSubmittingUserInput(true);
     try {
-      await submitSessionUserInput(projectId, targetSessionId, answers);
+      await submitSessionUserInput(projectId, targetSessionId, answers, worktreeId);
       setUserInputDraft({});
     } catch (error) {
       setStreamItems((prev) => [
@@ -1613,13 +1654,8 @@ export function SessionView({
           </div>
         )}
 
-        {/* Desktop: path + terminal toggle */}
+        {/* Desktop: terminal toggle */}
         <div className="hidden md:flex items-center gap-2">
-          {project && (
-            <span className="font-mono text-xs text-muted-foreground truncate max-w-64">
-              {project.path}
-            </span>
-          )}
           {sessionId && (
             <button
               onClick={() => setTerminalOpen(!terminalOpen)}
@@ -1753,6 +1789,16 @@ export function SessionView({
 
                     const item = render.item;
 
+                    if (item.type === "user_message") {
+                      return (
+                        <div key={render.key} className="flex justify-end">
+                          <div className="max-w-[85%] rounded-2xl bg-secondary px-4 py-3 text-sm">
+                            {item.text}
+                          </div>
+                        </div>
+                      );
+                    }
+
                     if (item.type === "assistant") {
                       return <AssistantBlock key={render.key} text={item.text} />;
                     }
@@ -1836,7 +1882,7 @@ export function SessionView({
           {/* Input */}
           <div className="shrink-0 border-t border-border bg-background px-3 pb-3 pt-2 md:px-4 md:pb-4 md:pt-3">
             <div className="mx-auto max-w-3xl">
-              <form onSubmit={handleSend}>
+              <form onSubmit={streaming && selectedProvider === "codex" ? handleSteer : handleSend}>
                 <div className="rounded-xl border border-border bg-input p-3">
                   <textarea
                     ref={textareaRef}
@@ -1844,18 +1890,21 @@ export function SessionView({
                     onChange={(e) => setMessage(e.target.value)}
                     onKeyDown={handleKeyDown}
                     placeholder={
-                      sessionId
+                      streaming && selectedProvider === "codex"
+                        ? "Steer the agent..."
+                        : sessionId
                         ? "Ask for follow-up changes"
                         : "Describe what you want to build..."
                     }
                     rows={1}
-                    disabled={streaming}
+                    disabled={streaming && selectedProvider !== "codex"}
                     className="w-full resize-none overflow-y-auto bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
                     style={{ maxHeight: "calc(1.25rem * 5)" }}
                   />
                   <div className="mt-2 flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      {/* Agent provider picker */}
+                      {/* Agent provider picker — hidden while Codex is steering */}
+                      {streaming && selectedProvider === "codex" ? null : (<>
                       <div className="relative" ref={providerPickerRef}>
                         <button
                           type="button"
@@ -1982,19 +2031,36 @@ export function SessionView({
                           </div>
                         )}
                       </div>
+                    </>)}
                     </div>
-                    <Button
-                      type="submit"
-                      size="icon"
-                      disabled={streaming || !message.trim()}
-                      className="h-8 w-8 rounded-full bg-foreground text-background hover:bg-foreground/90"
-                    >
-                      {streaming ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <ArrowUp className="h-4 w-4" />
+                    <div className="flex items-center gap-2">
+                      {streaming && selectedProvider === "codex" && (
+                        <button
+                          type="button"
+                          onClick={handleStop}
+                          title="Stop"
+                          className="flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                        >
+                          <Square className="h-3.5 w-3.5" />
+                        </button>
                       )}
-                    </Button>
+                      <Button
+                        type="submit"
+                        size="icon"
+                        disabled={
+                          streaming && selectedProvider === "codex"
+                            ? !message.trim()
+                            : streaming || !message.trim()
+                        }
+                        className="h-8 w-8 rounded-full bg-foreground text-background hover:bg-foreground/90"
+                      >
+                        {streaming && selectedProvider !== "codex" ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <ArrowUp className="h-4 w-4" />
+                        )}
+                      </Button>
+                    </div>
                   </div>
                 </div>
               </form>
@@ -2011,7 +2077,7 @@ export function SessionView({
               <span className="text-xs font-medium text-muted-foreground">Terminal</span>
             </div>
             <div className="flex-1 min-h-0">
-              <Terminal ref={terminalRef} sessionId={sessionId} projectId={projectId} />
+              <Terminal ref={terminalRef} sessionId={sessionId} projectId={projectId} worktreeId={worktreeId} />
             </div>
             <TerminalMobileControls terminalRef={terminalRef} />
           </div>

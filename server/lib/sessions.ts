@@ -5,6 +5,7 @@ export interface SessionState {
   id: string;
   title?: string;
   workingDirectory: string;
+  worktreeId?: string;
   model: string;
   provider?: string;
   mode?: "default" | "plan";

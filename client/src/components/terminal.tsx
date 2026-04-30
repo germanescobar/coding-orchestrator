@@ -23,6 +23,7 @@ export interface TerminalHandle {
 interface TerminalProps {
   sessionId: string;
   projectId: string;
+  worktreeId?: string;
 }
 
 function encodeSpecialKey(term: XTerm, key: TerminalSpecialKey): string {
@@ -51,7 +52,7 @@ function encodeSpecialKey(term: XTerm, key: TerminalSpecialKey): string {
 }
 
 export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
-  function Terminal({ sessionId, projectId }, ref) {
+  function Terminal({ sessionId, projectId, worktreeId }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<XTerm | null>(null);
     const fitRef = useRef<FitAddon | null>(null);
@@ -141,7 +142,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
       wsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({ type: "attach", sessionId, projectId }));
+        ws.send(JSON.stringify({ type: "attach", sessionId, projectId, worktreeId }));
 
         const fitAddon = fitRef.current;
         if (fitAddon) {
@@ -195,7 +196,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
         ws.close();
         wsRef.current = null;
       };
-    }, [sessionId, projectId]);
+    }, [sessionId, projectId, worktreeId]);
 
     return (
       <div

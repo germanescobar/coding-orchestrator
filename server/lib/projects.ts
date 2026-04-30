@@ -6,6 +6,7 @@ export interface Project {
   id: string;
   name: string;
   path: string;
+  setupCommands?: string;
   createdAt: string;
 }
 
@@ -14,6 +15,14 @@ const PROJECTS_FILE = path.join(DATA_DIR, "projects.json");
 
 async function ensureDataDir() {
   await fs.mkdir(DATA_DIR, { recursive: true });
+}
+
+async function writeSetupScript(projectPath: string, commands: string): Promise<void> {
+  const dir = path.join(projectPath, ".coding-orchestrator");
+  await fs.mkdir(dir, { recursive: true });
+  const scriptPath = path.join(dir, "setup.sh");
+  const content = `#!/bin/bash\nset -e\n\n${commands.trimEnd()}\n`;
+  await fs.writeFile(scriptPath, content, { mode: 0o755 });
 }
 
 export async function getProjects(): Promise<Project[]> {
@@ -27,7 +36,8 @@ export async function getProjects(): Promise<Project[]> {
 
 export async function addProject(
   name: string,
-  projectPath: string
+  projectPath: string,
+  setupCommands?: string
 ): Promise<Project> {
   await ensureDataDir();
   const projects = await getProjects();
@@ -35,16 +45,43 @@ export async function addProject(
     id: uuidv4(),
     name,
     path: projectPath,
+    setupCommands,
     createdAt: new Date().toISOString(),
   };
   projects.push(project);
   await fs.writeFile(PROJECTS_FILE, JSON.stringify(projects, null, 2));
+  if (setupCommands?.trim()) {
+    await writeSetupScript(projectPath, setupCommands);
+  }
   return project;
 }
 
 export async function getProject(id: string): Promise<Project | null> {
   const projects = await getProjects();
   return projects.find((p) => p.id === id) ?? null;
+}
+
+export async function updateProject(
+  id: string,
+  patch: { name?: string; setupCommands?: string }
+): Promise<Project | null> {
+  const projects = await getProjects();
+  const idx = projects.findIndex((p) => p.id === id);
+  if (idx === -1) return null;
+  const updated: Project = { ...projects[idx], ...patch };
+  projects[idx] = updated;
+  await ensureDataDir();
+  await fs.writeFile(PROJECTS_FILE, JSON.stringify(projects, null, 2));
+  if (patch.setupCommands !== undefined) {
+    if (patch.setupCommands.trim()) {
+      await writeSetupScript(updated.path, patch.setupCommands);
+    } else {
+      // Remove setup.sh if commands cleared
+      const scriptPath = path.join(updated.path, ".coding-orchestrator", "setup.sh");
+      await fs.rm(scriptPath, { force: true });
+    }
+  }
+  return updated;
 }
 
 export async function deleteProject(id: string): Promise<boolean> {
