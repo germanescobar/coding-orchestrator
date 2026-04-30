@@ -1,16 +1,20 @@
 import { useState, useEffect, useCallback } from "react";
 import { Menu, X } from "lucide-react";
 import { toast } from "sonner";
-import { fetchProjects, type Project } from "./api.ts";
+import { fetchProjects, type Project, type Worktree } from "./api.ts";
 import { Sidebar } from "./components/sidebar.tsx";
 import { SettingsDialog } from "./components/settings-dialog.tsx";
 import { ProjectSetup } from "./pages/ProjectSetup.tsx";
+import { EditProject } from "./pages/EditProject.tsx";
+import { NewWorktree } from "./pages/NewWorktree.tsx";
 import { SessionView } from "./pages/SessionView.tsx";
 
 export type View =
   | { page: "empty" }
   | { page: "new-project" }
-  | { page: "session"; projectId: string; sessionId?: string };
+  | { page: "edit-project"; projectId: string }
+  | { page: "new-worktree"; projectId: string }
+  | { page: "session"; projectId: string; worktreeId?: string; sessionId?: string };
 
 function loadSavedView(): View {
   try {
@@ -42,7 +46,6 @@ export function App() {
 
   useEffect(loadProjects, [loadProjects]);
 
-  // Close sidebar on navigation (mobile)
   const closeSidebar = () => setSidebarOpen(false);
 
   const handleSelectProject = (projectId: string) => {
@@ -50,9 +53,13 @@ export function App() {
     setView({ page: "session", projectId });
   };
 
-  const handleSelectSession = (projectId: string, sessionId: string) => {
+  const handleSelectSession = (
+    projectId: string,
+    sessionId: string,
+    worktreeId?: string
+  ) => {
     setActiveProjectId(projectId);
-    setView({ page: "session", projectId, sessionId });
+    setView({ page: "session", projectId, worktreeId, sessionId });
     setCompletedSessions((prev) => {
       if (!prev.has(sessionId)) return prev;
       const next = new Set(prev);
@@ -62,9 +69,9 @@ export function App() {
     closeSidebar();
   };
 
-  const handleNewThread = (projectId: string) => {
+  const handleNewThread = (projectId: string, worktreeId?: string) => {
     setActiveProjectId(projectId);
-    setView({ page: "session", projectId });
+    setView({ page: "session", projectId, worktreeId });
     closeSidebar();
   };
 
@@ -74,9 +81,22 @@ export function App() {
     closeSidebar();
   };
 
+  const handleProjectSaved = (project: Project) => {
+    loadProjects();
+    setView({ page: "session", projectId: project.id });
+    closeSidebar();
+  };
+
+  const handleWorktreeCreated = (projectId: string, worktree: Worktree) => {
+    loadProjects();
+    setView({ page: "session", projectId, worktreeId: worktree.id });
+    closeSidebar();
+  };
+
+  const activeView = view;
+
   return (
     <div className="dark flex h-dvh w-full bg-background text-foreground">
-      {/* Mobile overlay */}
       {sidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/50 md:hidden"
@@ -84,7 +104,6 @@ export function App() {
         />
       )}
 
-      {/* Sidebar */}
       <div
         className={`fixed inset-y-0 left-0 z-40 w-64 transform transition-transform duration-200 ease-in-out md:relative md:translate-x-0 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full"
@@ -93,13 +112,22 @@ export function App() {
         <Sidebar
           projects={projects}
           activeProjectId={activeProjectId}
-          activeSessionId={view.page === "session" ? view.sessionId : undefined}
+          activeWorktreeId={activeView.page === "session" ? activeView.worktreeId : undefined}
+          activeSessionId={activeView.page === "session" ? activeView.sessionId : undefined}
           completedSessions={completedSessions}
           onSelectProject={handleSelectProject}
           onSelectSession={handleSelectSession}
           onNewThread={handleNewThread}
           onNewProject={() => {
             setView({ page: "new-project" });
+            closeSidebar();
+          }}
+          onEditProject={(projectId) => {
+            setView({ page: "edit-project", projectId });
+            closeSidebar();
+          }}
+          onNewWorktree={(projectId) => {
+            setView({ page: "new-worktree", projectId });
             closeSidebar();
           }}
           onProjectsChanged={loadProjects}
@@ -111,7 +139,6 @@ export function App() {
       </div>
 
       <main className="flex flex-1 flex-col min-h-0 min-w-0">
-        {/* Mobile header with hamburger */}
         <div className="flex h-12 shrink-0 items-center border-b border-border bg-background px-3 md:hidden">
           <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
@@ -128,7 +155,7 @@ export function App() {
           </span>
         </div>
 
-        {view.page === "empty" && (
+        {activeView.page === "empty" && (
           <div className="flex flex-1 items-center justify-center p-4">
             <div className="text-center">
               <h2 className="text-lg font-medium text-muted-foreground">
@@ -138,20 +165,50 @@ export function App() {
           </div>
         )}
 
-        {view.page === "new-project" && (
+        {activeView.page === "new-project" && (
           <ProjectSetup
             onCreated={handleProjectCreated}
             onCancel={() => setView({ page: "empty" })}
           />
         )}
 
-        {view.page === "session" && (
+        {activeView.page === "edit-project" && (() => {
+          const project = projects.find((p) => p.id === activeView.projectId);
+          if (!project) return null;
+          return (
+            <EditProject
+              project={project}
+              onSaved={handleProjectSaved}
+              onCancel={() => setView({ page: "session", projectId: activeView.projectId })}
+            />
+          );
+        })()}
+
+        {activeView.page === "new-worktree" && (() => {
+          const project = projects.find((p) => p.id === activeView.projectId);
+          if (!project) return null;
+          return (
+            <NewWorktree
+              project={project}
+              onCreated={(worktree) => handleWorktreeCreated(activeView.projectId, worktree)}
+              onCancel={() => setView({ page: "session", projectId: activeView.projectId })}
+            />
+          );
+        })()}
+
+        {activeView.page === "session" && (
           <SessionView
-            projectId={view.projectId}
-            sessionId={view.sessionId}
-            project={projects.find((p) => p.id === view.projectId)}
+            projectId={activeView.projectId}
+            sessionId={activeView.sessionId}
+            worktreeId={activeView.worktreeId}
+            project={projects.find((p) => p.id === activeView.projectId)}
             onSessionCreated={(sessionId) => {
-              setView({ page: "session", projectId: view.projectId, sessionId });
+              setView({
+                page: "session",
+                projectId: activeView.projectId,
+                worktreeId: activeView.worktreeId,
+                sessionId,
+              });
               loadProjects();
             }}
             onBackgroundComplete={(sessionId) => {
@@ -161,7 +218,8 @@ export function App() {
                 description: "A background session has finished.",
                 action: {
                   label: "View",
-                  onClick: () => handleSelectSession(view.projectId, sessionId),
+                  onClick: () =>
+                    handleSelectSession(activeView.projectId, sessionId, activeView.worktreeId),
                 },
               });
             }}

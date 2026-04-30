@@ -4,10 +4,12 @@ import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { projectsRouter } from "./routes/projects.js";
 import { sessionsRouter } from "./routes/sessions.js";
+import { worktreesRouter } from "./routes/worktrees.js";
 import { modelsRouter } from "./routes/models.js";
 import { apiKeysRouter } from "./routes/api-keys.js";
 import { getAgentProviders } from "./lib/agents.js";
 import { getProject } from "./lib/projects.js";
+import { resolveWorktree } from "./lib/worktrees.js";
 import { ptyManager } from "./lib/pty-manager.js";
 
 const app = express();
@@ -15,6 +17,7 @@ app.use(cors());
 app.use(express.json());
 
 app.use("/api/projects", projectsRouter);
+app.use("/api/projects", worktreesRouter);
 app.use("/api/projects", sessionsRouter);
 app.use("/api/models", modelsRouter);
 app.use("/api/api-keys", apiKeysRouter);
@@ -45,6 +48,7 @@ wss.on("connection", (ws: WebSocket) => {
     if (msg.type === "attach") {
       const sid = msg.sessionId as string;
       const projectId = msg.projectId as string;
+      const worktreeIdParam = msg.worktreeId as string | undefined;
       if (!sid || !projectId) return;
 
       const project = await getProject(projectId);
@@ -53,8 +57,14 @@ wss.on("connection", (ws: WebSocket) => {
         return;
       }
 
+      const worktree = await resolveWorktree(projectId, worktreeIdParam);
+      if (!worktree) {
+        ws.send(JSON.stringify({ type: "error", message: "Worktree not found" }));
+        return;
+      }
+
       sessionId = sid;
-      const result = ptyManager.getOrCreate(sid, project.path);
+      const result = ptyManager.getOrCreate(sid, worktree.path);
 
       if (result.error) {
         ws.send(JSON.stringify({ type: "error", message: `Failed to spawn terminal: ${result.error}` }));

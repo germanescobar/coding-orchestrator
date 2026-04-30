@@ -29,6 +29,7 @@ interface SessionRuntime {
   mode: "default" | "plan";
   startedEmitted: boolean;
   turnInProgress: boolean;
+  currentTurnId?: string;
   listeners: Set<(event: AgentStreamEvent) => void>;
   pendingUserInput?: PendingUserInputRequest;
   parseEvent: (line: string) => AgentStreamEvent | null;
@@ -122,7 +123,7 @@ export class CodexAppServerManager {
     this.emitStarted(runtime, options.model ?? "");
 
     try {
-      await this.call("turn/start", {
+      const turnResult = await this.call("turn/start", {
         threadId: runtime.threadId,
         input: [{ type: "text", text: options.message, text_elements: [] }],
         cwd: options.cwd,
@@ -140,7 +141,8 @@ export class CodexAppServerManager {
                 },
               }
             : null,
-      });
+      }) as { turn?: { id?: string } } | null;
+      runtime.currentTurnId = turnResult?.turn?.id;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.emit(runtime, {
@@ -153,6 +155,35 @@ export class CodexAppServerManager {
     }
 
     return { sessionId: runtime.sessionId, done };
+  }
+
+  async stopSession(sessionId: string): Promise<void> {
+    const runtime = this.sessions.get(sessionId);
+    if (!runtime?.turnInProgress) {
+      throw new Error("No active turn for this session");
+    }
+    if (!runtime.currentTurnId) {
+      throw new Error("Turn ID not yet available");
+    }
+    await this.call("turn/interrupt", {
+      threadId: runtime.threadId,
+      turnId: runtime.currentTurnId,
+    });
+  }
+
+  async steerSession(sessionId: string, message: string): Promise<void> {
+    const runtime = this.sessions.get(sessionId);
+    if (!runtime?.turnInProgress) {
+      throw new Error("No active turn for this session");
+    }
+    if (!runtime.currentTurnId) {
+      throw new Error("Turn ID not yet available");
+    }
+    await this.call("turn/steer", {
+      threadId: runtime.threadId,
+      input: [{ type: "text", text: message, text_elements: [] }],
+      expectedTurnId: runtime.currentTurnId,
+    });
   }
 
   async submitUserInput(
@@ -266,6 +297,7 @@ export class CodexAppServerManager {
 
     if (event.type === "run.completed" || event.type === "run.failed") {
       runtime.turnInProgress = false;
+      runtime.currentTurnId = undefined;
       runtime.pendingUserInput = undefined;
       runtime.listeners.clear();
       if (event.type === "run.completed") {
