@@ -13,11 +13,13 @@ import {
   fetchAgentProviders,
   fetchSession,
   fetchSessionRuntime,
+  fetchWorktrees,
   startSession,
   stopSession,
   steerSession,
   submitSessionUserInput,
   type Project,
+  type Worktree,
   type AgentEvent,
   type AgentProviderInfo,
   type Model,
@@ -1100,6 +1102,7 @@ export function SessionView({
   const [mobilePanel, setMobilePanel] = useState<"agent" | "terminal">("agent");
   const [userInputDraft, setUserInputDraft] = useState<Record<string, string>>({});
   const [submittingUserInput, setSubmittingUserInput] = useState(false);
+  const [activeWorktree, setActiveWorktree] = useState<Worktree | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -1170,6 +1173,16 @@ export function SessionView({
       .then((p) => setAgentProviders(p))
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!worktreeId) {
+      setActiveWorktree(null);
+      return;
+    }
+    fetchWorktrees(projectId)
+      .then((wts) => setActiveWorktree(wts.find((w) => w.id === worktreeId) ?? null))
+      .catch(() => {});
+  }, [projectId, worktreeId]);
 
   // When loading an existing session, restore the provider and model that were used
   useEffect(() => {
@@ -1684,7 +1697,7 @@ export function SessionView({
             onScroll={handleScroll}
             className="flex-1 overflow-y-auto min-h-0"
           >
-            <ProjectRootContext.Provider value={project?.path}>
+            <ProjectRootContext.Provider value={activeWorktree?.path ?? project?.path}>
             <div className="mx-auto max-w-3xl px-3 py-4 md:px-4 md:py-6">
               {!sessionId && events.length === 0 && streamItems.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-20">
