@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, createContext, useContext } from "react";
 import { diffLines } from "diff";
-import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square } from "lucide-react";
+import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square, Diff, PanelRight } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,8 @@ import { Terminal, type TerminalHandle } from "@/components/terminal";
 import { TerminalMobileControls } from "@/components/terminal-mobile-controls";
 import {
   fetchEvents,
+  fetchBranchDiff,
+  fetchGitDiff,
   fetchModels,
   fetchAgentProviders,
   fetchSession,
@@ -225,6 +227,38 @@ function parseDiffFromToolCall(tool: string, input?: Record<string, unknown>): D
   return [];
 }
 
+function parseFullGitDiff(diff: string): DiffFile[] {
+  if (!diff.trim()) return [];
+  const files: DiffFile[] = [];
+  const sections = diff.split(/(?=^diff --git )/m);
+  for (const section of sections) {
+    if (!section.trim()) continue;
+    const pathMatch = section.match(/^diff --git a\/.+ b\/(.+)$/m);
+    if (!pathMatch) continue;
+    const filePath = pathMatch[1].trim();
+    const isNew = /^new file mode/m.test(section) || /^--- \/dev\/null/m.test(section);
+    const isDeleted = /^deleted file mode/m.test(section);
+    const op: "add" | "delete" | "update" = isNew ? "add" : isDeleted ? "delete" : "update";
+
+    // Only process lines inside hunks — skip all diff/index/---/+++ header lines
+    const lines: DiffLine[] = [];
+    let inHunk = false;
+    for (const raw of section.split("\n")) {
+      if (raw.startsWith("@@")) {
+        inHunk = true;
+        lines.push({ kind: "ctx", text: raw });
+      } else if (inHunk) {
+        if (raw.startsWith("+")) lines.push({ kind: "add", text: raw.slice(1) });
+        else if (raw.startsWith("-")) lines.push({ kind: "del", text: raw.slice(1) });
+        else if (raw.startsWith(" ")) lines.push({ kind: "ctx", text: raw.slice(1) });
+      }
+    }
+
+    files.push({ path: filePath, op, lines });
+  }
+  return files;
+}
+
 const ProjectRootContext = createContext<string | undefined>(undefined);
 
 function relativizePath(path: string, root: string | undefined): string {
@@ -248,6 +282,34 @@ function summarizeDiffFiles(files: DiffFile[]): { added: number; deleted: number
   return { added, deleted };
 }
 
+interface ProcessedLine {
+  kind: "add" | "del" | "ctx" | "hunk";
+  text: string;
+  oldLine?: number;
+  newLine?: number;
+}
+
+function processLinesWithNumbers(lines: DiffLine[]): ProcessedLine[] {
+  const result: ProcessedLine[] = [];
+  let oldLine = 1;
+  let newLine = 1;
+  for (const line of lines) {
+    if (line.kind === "ctx" && line.text.startsWith("@@")) {
+      const m = line.text.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { oldLine = parseInt(m[1], 10); newLine = parseInt(m[2], 10); }
+      result.push({ kind: "hunk", text: line.text });
+    } else if (line.kind === "del") {
+      result.push({ kind: "del", text: line.text, oldLine: oldLine++ });
+    } else if (line.kind === "add") {
+      result.push({ kind: "add", text: line.text, newLine: newLine++ });
+    } else {
+      result.push({ kind: "ctx", text: line.text, oldLine, newLine });
+      oldLine++; newLine++;
+    }
+  }
+  return result;
+}
+
 function DiffBlock({ files }: { files: DiffFile[] }) {
   const [expanded, setExpanded] = useState(false);
   const projectRoot = useContext(ProjectRootContext);
@@ -258,10 +320,10 @@ function DiffBlock({ files }: { files: DiffFile[] }) {
       : `${files.length} files changed`;
 
   return (
-    <div>
+    <div className="rounded-md border border-border/30 overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-left min-w-0 hover:bg-muted/50 transition-colors"
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left min-w-0 hover:bg-muted/40 transition-colors bg-muted/20"
       >
         {expanded ? (
           <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground/60" />
@@ -284,36 +346,53 @@ function DiffBlock({ files }: { files: DiffFile[] }) {
 function DiffView({ files }: { files: DiffFile[] }) {
   const projectRoot = useContext(ProjectRootContext);
   return (
-    <div className="px-3 py-2 space-y-2">
-      {files.map((file, i) => (
-        <div key={i}>
-          <div className="pb-1 font-mono text-[10px] text-muted-foreground/70">
-            {file.op === "add" ? "new file" : file.op === "delete" ? "deleted" : "modified"}{" "}
-            <span className="text-muted-foreground/90">{relativizePath(file.path, projectRoot)}</span>
-          </div>
-          {file.op !== "delete" && file.lines.length > 0 && (
-            <div className="rounded overflow-x-auto bg-background/40 font-mono text-[11px]">
-              {file.lines.map((line, j) => (
-                <div
-                  key={j}
-                  className={
-                    line.kind === "add"
-                      ? "bg-green-950/40 text-green-300/90"
-                      : line.kind === "del"
-                      ? "bg-red-950/40 text-red-300/90"
-                      : "text-muted-foreground/50"
-                  }
-                >
-                  <span className="select-none px-1.5 opacity-60">
-                    {line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}
-                  </span>
-                  <span className="whitespace-pre">{line.text}</span>
-                </div>
-              ))}
+    <div className="border-t border-border/30 divide-y divide-border/20">
+      {files.map((file, i) => {
+        if (file.op === "delete" || file.lines.length === 0) return null;
+        const processed = processLinesWithNumbers(file.lines);
+        return (
+          <div key={i}>
+            {files.length > 1 && (
+              <div className="px-3 py-1 bg-muted/10 font-mono text-[10px] text-muted-foreground/50 border-b border-border/20">
+                {relativizePath(file.path, projectRoot)}
+              </div>
+            )}
+            <div className="overflow-x-auto">
+              {processed.map((line, j) => {
+                if (line.kind === "hunk") {
+                  return (
+                    <div key={j} className="flex bg-blue-950/20 border-y border-blue-900/20 first:border-t-0">
+                      <span className="w-9 shrink-0 border-r border-border/20 bg-background/10" />
+                      <span className="w-9 shrink-0 border-r border-border/20 bg-background/10" />
+                      <span className="px-3 py-0.5 font-mono text-[10px] text-blue-400/50 whitespace-pre">
+                        {line.text}
+                      </span>
+                    </div>
+                  );
+                }
+                const isAdd = line.kind === "add";
+                const isDel = line.kind === "del";
+                return (
+                  <div key={j} className={`flex min-w-0 ${isAdd ? "bg-green-950/30" : isDel ? "bg-red-950/30" : ""}`}>
+                    <span className="w-9 shrink-0 text-right pr-2 py-0.5 select-none font-mono text-[10px] text-muted-foreground/25 border-r border-border/20 bg-background/10">
+                      {line.oldLine ?? ""}
+                    </span>
+                    <span className="w-9 shrink-0 text-right pr-2 py-0.5 select-none font-mono text-[10px] text-muted-foreground/25 border-r border-border/20 bg-background/10">
+                      {line.newLine ?? ""}
+                    </span>
+                    <span className={`pl-2 pr-1 py-0.5 shrink-0 select-none font-mono text-[11px] ${isAdd ? "text-green-400/70" : isDel ? "text-red-400/70" : "text-muted-foreground/30"}`}>
+                      {isAdd ? "+" : isDel ? "−" : " "}
+                    </span>
+                    <span className={`py-0.5 pr-3 whitespace-pre font-mono text-[11px] flex-1 min-w-0 ${isAdd ? "text-green-300/90" : isDel ? "text-red-300/90" : "text-muted-foreground/70"}`}>
+                      {line.text}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
-          )}
-        </div>
-      ))}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1075,6 +1154,52 @@ function ErrorBlock({ text }: { text: string }) {
   );
 }
 
+function ChangesPanel({
+  localFiles,
+  branchFiles,
+  projectRoot,
+}: {
+  localFiles: DiffFile[];
+  branchFiles: DiffFile[];
+  projectRoot?: string;
+}) {
+  const hasBranch = branchFiles.length > 0;
+  const [tab, setTab] = useState<"local" | "branch">("local");
+  const activeFiles = tab === "branch" && hasBranch ? branchFiles : localFiles;
+
+  return (
+    <ProjectRootContext.Provider value={projectRoot}>
+      <div className="flex flex-col h-full">
+        {hasBranch && (
+          <div className="flex shrink-0 items-center gap-1 px-2 pt-2 pb-1">
+            <button
+              onClick={() => setTab("local")}
+              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                tab === "local" ? "bg-accent/40 text-foreground" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Local
+            </button>
+            <button
+              onClick={() => setTab("branch")}
+              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                tab === "branch" ? "bg-accent/40 text-foreground" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Branch
+            </button>
+          </div>
+        )}
+        <div className="flex-1 overflow-y-auto py-2 px-3 space-y-2">
+          {activeFiles.map((file, i) => (
+            <DiffBlock key={i} files={[file]} />
+          ))}
+        </div>
+      </div>
+    </ProjectRootContext.Provider>
+  );
+}
+
 export function SessionView({
   projectId,
   sessionId,
@@ -1098,8 +1223,12 @@ export function SessionView({
   const [selectedProvider, setSelectedProvider] = useState<string>("ada");
   const [providerResolved, setProviderResolved] = useState(!sessionId);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
-  const [terminalOpen, setTerminalOpen] = useState(true);
-  const [mobilePanel, setMobilePanel] = useState<"agent" | "terminal">("agent");
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [mobilePanel, setMobilePanel] = useState<"agent" | "terminal" | "changes">("agent");
+  const [rightTab, setRightTab] = useState<"terminal" | "changes">("terminal");
+  const [gitDiffFiles, setGitDiffFiles] = useState<DiffFile[]>([]);
+  const [gitDiffLoaded, setGitDiffLoaded] = useState(false);
+  const [branchDiffFiles, setBranchDiffFiles] = useState<DiffFile[]>([]);
   const [userInputDraft, setUserInputDraft] = useState<Record<string, string>>({});
   const [submittingUserInput, setSubmittingUserInput] = useState(false);
   const [activeWorktree, setActiveWorktree] = useState<Worktree | null>(null);
@@ -1298,6 +1427,45 @@ export function SessionView({
     stickToBottomRef.current = distanceFromBottom < 80;
   };
 
+  // Poll git diff for the Changes tab
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      fetchGitDiff(projectId, worktreeId)
+        .then(({ diff }) => {
+          if (!cancelled) {
+            setGitDiffFiles(parseFullGitDiff(diff));
+            setGitDiffLoaded(true);
+          }
+        })
+        .catch(() => { if (!cancelled) setGitDiffLoaded(true); });
+    };
+    load();
+    const interval = setInterval(load, 3000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [projectId, worktreeId]);
+
+  // Poll branch diff for the Changes tab (PR view)
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      fetchBranchDiff(projectId, worktreeId)
+        .then(({ diff }) => { if (!cancelled) setBranchDiffFiles(parseFullGitDiff(diff)); })
+        .catch(() => {});
+    };
+    load();
+    const interval = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [projectId, worktreeId]);
+
+  // Auto-switch away from Changes tab when there are no changes
+  useEffect(() => {
+    if (gitDiffLoaded && gitDiffFiles.length === 0 && rightTab === "changes") {
+      setRightTab("terminal");
+      if (mobilePanel === "changes") setMobilePanel("terminal");
+    }
+  }, [gitDiffLoaded, gitDiffFiles.length, rightTab, mobilePanel]);
+
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
       if (
@@ -1343,7 +1511,6 @@ export function SessionView({
 
     // Check if the user is still viewing the session this stream belongs to
     const isVisible = () =>
-      currentSessionIdRef.current == null ||
       currentSessionIdRef.current === sendContextRef.current?.sessionId;
 
     es.onmessage = (event) => {
@@ -1639,7 +1806,7 @@ export function SessionView({
           </h1>
         </div>
 
-        {/* Mobile: Agent/Terminal tabs in header */}
+        {/* Mobile: Agent/Terminal/Changes tabs in header */}
         {sessionId && (
           <div className="flex items-center gap-1 md:hidden">
             <button
@@ -1654,7 +1821,7 @@ export function SessionView({
               Agent
             </button>
             <button
-              onClick={() => setMobilePanel("terminal")}
+              onClick={() => { setMobilePanel("terminal"); setRightTab("terminal"); }}
               className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
                 mobilePanel === "terminal"
                   ? "bg-accent text-foreground"
@@ -1664,33 +1831,44 @@ export function SessionView({
               <TerminalSquare className="h-3 w-3" />
               Terminal
             </button>
+            {gitDiffFiles.length > 0 && (
+              <button
+                onClick={() => { setMobilePanel("changes"); setRightTab("changes"); }}
+                className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                  mobilePanel === "changes"
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground"
+                }`}
+              >
+                <Diff className="h-3 w-3" />
+                Changes
+              </button>
+            )}
           </div>
         )}
 
         {/* Desktop: terminal toggle */}
         <div className="hidden md:flex items-center gap-2">
-          {sessionId && (
-            <button
-              onClick={() => setTerminalOpen(!terminalOpen)}
-              className={`ml-2 rounded-md p-1.5 transition-colors ${
-                terminalOpen
-                  ? "bg-accent text-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
-              }`}
-              title={terminalOpen ? "Hide terminal" : "Show terminal"}
-            >
-              <TerminalSquare className="h-4 w-4" />
-            </button>
-          )}
+          <button
+            onClick={() => setTerminalOpen(!terminalOpen)}
+            className={`ml-2 rounded-md p-1.5 transition-colors ${
+              terminalOpen
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground"
+            }`}
+            title={terminalOpen ? "Hide panel" : "Show panel"}
+          >
+            <PanelRight className="h-4 w-4" />
+          </button>
         </div>
       </header>
 
       {/* Main content area: chat + terminal side by side on desktop, tabbed on mobile */}
       <div className="flex flex-1 min-h-0">
-        {/* Chat panel — hidden on mobile when terminal tab is active */}
+        {/* Chat panel — hidden on mobile when terminal or changes tab is active */}
         <div className={`flex-col min-h-0 min-w-0 w-full ${
-          sessionId && mobilePanel === "terminal" ? "hidden md:flex" : "flex"
-        } ${sessionId && terminalOpen ? "md:w-1/2 md:border-r md:border-border" : "flex-1"}`}>
+          sessionId && mobilePanel !== "agent" ? "hidden md:flex" : "flex"
+        } ${terminalOpen ? "md:w-1/2 md:border-r md:border-border" : "flex-1"}`}>
           {/* Messages / Events area */}
           <div
             ref={scrollContainerRef}
@@ -2081,20 +2259,65 @@ export function SessionView({
           </div>
         </div>
 
-        {/* Terminal panel — desktop: side panel; mobile: full screen when terminal tab active */}
-        {sessionId && (terminalOpen || mobilePanel === "terminal") && (
+        {/* Right panel — desktop: side panel with Terminal/Changes tabs; mobile: full screen when terminal/changes tab active */}
+        {(terminalOpen || mobilePanel === "terminal" || mobilePanel === "changes") && (() => {
+          const { added: changesAdded, deleted: changesDeleted } = summarizeDiffFiles(gitDiffFiles);
+          const hasChanges = gitDiffFiles.length > 0;
+          return (
           <div className={`flex flex-col min-h-0 min-w-0 overflow-hidden ${
-            mobilePanel === "terminal" ? "flex-1 md:w-1/2" : "hidden md:flex md:w-1/2"
+            mobilePanel === "terminal" || mobilePanel === "changes" ? "flex-1 md:w-1/2" : "hidden md:flex md:w-1/2"
           }`}>
-            <div className="hidden md:flex h-9 shrink-0 items-center justify-between border-b border-border bg-[#1c1c1e] px-3">
-              <span className="text-xs font-medium text-muted-foreground">Terminal</span>
+            {/* Tab bar — desktop only; mobile uses the header tabs */}
+            <div className="hidden md:flex h-9 shrink-0 items-center border-b border-border bg-[#1c1c1e] px-2 gap-1">
+              <button
+                onClick={() => { setRightTab("terminal"); if (mobilePanel === "changes") setMobilePanel("terminal"); }}
+                className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                  rightTab === "terminal"
+                    ? "bg-accent/30 text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <TerminalSquare className="h-3 w-3" />
+                Terminal
+              </button>
+              {hasChanges && (
+                <button
+                  onClick={() => { setRightTab("changes"); if (mobilePanel === "terminal") setMobilePanel("changes"); }}
+                  className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                    rightTab === "changes"
+                      ? "bg-accent/30 text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Diff className="h-3 w-3" />
+                  Changes
+                  <span className="font-mono text-[10px] text-muted-foreground/70">
+                    <span className="text-green-400/90">+{changesAdded}</span>
+                    {" "}
+                    <span className="text-red-400/90">-{changesDeleted}</span>
+                  </span>
+                </button>
+              )}
             </div>
-            <div className="flex-1 min-h-0">
-              <Terminal ref={terminalRef} sessionId={sessionId} projectId={projectId} worktreeId={worktreeId} />
+            {/* Content area — terminal always mounted and sized, changes panel overlaid */}
+            <div className="relative flex-1 min-h-0">
+              <div className={`absolute inset-0 ${rightTab !== "terminal" ? "invisible pointer-events-none" : ""}`}>
+                <Terminal ref={terminalRef} projectId={projectId} worktreeId={worktreeId} />
+              </div>
+              {rightTab === "changes" && hasChanges && (
+                <div className="absolute inset-0 overflow-auto bg-background">
+                  <ChangesPanel
+                    localFiles={gitDiffFiles}
+                    branchFiles={branchDiffFiles}
+                    projectRoot={activeWorktree?.path ?? project?.path}
+                  />
+                </div>
+              )}
             </div>
-            <TerminalMobileControls terminalRef={terminalRef} />
+            {rightTab === "terminal" && <TerminalMobileControls terminalRef={terminalRef} />}
           </div>
-        )}
+          );
+        })()}
       </div>
     </>
   );

@@ -1,7 +1,11 @@
 import { Router, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
 import { getProject } from "../lib/projects.js";
 import { resolveWorktree } from "../lib/worktrees.js";
+
+const execAsync = promisify(exec);
 import { getSessions, getSession, getEvents, archiveSession, saveSession, appendEvent, type AgentEvent } from "../lib/sessions.js";
 import { getApiKeyEnvVars } from "../lib/api-keys.js";
 import { getAgentProvider, type AgentStreamEvent } from "../lib/agents.js";
@@ -19,6 +23,108 @@ function stripAnsi(s: string): string {
 }
 
 export const sessionsRouter = Router();
+
+// Git diff for a worktree
+sessionsRouter.get("/:projectId/git/diff", async (req, res) => {
+  const project = await getProject(req.params.projectId);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+  const worktree = await resolveWorktree(
+    req.params.projectId,
+    req.query.worktreeId as string | undefined
+  );
+  if (!worktree) {
+    res.status(404).json({ error: "Worktree not found" });
+    return;
+  }
+
+  const execOpts = {
+    cwd: worktree.path,
+    maxBuffer: 10 * 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  };
+
+  let diff = "";
+
+  // Tracked file changes (staged + unstaged vs HEAD)
+  try {
+    const { stdout } = await execAsync("git diff HEAD", execOpts);
+    diff += stdout;
+  } catch {
+    // HEAD may not exist (empty repo) — fall back to staged only
+    try {
+      const { stdout } = await execAsync("git diff --cached", execOpts);
+      diff += stdout;
+    } catch { /* ignore */ }
+  }
+
+  // Untracked new files — produce a pseudo "new file" diff for each
+  try {
+    const { stdout: listOut } = await execAsync(
+      "git ls-files --others --exclude-standard",
+      execOpts
+    );
+    const untracked = listOut.split("\n").filter(Boolean).slice(0, 50);
+    const { readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    await Promise.all(
+      untracked.map(async (file) => {
+        try {
+          const content = await readFile(join(worktree.path, file), "utf-8");
+          const lines = content.split("\n");
+          if (lines[lines.length - 1] === "") lines.pop();
+          diff += `diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n`;
+          diff += lines.map((l) => `+${l}`).join("\n") + "\n";
+        } catch { /* skip binary / unreadable */ }
+      })
+    );
+  } catch { /* ignore */ }
+
+  res.json({ diff });
+});
+
+// Branch diff — committed changes on the current branch vs its merge-base with main/master
+sessionsRouter.get("/:projectId/git/branch-diff", async (req, res) => {
+  const project = await getProject(req.params.projectId);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+  const worktree = await resolveWorktree(
+    req.params.projectId,
+    req.query.worktreeId as string | undefined
+  );
+  if (!worktree) {
+    res.status(404).json({ error: "Worktree not found" });
+    return;
+  }
+
+  const execOpts = {
+    cwd: worktree.path,
+    maxBuffer: 10 * 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  };
+
+  let diff = "";
+  const baseCandidates = ["origin/main", "origin/master", "main", "master"];
+  for (const base of baseCandidates) {
+    try {
+      const { stdout: mergeBase } = await execAsync(`git merge-base HEAD ${base}`, execOpts);
+      const sha = mergeBase.trim();
+      if (sha) {
+        const { stdout } = await execAsync(`git diff ${sha}..HEAD`, execOpts);
+        diff = stdout;
+        break;
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+
+  res.json({ diff });
+});
 
 // Stream a new session via SSE — must be before /:sessionId routes
 sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
