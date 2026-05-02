@@ -1166,6 +1166,9 @@ function ChangesPanel({
   const hasBranch = branchFiles.length > 0;
   const [tab, setTab] = useState<"local" | "branch">("local");
   const activeFiles = tab === "branch" && hasBranch ? branchFiles : localFiles;
+  const { added: localAdded, deleted: localDeleted } = summarizeDiffFiles(localFiles);
+  const { added: branchAdded, deleted: branchDeleted } = summarizeDiffFiles(branchFiles);
+  const hasLocal = localFiles.length > 0;
 
   return (
     <ProjectRootContext.Provider value={projectRoot}>
@@ -1173,25 +1176,40 @@ function ChangesPanel({
         {hasBranch && (
           <div className="flex shrink-0 items-center gap-1 px-2 pt-2 pb-1">
             <button
-              onClick={() => setTab("local")}
-              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                tab === "local" ? "bg-accent/40 text-foreground" : "text-muted-foreground hover:text-foreground"
+              onClick={() => hasLocal && setTab("local")}
+              disabled={!hasLocal}
+              className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                !hasLocal
+                  ? "text-muted-foreground/40 cursor-not-allowed"
+                  : tab === "local"
+                  ? "bg-accent/40 text-foreground"
+                  : "text-muted-foreground hover:text-foreground"
               }`}
             >
               Local
+              <span className="font-mono text-[10px] text-muted-foreground/40">
+                <span className={hasLocal ? "text-green-400/90" : ""}>+{localAdded}</span>{" "}
+                <span className={hasLocal ? "text-red-400/90" : ""}>-{localDeleted}</span>
+              </span>
             </button>
             <button
               onClick={() => setTab("branch")}
-              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+              className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
                 tab === "branch" ? "bg-accent/40 text-foreground" : "text-muted-foreground hover:text-foreground"
               }`}
             >
               Branch
+              <span className="font-mono text-[10px] text-muted-foreground/70">
+                <span className="text-green-400/90">+{branchAdded}</span>{" "}
+                <span className="text-red-400/90">-{branchDeleted}</span>
+              </span>
             </button>
           </div>
         )}
         <div className="flex-1 overflow-y-auto py-2 px-3 space-y-2">
-          {activeFiles.map((file, i) => (
+          {activeFiles.length === 0 ? (
+            <p className="px-1 pt-1 text-xs text-muted-foreground/50">No changes</p>
+          ) : activeFiles.map((file, i) => (
             <DiffBlock key={i} files={[file]} />
           ))}
         </div>
@@ -1460,11 +1478,11 @@ export function SessionView({
 
   // Auto-switch away from Changes tab when there are no changes
   useEffect(() => {
-    if (gitDiffLoaded && gitDiffFiles.length === 0 && rightTab === "changes") {
+    if (gitDiffLoaded && gitDiffFiles.length === 0 && branchDiffFiles.length === 0 && rightTab === "changes") {
       setRightTab("terminal");
       if (mobilePanel === "changes") setMobilePanel("terminal");
     }
-  }, [gitDiffLoaded, gitDiffFiles.length, rightTab, mobilePanel]);
+  }, [gitDiffLoaded, gitDiffFiles.length, branchDiffFiles.length, rightTab, mobilePanel]);
 
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
@@ -1831,7 +1849,7 @@ export function SessionView({
               <TerminalSquare className="h-3 w-3" />
               Terminal
             </button>
-            {gitDiffFiles.length > 0 && (
+            {(gitDiffFiles.length > 0 || branchDiffFiles.length > 0) && (
               <button
                 onClick={() => { setMobilePanel("changes"); setRightTab("changes"); }}
                 className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
@@ -2261,8 +2279,8 @@ export function SessionView({
 
         {/* Right panel — desktop: side panel with Terminal/Changes tabs; mobile: full screen when terminal/changes tab active */}
         {(terminalOpen || mobilePanel === "terminal" || mobilePanel === "changes") && (() => {
-          const { added: changesAdded, deleted: changesDeleted } = summarizeDiffFiles(gitDiffFiles);
-          const hasChanges = gitDiffFiles.length > 0;
+          const { added: changesAdded, deleted: changesDeleted } = summarizeDiffFiles(gitDiffFiles.length > 0 ? gitDiffFiles : branchDiffFiles);
+          const hasChanges = gitDiffFiles.length > 0 || branchDiffFiles.length > 0;
           return (
           <div className={`flex flex-col min-h-0 min-w-0 overflow-hidden ${
             mobilePanel === "terminal" || mobilePanel === "changes" ? "flex-1 md:w-1/2" : "hidden md:flex md:w-1/2"
@@ -2304,7 +2322,7 @@ export function SessionView({
               <div className={`absolute inset-0 ${rightTab !== "terminal" ? "invisible pointer-events-none" : ""}`}>
                 <Terminal ref={terminalRef} projectId={projectId} worktreeId={worktreeId} />
               </div>
-              {rightTab === "changes" && hasChanges && (
+              {rightTab === "changes" && (gitDiffFiles.length > 0 || branchDiffFiles.length > 0) && (
                 <div className="absolute inset-0 overflow-auto bg-background">
                   <ChangesPanel
                     localFiles={gitDiffFiles}
