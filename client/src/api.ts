@@ -384,6 +384,24 @@ export async function fetchBranches(
   return res.json();
 }
 
+export async function fetchGitDiff(
+  projectId: string,
+  worktreeId?: string
+): Promise<{ diff: string }> {
+  const params = worktreeId ? `?worktreeId=${encodeURIComponent(worktreeId)}` : "";
+  const res = await fetch(`${BASE}/projects/${projectId}/git/diff${params}`);
+  return res.json();
+}
+
+export async function fetchBranchDiff(
+  projectId: string,
+  worktreeId?: string
+): Promise<{ diff: string }> {
+  const params = worktreeId ? `?worktreeId=${encodeURIComponent(worktreeId)}` : "";
+  const res = await fetch(`${BASE}/projects/${projectId}/git/branch-diff${params}`);
+  return res.json();
+}
+
 export async function fetchWorktrees(projectId: string): Promise<Worktree[]> {
   const res = await fetch(`${BASE}/projects/${projectId}/worktrees`);
   return res.json();

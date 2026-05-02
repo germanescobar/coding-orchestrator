@@ -21,7 +21,6 @@ export interface TerminalHandle {
 }
 
 interface TerminalProps {
-  sessionId: string;
   projectId: string;
   worktreeId?: string;
 }
@@ -52,12 +51,11 @@ function encodeSpecialKey(term: XTerm, key: TerminalSpecialKey): string {
 }
 
 export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
-  function Terminal({ sessionId, projectId, worktreeId }, ref) {
+  function Terminal({ projectId, worktreeId }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<XTerm | null>(null);
     const fitRef = useRef<FitAddon | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
-    const prevSessionRef = useRef<string | null>(null);
 
     useImperativeHandle(ref, () => ({
       sendSpecialKey(key: TerminalSpecialKey) {
@@ -103,6 +101,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
 
       const resizeObserver = new ResizeObserver(() => {
         requestAnimationFrame(() => {
+          if (container.clientWidth === 0 || container.clientHeight === 0) return;
           fitAddon.fit();
         });
       });
@@ -116,16 +115,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
       };
     }, []);
 
-    // Handle session changes and WebSocket connection
+    // Handle WebSocket connection (per worktree, not per session)
     useEffect(() => {
       const term = termRef.current;
-      if (!term || !sessionId || !projectId) return;
-
-      if (prevSessionRef.current && prevSessionRef.current !== sessionId) {
-        term.clear();
-        term.reset();
-      }
-      prevSessionRef.current = sessionId;
+      if (!term || !projectId) return;
 
       if (wsRef.current) {
         wsRef.current.close();
@@ -142,7 +135,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
       wsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({ type: "attach", sessionId, projectId, worktreeId }));
+        ws.send(JSON.stringify({ type: "attach", projectId, worktreeId }));
 
         const fitAddon = fitRef.current;
         if (fitAddon) {
@@ -196,7 +189,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
         ws.close();
         wsRef.current = null;
       };
-    }, [sessionId, projectId, worktreeId]);
+    }, [projectId, worktreeId]);
 
     return (
       <div

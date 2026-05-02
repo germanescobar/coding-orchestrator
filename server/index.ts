@@ -34,7 +34,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws/terminal" });
 
 wss.on("connection", (ws: WebSocket) => {
-  let sessionId: string | null = null;
+  let ptyKey: string | null = null;
   let unsubscribe: (() => void) | null = null;
 
   ws.on("message", async (raw: Buffer) => {
@@ -46,10 +46,9 @@ wss.on("connection", (ws: WebSocket) => {
     }
 
     if (msg.type === "attach") {
-      const sid = msg.sessionId as string;
       const projectId = msg.projectId as string;
       const worktreeIdParam = msg.worktreeId as string | undefined;
-      if (!sid || !projectId) return;
+      if (!projectId) return;
 
       const project = await getProject(projectId);
       if (!project) {
@@ -63,8 +62,8 @@ wss.on("connection", (ws: WebSocket) => {
         return;
       }
 
-      sessionId = sid;
-      const result = ptyManager.getOrCreate(sid, worktree.path);
+      ptyKey = `${projectId}:${worktree.id}`;
+      const result = ptyManager.getOrCreate(ptyKey, worktree.path);
 
       if (result.error) {
         ws.send(JSON.stringify({ type: "error", message: `Failed to spawn terminal: ${result.error}` }));
@@ -77,17 +76,17 @@ wss.on("connection", (ws: WebSocket) => {
       }
 
       // Forward new PTY output to this WebSocket client
-      unsubscribe = ptyManager.onData(sid, (data: string) => {
+      unsubscribe = ptyManager.onData(ptyKey, (data: string) => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "output", data }));
         }
       });
 
       ws.send(JSON.stringify({ type: "attached" }));
-    } else if (msg.type === "input" && sessionId) {
-      ptyManager.write(sessionId, msg.data as string);
-    } else if (msg.type === "resize" && sessionId) {
-      ptyManager.resize(sessionId, msg.cols as number, msg.rows as number);
+    } else if (msg.type === "input" && ptyKey) {
+      ptyManager.write(ptyKey, msg.data as string);
+    } else if (msg.type === "resize" && ptyKey) {
+      ptyManager.resize(ptyKey, msg.cols as number, msg.rows as number);
     }
   });
 
