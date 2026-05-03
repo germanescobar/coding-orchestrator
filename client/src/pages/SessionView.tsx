@@ -434,7 +434,7 @@ function getRunStatusText(
 
 function getLatestPendingUserInputRequest(
   events: AgentEvent[]
-): UserInputQuestion[] | null {
+): { eventId: string; questions: UserInputQuestion[] } | null {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i];
     if (event.type === "user_input_response") return null;
@@ -443,7 +443,7 @@ function getLatestPendingUserInputRequest(
         ((event.data.questions as UserInputQuestion[] | undefined) ?? []).filter(
           Boolean
         );
-      return questions.length > 0 ? questions : null;
+      return questions.length > 0 ? { eventId: event.id, questions } : null;
     }
   }
 
@@ -635,10 +635,12 @@ function EventBlock({
   event,
   copiedId,
   onCopy,
+  hiddenPendingUserInputEventId,
 }: {
   event: AgentEvent;
   copiedId: string | null;
   onCopy: (e: AgentEvent) => void;
+  hiddenPendingUserInputEventId?: string | null;
 }) {
   const [expanded, setExpanded] = useState(false);
   const data = event.data;
@@ -697,6 +699,7 @@ function EventBlock({
   void expanded;
 
   if (event.type === "user_input_requested") {
+    if (hiddenPendingUserInputEventId === event.id) return null;
     const questions = ((data.questions as UserInputQuestion[] | undefined) ?? []).filter(Boolean);
     if (questions.length === 0) return null;
     return <UserInputRequestedBlock questions={questions} />;
@@ -1863,12 +1866,12 @@ export function SessionView({
     latestStructuredInputRequestFromStream
       ? latestStructuredInputRequestFromStream
       : (() => {
-          const questions = getLatestPendingUserInputRequest(events);
-          return questions
+          const pendingRequest = getLatestPendingUserInputRequest(events);
+          return pendingRequest
             ? {
                 type: "user_input_requested" as const,
-                id: "persisted-user-input-request",
-                questions,
+                id: pendingRequest.eventId,
+                questions: pendingRequest.questions,
               }
             : null;
         })();
