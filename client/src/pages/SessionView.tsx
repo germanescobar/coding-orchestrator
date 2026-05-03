@@ -26,6 +26,8 @@ import {
   type AgentProviderInfo,
   type Model,
   type PlanStep,
+  type ReasoningEffort,
+  type ServiceTier,
   type SessionStreamEvent,
   type UserInputQuestion,
 } from "../api.ts";
@@ -51,6 +53,26 @@ type StreamItem = (
   | { type: "thread_status"; status: string; activeFlags: string[] }
   | { type: "error"; text: string }
 ) & { at: number };
+
+const REASONING_EFFORT_OPTIONS: Array<{
+  value: ReasoningEffort;
+  label: string;
+}> = [
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "XHigh" },
+  { value: "none", label: "None" },
+];
+
+const SERVICE_TIER_OPTIONS: Array<{
+  value: ServiceTier;
+  label: string;
+}> = [
+  { value: "fast", label: "Fast" },
+  { value: "flex", label: "Flex" },
+];
 
 function normalizeToolResultContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -1234,8 +1256,14 @@ export function SessionView({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>("");
+  const [selectedReasoningEffort, setSelectedReasoningEffort] =
+    useState<ReasoningEffort>("medium");
+  const [selectedServiceTier, setSelectedServiceTier] =
+    useState<ServiceTier>("flex");
   const [selectedMode, setSelectedMode] = useState<"default" | "plan">("default");
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showReasoningEffortPicker, setShowReasoningEffortPicker] = useState(false);
+  const [showServiceTierPicker, setShowServiceTierPicker] = useState(false);
   const [activeStreamSessionId, setActiveStreamSessionId] = useState<string | null>(sessionId ?? null);
   const [agentProviders, setAgentProviders] = useState<AgentProviderInfo[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<string>("ada");
@@ -1256,6 +1284,8 @@ export function SessionView({
   const terminalRef = useRef<TerminalHandle | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
+  const reasoningEffortPickerRef = useRef<HTMLDivElement>(null);
+  const serviceTierPickerRef = useRef<HTMLDivElement>(null);
   const providerPickerRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const currentSessionIdRef = useRef(sessionId);
@@ -1316,6 +1346,13 @@ export function SessionView({
   }, [selectedMode, selectedProvider]);
 
   useEffect(() => {
+    if (selectedProvider !== "codex") {
+      setShowReasoningEffortPicker(false);
+      setShowServiceTierPicker(false);
+    }
+  }, [selectedProvider]);
+
+  useEffect(() => {
     fetchAgentProviders()
       .then((p) => setAgentProviders(p))
       .catch(() => {});
@@ -1348,6 +1385,8 @@ export function SessionView({
             if (session.model) {
               setSelectedModel(session.model);
             }
+            setSelectedReasoningEffort(session.reasoningEffort || "medium");
+            setSelectedServiceTier(session.serviceTier || "flex");
           }
 
           if (eventsResult.status === "fulfilled") {
@@ -1367,6 +1406,8 @@ export function SessionView({
       setStreaming(false);
       setProviderResolved(true);
       setSelectedMode("default");
+      setSelectedReasoningEffort("medium");
+      setSelectedServiceTier("flex");
     }
     setActiveStreamSessionId(sessionId ?? null);
     setUserInputDraft({});
@@ -1493,6 +1534,18 @@ export function SessionView({
         setShowModelPicker(false);
       }
       if (
+        reasoningEffortPickerRef.current &&
+        !reasoningEffortPickerRef.current.contains(e.target as Node)
+      ) {
+        setShowReasoningEffortPicker(false);
+      }
+      if (
+        serviceTierPickerRef.current &&
+        !serviceTierPickerRef.current.contains(e.target as Node)
+      ) {
+        setShowServiceTierPicker(false);
+      }
+      if (
         providerPickerRef.current &&
         !providerPickerRef.current.contains(e.target as Node)
       ) {
@@ -1521,6 +1574,10 @@ export function SessionView({
     const es = startSession(projectId, sentMessage, {
       resumeSessionId: sessionId,
       model: selectedModel,
+      reasoningEffort:
+        selectedProvider === "codex" ? selectedReasoningEffort : undefined,
+      serviceTier:
+        selectedProvider === "codex" ? selectedServiceTier : undefined,
       provider: selectedProvider || undefined,
       mode: selectedProvider === "codex" ? selectedMode : "default",
       worktreeId,
@@ -1944,6 +2001,9 @@ export function SessionView({
                       event={renderItem.event}
                       copiedId={copiedId}
                       onCopy={copyEventData}
+                      hiddenPendingUserInputEventId={
+                        streamItems.length === 0 ? latestStructuredInputRequest?.id : null
+                      }
                     />
                   );
                 })}

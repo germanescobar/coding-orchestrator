@@ -85,6 +85,8 @@ export interface SpawnOptions {
   env: Record<string, string>;
   resumeSessionId?: string;
   model?: string;
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  serviceTier?: "fast" | "flex";
   mode?: "default" | "plan";
 }
 
@@ -115,8 +117,14 @@ const adaProvider: AgentProvider = {
   id: "ada",
   name: "Ada",
 
-  spawn({ message, cwd, env, resumeSessionId, model }) {
+  spawn({ message, cwd, env, resumeSessionId, model, reasoningEffort, serviceTier }) {
     const cmdArgs = ["--stream-json", "--auto-approve", "--model", model || ""];
+    if (reasoningEffort) {
+      cmdArgs.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+    }
+    if (serviceTier) {
+      cmdArgs.push("-c", `service_tier="${serviceTier}"`);
+    }
 
     const args = ["chat", message];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
@@ -146,9 +154,15 @@ const codexProvider: AgentProvider = {
   id: "codex",
   name: "Codex",
 
-  spawn({ message, cwd, env, resumeSessionId, model, mode }) {
+  spawn({ message, cwd, env, resumeSessionId, model, reasoningEffort, serviceTier, mode }) {
     // Flags must come before the prompt argument
     const flags = ["--json", "--full-auto", "--skip-git-repo-check", "--model", model || ""];
+    if (reasoningEffort) {
+      flags.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+    }
+    if (serviceTier) {
+      flags.push("-c", `service_tier="${serviceTier}"`);
+    }
     if (mode === "plan") {
       flags.push("--enable", "default_mode_request_user_input");
     }

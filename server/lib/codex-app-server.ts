@@ -70,8 +70,29 @@ export interface StartPlanTurnOptions {
   cwd: string;
   env: Record<string, string>;
   model?: string;
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  serviceTier?: "fast" | "flex";
   resumeSessionId?: string;
   mode?: "default" | "plan";
+}
+
+interface CodexModelListItem {
+  id: string;
+  model: string;
+  displayName: string;
+  hidden: boolean;
+  defaultReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  additionalSpeedTiers?: string[];
+  isDefault: boolean;
+}
+
+interface CollaborationModePayload {
+  mode: "default" | "plan";
+  settings?: {
+    model: string;
+    reasoning_effort: StartPlanTurnOptions["reasoningEffort"] | null;
+    developer_instructions: string | null;
+  };
 }
 
 export class CodexAppServerManager {
@@ -130,17 +151,12 @@ export class CodexAppServerManager {
         approvalPolicy: "never",
         sandboxPolicy: { type: "dangerFullAccess" },
         model: options.model ?? null,
-        collaborationMode:
-          runtime.mode === "plan"
-            ? {
-                mode: "plan",
-                settings: {
-                  model: options.model ?? "",
-                  reasoning_effort: null,
-                  developer_instructions: null,
-                },
-              }
-            : null,
+        serviceTier: options.serviceTier ?? null,
+        reasoning: {
+          effort: options.reasoningEffort ?? null,
+          summary: null,
+        },
+        collaborationMode: this.getCollaborationModePayload(options),
       }) as { turn?: { id?: string } } | null;
       runtime.currentTurnId = turnResult?.turn?.id;
     } catch (error) {
@@ -210,9 +226,58 @@ export class CodexAppServerManager {
     });
   }
 
+  async listModels(env: Record<string, string>): Promise<CodexModelListItem[]> {
+    await this.ensureStarted(env);
+
+    const models: CodexModelListItem[] = [];
+    let cursor: string | null = null;
+
+    do {
+      const response = await this.call("model/list", {
+        cursor,
+        includeHidden: false,
+        limit: 100,
+      }) as {
+        data?: CodexModelListItem[];
+        nextCursor?: string | null;
+      } | null;
+
+      models.push(...(response?.data ?? []));
+      cursor = response?.nextCursor ?? null;
+    } while (cursor);
+
+    return models;
+  }
+
+  private getCollaborationModePayload(
+    options: StartPlanTurnOptions
+  ): CollaborationModePayload {
+    if (options.mode === "plan") {
+      return {
+        mode: "plan",
+        settings: {
+          model: options.model ?? "",
+          reasoning_effort: options.reasoningEffort ?? null,
+          developer_instructions: null,
+        },
+      };
+    }
+
+    return {
+      mode: "default",
+      settings: {
+        model: options.model ?? "",
+        reasoning_effort: options.reasoningEffort ?? null,
+        developer_instructions:
+          "<collaboration_mode># Collaboration Mode: Default\n\nYou are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.</collaboration_mode>",
+      },
+    };
+  }
+
   private async createSession(options: StartPlanTurnOptions): Promise<SessionRuntime> {
     const response = await this.call("thread/start", {
       model: options.model ?? null,
+      serviceTier: options.serviceTier ?? null,
       cwd: options.cwd,
       approvalPolicy: "never",
       sandbox: "danger-full-access",
@@ -244,6 +309,7 @@ export class CodexAppServerManager {
     const response = await this.call("thread/resume", {
       threadId: options.resumeSessionId,
       model: options.model ?? null,
+      serviceTier: options.serviceTier ?? null,
       cwd: options.cwd,
       approvalPolicy: "never",
       sandbox: "danger-full-access",
