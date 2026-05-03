@@ -1846,6 +1846,12 @@ export function SessionView({
 
   const selectedModelName =
     models.find((m) => m.id === selectedModel)?.name ?? selectedModel;
+  const selectedReasoningEffortLabel =
+    REASONING_EFFORT_OPTIONS.find((option) => option.value === selectedReasoningEffort)?.label ??
+    selectedReasoningEffort;
+  const selectedServiceTierLabel =
+    SERVICE_TIER_OPTIONS.find((option) => option.value === selectedServiceTier)?.label ??
+    selectedServiceTier;
   const latestStructuredInputRequestFromStream =
     [...streamItems]
       .reverse()
@@ -2238,6 +2244,73 @@ export function SessionView({
                             </button>
                           </div>
                           <span className="text-muted-foreground/40">|</span>
+                          <div className="relative" ref={reasoningEffortPickerRef}>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setShowReasoningEffortPicker(!showReasoningEffortPicker)
+                              }
+                              className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                            >
+                              {selectedReasoningEffortLabel}
+                              <ChevronDown className="h-3 w-3" />
+                            </button>
+                            {showReasoningEffortPicker && (
+                              <div className="absolute bottom-full left-0 mb-1 w-40 rounded-lg border border-border bg-popover p-1 shadow-lg">
+                                {REASONING_EFFORT_OPTIONS.map((option) => (
+                                  <button
+                                    key={option.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedReasoningEffort(option.value);
+                                      setShowReasoningEffortPicker(false);
+                                    }}
+                                    className={`flex w-full items-center rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                                      selectedReasoningEffort === option.value
+                                        ? "bg-accent text-accent-foreground"
+                                        : "text-popover-foreground hover:bg-accent"
+                                    }`}
+                                  >
+                                    {option.label}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <div className="relative" ref={serviceTierPickerRef}>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setShowServiceTierPicker(!showServiceTierPicker)
+                              }
+                              className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                            >
+                              {selectedServiceTierLabel}
+                              <ChevronDown className="h-3 w-3" />
+                            </button>
+                            {showServiceTierPicker && (
+                              <div className="absolute bottom-full left-0 mb-1 w-32 rounded-lg border border-border bg-popover p-1 shadow-lg">
+                                {SERVICE_TIER_OPTIONS.map((option) => (
+                                  <button
+                                    key={option.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedServiceTier(option.value);
+                                      setShowServiceTierPicker(false);
+                                    }}
+                                    className={`flex w-full items-center rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                                      selectedServiceTier === option.value
+                                        ? "bg-accent text-accent-foreground"
+                                        : "text-popover-foreground hover:bg-accent"
+                                    }`}
+                                  >
+                                    {option.label}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <span className="text-muted-foreground/40">|</span>
                         </>
                       )}
                       {/* Model picker */}
@@ -2400,4 +2473,3 @@ export function SessionView({
     </>
   );
 }
-
