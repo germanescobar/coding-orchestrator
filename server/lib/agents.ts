@@ -483,11 +483,27 @@ function mapCodexAppServerEvent(
   }
 
   if (method === "turn/completed") {
+    const turn = params.turn as Record<string, unknown> | undefined;
+    const status = turn?.status as string | undefined;
+    if (status === "failed") {
+      const error = turn?.error as Record<string, unknown> | undefined;
+      const message =
+        (error?.message as string | undefined) ??
+        (error?.additionalDetails as string | undefined) ??
+        "Codex turn failed";
+      return {
+        type: "run.failed",
+        sessionId: (params.threadId as string | undefined) ?? state.threadId,
+        error: message,
+        timestamp: new Date().toISOString(),
+      };
+    }
+
     return {
       type: "run.completed",
       sessionId: (params.threadId as string | undefined) ?? state.threadId,
-      status: "completed",
-      stopReason: "completed",
+      status: status === "interrupted" ? "max_iterations" : "completed",
+      stopReason: status ?? "completed",
       timestamp: new Date().toISOString(),
     };
   }

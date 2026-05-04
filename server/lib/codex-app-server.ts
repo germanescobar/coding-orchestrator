@@ -144,6 +144,7 @@ export class CodexAppServerManager {
     this.emitStarted(runtime, options.model ?? "");
 
     try {
+      const serviceTier = options.serviceTier === "fast" ? "fast" : null;
       const turnResult = await this.call("turn/start", {
         threadId: runtime.threadId,
         input: [{ type: "text", text: options.message, text_elements: [] }],
@@ -151,11 +152,9 @@ export class CodexAppServerManager {
         approvalPolicy: "never",
         sandboxPolicy: { type: "dangerFullAccess" },
         model: options.model ?? null,
-        serviceTier: options.serviceTier ?? null,
-        reasoning: {
-          effort: options.reasoningEffort ?? null,
-          summary: null,
-        },
+        serviceTier,
+        effort: options.reasoningEffort ?? null,
+        summary: null,
         collaborationMode: this.getCollaborationModePayload(options),
       }) as { turn?: { id?: string } } | null;
       runtime.currentTurnId = turnResult?.turn?.id;
@@ -275,9 +274,10 @@ export class CodexAppServerManager {
   }
 
   private async createSession(options: StartPlanTurnOptions): Promise<SessionRuntime> {
+    const serviceTier = options.serviceTier === "fast" ? "fast" : null;
     const response = await this.call("thread/start", {
       model: options.model ?? null,
-      serviceTier: options.serviceTier ?? null,
+      serviceTier,
       cwd: options.cwd,
       approvalPolicy: "never",
       sandbox: "danger-full-access",
@@ -306,10 +306,11 @@ export class CodexAppServerManager {
   }
 
   private async resumeSession(options: StartPlanTurnOptions): Promise<SessionRuntime> {
+    const serviceTier = options.serviceTier === "fast" ? "fast" : null;
     const response = await this.call("thread/resume", {
       threadId: options.resumeSessionId,
       model: options.model ?? null,
-      serviceTier: options.serviceTier ?? null,
+      serviceTier,
       cwd: options.cwd,
       approvalPolicy: "never",
       sandbox: "danger-full-access",

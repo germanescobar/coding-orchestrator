@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, createContext, useContext } from "react";
 import { diffLines } from "diff";
-import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square, Diff, PanelRight } from "lucide-react";
+import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square, Diff, PanelRight, Zap } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -64,14 +64,6 @@ const REASONING_EFFORT_OPTIONS: Array<{
   { value: "high", label: "High" },
   { value: "xhigh", label: "XHigh" },
   { value: "none", label: "None" },
-];
-
-const SERVICE_TIER_OPTIONS: Array<{
-  value: ServiceTier;
-  label: string;
-}> = [
-  { value: "fast", label: "Fast" },
-  { value: "flex", label: "Flex" },
 ];
 
 function normalizeToolResultContent(content: unknown): string {
@@ -1266,7 +1258,6 @@ export function SessionView({
   const [selectedMode, setSelectedMode] = useState<"default" | "plan">("default");
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [showReasoningEffortPicker, setShowReasoningEffortPicker] = useState(false);
-  const [showServiceTierPicker, setShowServiceTierPicker] = useState(false);
   const [activeStreamSessionId, setActiveStreamSessionId] = useState<string | null>(sessionId ?? null);
   const [agentProviders, setAgentProviders] = useState<AgentProviderInfo[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<string>("ada");
@@ -1288,7 +1279,6 @@ export function SessionView({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const reasoningEffortPickerRef = useRef<HTMLDivElement>(null);
-  const serviceTierPickerRef = useRef<HTMLDivElement>(null);
   const providerPickerRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const currentSessionIdRef = useRef(sessionId);
@@ -1351,7 +1341,6 @@ export function SessionView({
   useEffect(() => {
     if (selectedProvider !== "codex") {
       setShowReasoningEffortPicker(false);
-      setShowServiceTierPicker(false);
     }
   }, [selectedProvider]);
 
@@ -1543,12 +1532,6 @@ export function SessionView({
         setShowReasoningEffortPicker(false);
       }
       if (
-        serviceTierPickerRef.current &&
-        !serviceTierPickerRef.current.contains(e.target as Node)
-      ) {
-        setShowServiceTierPicker(false);
-      }
-      if (
         providerPickerRef.current &&
         !providerPickerRef.current.contains(e.target as Node)
       ) {
@@ -1589,7 +1572,9 @@ export function SessionView({
 
     // Check if the user is still viewing the session this stream belongs to
     const isVisible = () =>
-      currentSessionIdRef.current === sendContextRef.current?.sessionId;
+      !sendContextRef.current?.sessionId ||
+      currentSessionIdRef.current === sendContextRef.current.sessionId ||
+      detectedSessionId === sendContextRef.current.sessionId;
 
     es.onmessage = (event) => {
       const data = JSON.parse(event.data) as SessionStreamEvent;
@@ -1852,9 +1837,6 @@ export function SessionView({
   const selectedReasoningEffortLabel =
     REASONING_EFFORT_OPTIONS.find((option) => option.value === selectedReasoningEffort)?.label ??
     selectedReasoningEffort;
-  const selectedServiceTierLabel =
-    SERVICE_TIER_OPTIONS.find((option) => option.value === selectedServiceTier)?.label ??
-    selectedServiceTier;
   const latestStructuredInputRequestFromStream =
     [...streamItems]
       .reverse()
@@ -2280,102 +2262,90 @@ export function SessionView({
                               </div>
                             )}
                           </div>
-                          <div className="relative" ref={serviceTierPickerRef}>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setShowServiceTierPicker(!showServiceTierPicker)
-                              }
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
-                            >
-                              {selectedServiceTierLabel}
-                              <ChevronDown className="h-3 w-3" />
-                            </button>
-                            {showServiceTierPicker && (
-                              <div className="absolute bottom-full left-0 mb-1 w-32 rounded-lg border border-border bg-popover p-1 shadow-lg">
-                                {SERVICE_TIER_OPTIONS.map((option) => (
-                                  <button
-                                    key={option.value}
-                                    type="button"
-                                    onClick={() => {
-                                      setSelectedServiceTier(option.value);
-                                      setShowServiceTierPicker(false);
-                                    }}
-                                    className={`flex w-full items-center rounded-md px-3 py-2 text-sm text-left transition-colors ${
-                                      selectedServiceTier === option.value
-                                        ? "bg-accent text-accent-foreground"
-                                        : "text-popover-foreground hover:bg-accent"
-                                    }`}
-                                  >
-                                    {option.label}
-                                  </button>
-                                ))}
-                              </div>
-                            )}
-                          </div>
+                          <button
+                            type="button"
+                            aria-pressed={selectedServiceTier === "fast"}
+                            title={
+                              selectedServiceTier === "fast"
+                                ? "Fast mode active"
+                                : "Fast mode inactive"
+                            }
+                            onClick={() =>
+                              setSelectedServiceTier((tier) =>
+                                tier === "fast" ? "flex" : "fast"
+                              )
+                            }
+                            className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                              selectedServiceTier === "fast"
+                                ? "bg-amber-500/15 text-amber-500 hover:bg-amber-500/20"
+                                : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                            }`}
+                          >
+                            <Zap className="h-3.5 w-3.5" />
+                          </button>
                           <span className="text-muted-foreground/40">|</span>
                         </>
                       )}
                       {/* Model picker */}
-                      <div className="relative" ref={modelPickerRef}>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!showModelPicker && models.length === 0) loadModels(selectedProvider);
-                            setShowModelPicker(!showModelPicker);
-                          }}
-                          className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
-                        >
-                          {selectedModelName || "Select model"}
-                          <ChevronDown className="h-3 w-3" />
-                        </button>
-                        {showModelPicker && (
-                          <div className="absolute bottom-full left-0 mb-1 w-96 max-h-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-lg">
-                            {models.length === 0 ? (
-                              <div className="px-3 py-2 text-xs text-muted-foreground">
-                                No models found. Check ollama or add API keys in Settings.
-                              </div>
-                            ) : (
-                              Object.entries(
-                                models.reduce<Record<string, Model[]>>((acc, m) => {
-                                  const provider = m.provider || "ollama";
-                                  if (!acc[provider]) acc[provider] = [];
-                                  acc[provider].push(m);
-                                  return acc;
-                                }, {})
-                              ).map(([provider, providerModels]) => (
-                                <div key={provider}>
-                                  <div className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                                    {provider}
+                          <div className="relative" ref={modelPickerRef}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!showModelPicker && models.length === 0) loadModels(selectedProvider);
+                                setShowModelPicker(!showModelPicker);
+                              }}
+                              className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                            >
+                              {selectedModelName || "Select model"}
+                              <ChevronDown className="h-3 w-3" />
+                            </button>
+                            {showModelPicker && (
+                              <div className="absolute bottom-full left-0 mb-1 w-96 max-h-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-lg">
+                                {models.length === 0 ? (
+                                  <div className="px-3 py-2 text-xs text-muted-foreground">
+                                    No models found. Check ollama or add API keys in Settings.
                                   </div>
-                                  {providerModels.map((model) => (
-                                    <button
-                                      key={model.id}
-                                      type="button"
-                                      onClick={() => {
-                                        setSelectedModel(model.id);
-                                        setShowModelPicker(false);
-                                      }}
-                                      className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-left transition-colors ${
-                                        selectedModel === model.id
-                                          ? "bg-accent text-accent-foreground"
-                                          : "text-popover-foreground hover:bg-accent"
-                                      }`}
-                                    >
-                                      <span className="font-mono text-xs">{model.name}</span>
-                                      {model.size && (
-                                        <span className="ml-auto text-xs text-muted-foreground">
-                                          {model.size}
-                                        </span>
-                                      )}
-                                    </button>
-                                  ))}
-                                </div>
-                              ))
+                                ) : (
+                                  Object.entries(
+                                    models.reduce<Record<string, Model[]>>((acc, m) => {
+                                      const provider = m.provider || "ollama";
+                                      if (!acc[provider]) acc[provider] = [];
+                                      acc[provider].push(m);
+                                      return acc;
+                                    }, {})
+                                  ).map(([provider, providerModels]) => (
+                                    <div key={provider}>
+                                      <div className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                                        {provider}
+                                      </div>
+                                      {providerModels.map((model) => (
+                                        <button
+                                          key={model.id}
+                                          type="button"
+                                          onClick={() => {
+                                            setSelectedModel(model.id);
+                                            setShowModelPicker(false);
+                                          }}
+                                          className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                                            selectedModel === model.id
+                                              ? "bg-accent text-accent-foreground"
+                                              : "text-popover-foreground hover:bg-accent"
+                                          }`}
+                                        >
+                                          <span className="font-mono text-xs">{model.name}</span>
+                                          {model.size && (
+                                            <span className="ml-auto text-xs text-muted-foreground">
+                                              {model.size}
+                                            </span>
+                                          )}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  ))
+                                )}
+                              </div>
                             )}
                           </div>
-                        )}
-                      </div>
                     </>)}
                     </div>
                     <div className="flex items-center gap-2">
@@ -2395,12 +2365,12 @@ export function SessionView({
                         disabled={
                           streaming && selectedProvider === "codex"
                             ? !message.trim()
-                            : streaming || !message.trim()
+                            : !message.trim() || streaming
                         }
-                        className="h-8 w-8 rounded-full bg-foreground text-background hover:bg-foreground/90"
+                        className="h-8 w-8 rounded-full"
                       >
-                        {streaming && selectedProvider !== "codex" ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
+                        {streaming && selectedProvider === "codex" ? (
+                          <MessageSquare className="h-4 w-4" />
                         ) : (
                           <ArrowUp className="h-4 w-4" />
                         )}

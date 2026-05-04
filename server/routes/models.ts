@@ -118,11 +118,7 @@ async function fetchCodexModels(): Promise<Model[]> {
       id: model.model || model.id,
       name: model.displayName || model.model || model.id,
       provider: "codex",
-      size: model.additionalSpeedTiers?.includes("fast")
-        ? "fast"
-        : model.isDefault
-          ? "default"
-          : model.defaultReasoningEffort,
+      size: model.isDefault ? "default" : "",
     }));
   } catch {
     return getCodexModels();
