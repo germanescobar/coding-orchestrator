@@ -146,6 +146,15 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
   const message = req.query.message as string;
   const resumeSessionId = req.query.resumeSessionId as string | undefined;
   const model = req.query.model as string | undefined;
+  const reasoningEffort = req.query.reasoningEffort as
+    | "none"
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | undefined;
+  const serviceTier = req.query.serviceTier as "fast" | "flex" | undefined;
   const providerId = (req.query.provider as string) || "ada";
   const mode = (req.query.mode as "default" | "plan" | undefined) || "default";
 
@@ -167,6 +176,8 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       message,
       resumeSessionId,
       model,
+      reasoningEffort,
+      serviceTier,
       mode,
       providerId,
     });
@@ -187,6 +198,8 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
     env: apiKeyEnv,
     resumeSessionId,
     model,
+    reasoningEffort,
+    serviceTier,
     mode,
   });
 
@@ -230,6 +243,8 @@ sessionsRouter.get("/:projectId/sessions/stream", async (req, res) => {
       workingDirectory: worktreePath,
       worktreeId,
       model: model ?? existing?.model ?? "",
+      reasoningEffort: reasoningEffort ?? existing?.reasoningEffort,
+      serviceTier: serviceTier ?? existing?.serviceTier,
       provider: providerId,
       mode,
       messages: existing?.messages ?? [],
@@ -401,11 +416,23 @@ async function streamCodexPlanSession(
     message: string;
     resumeSessionId?: string;
     model?: string;
+    reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+    serviceTier?: "fast" | "flex";
     mode: "default" | "plan";
     providerId: string;
   }
 ) {
-  const { worktreePath, worktreeId, message, resumeSessionId, model, mode, providerId } = options;
+  const {
+    worktreePath,
+    worktreeId,
+    message,
+    resumeSessionId,
+    model,
+    reasoningEffort,
+    serviceTier,
+    mode,
+    providerId,
+  } = options;
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -447,6 +474,8 @@ async function streamCodexPlanSession(
       workingDirectory: worktreePath,
       worktreeId,
       model: model ?? existing?.model ?? "",
+      reasoningEffort: reasoningEffort ?? existing?.reasoningEffort,
+      serviceTier: serviceTier ?? existing?.serviceTier,
       provider: providerId,
       mode,
       messages: existing?.messages ?? [],
@@ -520,6 +549,8 @@ async function streamCodexPlanSession(
         env: await getApiKeyEnvVars(),
         resumeSessionId,
         model,
+        reasoningEffort,
+        serviceTier,
         mode,
       },
       handleEvent
