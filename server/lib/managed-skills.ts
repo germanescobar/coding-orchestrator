@@ -510,6 +510,15 @@ Invoke the Controller CLI by its absolute path — it is not on your PATH.
 Every command below is run as either \`${cliPath} worktrees <command>\` or
 \`${cliPath} sessions <command>\`.
 
+Usually the user intent will be to create a worktree and start a session
+to ask or work on something specific. If this is the case, treat it as a
+two-step flow: \`worktrees create\` followed by \`sessions start\`. If the
+prompt for the new session is ambiguous, confirm with the user first.
+
+If the user only asks to create a worktree without a clear intent, create
+the worktree first and follow up with the user if they want to create a new
+conversation on it.
+
 ## Commands
 
 - \`${cliPath} worktrees list <project>\` — list the worktrees on a project.
@@ -535,10 +544,10 @@ that name directly to the CLI — no UUID lookup needed.
 
 ## Workflow
 
-End-to-end example for "worktree this conversation and start a turn on issue 42":
+End-to-end example for "work on issue 42 in a fresh worktree":
 
 \`\`\`sh
-# 1. Create the worktree (project name taken from the step above)
+# 1. Create the worktree (project name taken from the Picking-a-project step above)
 ${cliPath} worktrees create "Coding Orchestrator" --name issue-42
 # → Created worktree issue-42 (id=f1247ed6-3a1b-4c9d-b8e2-9f0a1c2d3e4f)
 
