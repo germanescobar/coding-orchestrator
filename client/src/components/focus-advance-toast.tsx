@@ -82,6 +82,9 @@ export function FocusAdvanceToast({
               Advancing to next conversation
             </div>
             <div className="mt-0.5 text-xs text-slate-400">
+              Triggered after a send, approval, or answered prompt.
+            </div>
+            <div className="mt-0.5 text-xs text-slate-400">
               <span className="hidden md:inline">
                 Press <span className="font-medium text-slate-200">{stayLabel}</span> to stay ·{" "}
                 <span className="font-medium text-slate-200">{nextLabel}</span> to continue ·{" "}

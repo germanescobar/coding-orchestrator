@@ -5089,6 +5089,18 @@ export function SessionView({
       fetchEvents(projectId, targetSessionId, worktreeId)
         .then(setEvents)
         .catch(() => {});
+      // Submitting the structured-input form is the "I'm done with this
+      // session for now" moment in Controller Mode, same as sending a
+      // message: schedule the focus-advance countdown. Dismiss
+      // (handleStructuredUserInputDismiss) is the explicit stay signal
+      // and is intentionally not wired to advance (issue #277).
+      if (controllerMode && onFocusAdvanceAfterSend) {
+        if (targetSessionId) {
+          onFocusAdvanceAfterSend(targetSessionId);
+        } else {
+          focusAdvanceOnAttachRef.current = true;
+        }
+      }
       if (result.resumeMessage) {
         const resumeStart: QueuedStreamStart = {
           message: result.resumeMessage,
@@ -5180,6 +5192,18 @@ export function SessionView({
       fetchEvents(projectId, targetSessionId, worktreeId)
         .then(setEvents)
         .catch(() => {});
+      // Resolving an approval card is the same "I'm done with this session
+      // for now" moment in Controller Mode as sending a message: schedule
+      // the focus-advance countdown so the user doesn't have to hit
+      // Next manually. Deny is the explicit "I want to stay and
+      // reconsider" signal, so it doesn't advance (issue #277).
+      if (controllerMode && onFocusAdvanceAfterSend && decision !== "deny") {
+        if (targetSessionId) {
+          onFocusAdvanceAfterSend(targetSessionId);
+        } else {
+          focusAdvanceOnAttachRef.current = true;
+        }
+      }
     } catch (error) {
       setStreamItems((prev) => [
         ...prev,
