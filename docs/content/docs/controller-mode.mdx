@@ -33,3 +33,11 @@ continue** chord so you can decide in the moment:
 
 The chord shown on the toast is the live, current binding, so it always matches
 whatever you've configured — no need to remember the mapping.
+
+The countdown is scheduled whenever you're "done with the current session for
+now" in Controller Mode: after sending a message, after clicking **Allow** on a
+tool-approval card (and **Deny** does *not* advance — it's the explicit
+"stay and reconsider" signal), and after submitting answers to a structured
+user-input prompt. If you resolve a prompt while a countdown is already in
+flight, the clock restarts on the new origin session rather than stacking a
+second toast.
