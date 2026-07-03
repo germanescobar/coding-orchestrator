@@ -89,9 +89,17 @@ function produceValue(
       if (!secret) return fail(acquire("This integration needs to be connected."));
       return { status: "ok", value: secret };
 
-    case "oauth":
     case "oauth_dynamic":
-      // Interactive acquisition isn't implemented yet.
+      // Same shape as client-credentials once the user has authorized: the
+      // access token is stored in the scheme's secret (or refreshed by
+      // resolveConnectionAuth) and attached as a bearer. No secret yet →
+      // the form still needs a "Connect" click to start the dynamic flow.
+      if (!secret) return fail(acquire("This integration needs to be connected."));
+      return { status: "ok", value: secret };
+
+    case "oauth":
+      // Interactive authorization-code flow without dynamic registration is
+      // not yet implemented.
       return fail({
         status: "reauth_needed",
         reason: "acquire",

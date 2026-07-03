@@ -16,6 +16,8 @@ import {
   updateConnection,
   deleteConnection,
   inspectOpenApiSpec,
+  acquireOAuthDynamic,
+  disconnectOAuthDynamic,
   type IntegrationConnection,
   type ConnectionMode,
   type AcquiredState,
@@ -440,8 +442,10 @@ function ConnectionForm({ connection, onCancel, onSaved }: ConnectionFormProps) 
                 <SchemeEditor
                   key={scheme.id ?? `new-${i}`}
                   scheme={scheme}
+                  connectionId={connection?.id}
                   onChange={(patch) => setScheme(i, patch)}
                   onRemove={() => setSchemes((prev) => prev.filter((_, idx) => idx !== i))}
+                  onAcquiredChange={(acquired) => setScheme(i, { acquired })}
                 />
               ))}
 
@@ -540,12 +544,16 @@ function ConnectionForm({ connection, onCancel, onSaved }: ConnectionFormProps) 
 /* One auth scheme: a preset selector, its config fields, and a single secret. */
 function SchemeEditor({
   scheme,
+  connectionId,
   onChange,
   onRemove,
+  onAcquiredChange,
 }: {
   scheme: FormScheme;
+  connectionId: string | undefined;
   onChange: (patch: Partial<FormScheme>) => void;
   onRemove: () => void;
+  onAcquiredChange: (acquired: AcquiredState | undefined) => void;
 }) {
   const preset = authPreset(scheme.presetId);
   // Hidden presets (not yet usable) aren't offered as new choices, but keep the
@@ -559,7 +567,7 @@ function SchemeEditor({
             value={scheme.presetId}
             // Switching preset starts a fresh scheme so stale config/secret don't carry over.
             onChange={(e) =>
-              onChange({ presetId: e.target.value, attachmentName: "", config: {}, secret: "", hasSecret: false })
+              onChange({ presetId: e.target.value, attachmentName: "", config: {}, secret: "", hasSecret: false, acquired: undefined })
             }
             className={INPUT_CLASS}
           >
@@ -616,17 +624,85 @@ function SchemeEditor({
         </Field>
       )}
 
-      {preset.acquisitionNote && <AcquisitionPanel preset={preset} acquired={scheme.acquired} />}
+      {preset.acquisitionNote && (
+        <AcquisitionPanel
+          preset={preset}
+          acquired={scheme.acquired}
+          // The OAuth (dynamic / MCP) flow needs both the connection and an
+          // already-persisted scheme id; the form's "new" schemes don't have
+          // either yet, so the connect button is disabled until the user saves
+          // the connection once.
+          connectionId={connectionId}
+          schemeId={scheme.id}
+          onAcquiredChange={onAcquiredChange}
+        />
+      )}
     </div>
   );
 }
 
 /*
- * Affordance for acquired-credential presets (OAuth). Both are disabled here —
- * acquisition lands with the outbound-execution layer.
+ * Affordance for acquired-credential presets (OAuth). For `oauth_dynamic` the
+ * Connect button actually drives the full RFC 8414 + RFC 7591 + PKCE flow
+ * (issue #280): the server discovers the AS, registers a client, opens the
+ * browser, and exchanges the code. The status flips Connected/Expired and
+ * Reconnect appears when the token can't be refreshed.
  */
-function AcquisitionPanel({ preset, acquired }: { preset: AuthPreset; acquired?: AcquiredState }) {
+function AcquisitionPanel({
+  preset,
+  acquired,
+  connectionId,
+  schemeId,
+  onAcquiredChange,
+}: {
+  preset: AuthPreset;
+  acquired?: AcquiredState;
+  connectionId: string | undefined;
+  schemeId: string | undefined;
+  onAcquiredChange: (acquired: AcquiredState | undefined) => void;
+}) {
   const status = acquired?.status ?? "none";
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const interactive = preset.acquisitionNote?.interactive === true;
+  const isDynamic = preset.acquisition === "oauth_dynamic";
+  // Acquiring requires a saved scheme (it has a server id) and a connection.
+  const canAcquire = Boolean(connectionId && schemeId);
+
+  const handleConnect = async () => {
+    if (!connectionId || !schemeId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await acquireOAuthDynamic(connectionId, schemeId);
+      onAcquiredChange(next);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDisconnect = async () => {
+    if (!connectionId || !schemeId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await disconnectOAuthDynamic(connectionId, schemeId);
+      onAcquiredChange({ status: "none" });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Acquired credential presets that aren't dynamic are still pending — only
+  // oauth_dynamic is wired up. The static "client credentials" preset has its
+  // own acquisition handled server-side; no UI affordance needed.
+  const showButton = interactive && isDynamic;
+
   return (
     <div className="rounded-md border border-dashed border-border p-2.5">
       <div className="flex items-center justify-between gap-2">
@@ -636,11 +712,52 @@ function AcquisitionPanel({ preset, acquired }: { preset: AuthPreset; acquired?:
         </Badge>
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">{preset.acquisitionNote?.note}</p>
-      {preset.acquisitionNote?.interactive && (
-        <Button type="button" size="sm" variant="outline" className="mt-2" disabled title="Coming soon">
-          Connect
-        </Button>
+      {showButton && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {status === "connected" || status === "expired" ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={handleConnect}
+              disabled={busy || !canAcquire}
+            >
+              {busy ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : null}
+              {status === "expired" ? "Reconnect" : "Reconnect"}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={handleConnect}
+              disabled={busy || !canAcquire}
+              title={canAcquire ? undefined : "Save the connection first to enable Connect."}
+            >
+              {busy ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : null}
+              Connect
+            </Button>
+          )}
+          {status === "connected" && (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={handleDisconnect}
+              disabled={busy}
+              className="text-muted-foreground hover:text-destructive"
+            >
+              Disconnect
+            </Button>
+          )}
+          {acquired?.expiresAt && (
+            <span className="text-xs text-muted-foreground">
+              Expires {new Date(acquired.expiresAt).toLocaleString()}
+            </span>
+          )}
+        </div>
       )}
+      {error && <p className="mt-1.5 text-xs text-destructive">{error}</p>}
     </div>
   );
 }

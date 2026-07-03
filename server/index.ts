@@ -36,6 +36,7 @@ import { makeSchedulesConsumer } from "./lib/schedules.js";
 import { startSessionInProcess } from "./lib/session-start.js";
 import { installManagedSkills } from "./lib/managed-skills.js";
 import { installControllerCli, controllerCliInstalledPath } from "./lib/controller-cli.js";
+import { installDefaultBrowserOpener } from "./lib/oauth-dynamic.js";
 
 function parsePort(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -226,6 +227,11 @@ async function start(): Promise<void> {
   if (process.env.NODE_ENV === "production") {
     await restoreLoginShellPath();
   }
+  // Wire the OAuth (dynamic / MCP) browser opener to Electron's
+  // shell.openExternal when we're running inside the packaged app. The
+  // server is `import()`-ed from the Electron main process in production,
+  // so `import("electron")` here resolves to the real module (issue #280).
+  await installDefaultBrowserOpener();
   // Sync managed skills (browser, controller-scripts, etc.) into each agent's
   // user skills home so they are available across Anita, Codex, and Claude.
   await installManagedSkills().catch((error: unknown) => {

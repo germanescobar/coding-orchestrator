@@ -220,8 +220,6 @@ export const AUTH_PRESETS: AuthPreset[] = [
       note: "Controller discovers the authorization server, registers dynamically, and signs you in via the browser. The agent never performs this step.",
     },
     fields: [{ key: "scopes", label: "Scopes", placeholder: "read write", optional: true }],
-    // Deferred: relies on the same browser-redirect acquisition flow.
-    hidden: true,
   },
   {
     id: "cloud",

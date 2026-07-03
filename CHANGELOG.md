@@ -76,6 +76,16 @@ and run it; no install required.
 
 ## [Unreleased]
 
+- **Integrations: OAuth (dynamic / MCP) auth scheme** (#280). The
+  "OAuth (dynamic / MCP)" preset is now selectable in the Add-scheme
+  picker. Clicking **Connect** runs the full RFC 8414 + RFC 7591 + PKCE
+  flow against the MCP server's authorization server: metadata discovery,
+  dynamic client registration, a loopback browser-redirect callback, and
+  token storage in the encrypted secret store. Subsequent agent runs
+  attach the access token as a bearer; the scheme proactively refreshes
+  on expiry and the UI shows a **Reconnect** action when re-auth is
+  required.
+
 ## [0.2.0] - 2026-06-28
 
 The second preview release. Headline changes: the orchestrator's on-disk
