@@ -547,6 +547,19 @@ async function fetchJson(
  * RFC 7591 dynamic client registration. The MCP spec REQUIRES DCR for
  * servers that don't issue static client ids; the resulting client is then
  * used for the authorization-code flow.
+ *
+ * Not every AS supports public DCR — Figma's MCP server, for example,
+ * returns 403 on this endpoint and requires clients to register via its
+ * developer dashboard. The MCP spec calls this out explicitly: "Any
+ * authorization servers that do not support Dynamic Client Registration
+ * need to provide alternative ways to obtain a client ID. For one of
+ * these authorization servers, MCP clients will have to either hardcode
+ * a client ID… or present a UI to users that allows them to enter
+ * these details, after registering an OAuth client themselves."
+ * (https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)
+ * When that happens the error message is the bridge to the manual
+ * path — we tell the user the AS rejected the registration and hint at
+ * the developer dashboard.
  */
 export async function dynamicClientRegistration(
   metadata: OAuthMetadata,
@@ -556,7 +569,9 @@ export async function dynamicClientRegistration(
   const endpoint = metadata.registration_endpoint;
   if (!endpoint) {
     throw new OAuthDynamicError(
-      "Authorization server does not support dynamic client registration.",
+      "This authorization server does not advertise a dynamic registration endpoint. " +
+        "Register an OAuth client manually at the server's developer dashboard and " +
+        "configure the connection with those credentials instead.",
       "dcr_failed"
     );
   }
@@ -588,10 +603,17 @@ export async function dynamicClientRegistration(
     REQUEST_TIMEOUT_MS
   );
   if (!res.ok) {
-    throw new OAuthDynamicError(
-      `Dynamic client registration failed (HTTP ${res.status}).`,
-      "dcr_failed"
-    );
+    // 403/401/400 all typically mean "closed registration": the AS exists
+    // but won't accept a fresh registration from us. Surface the spec's
+    // escape hatch in the user-facing message.
+    const hint =
+      res.status === 401 || res.status === 403
+        ? "This server's authorization server does not allow dynamic client registration. " +
+          "Register an OAuth client manually at the server's developer dashboard " +
+          "(e.g. Figma's developer console) and use the resulting client_id / " +
+          "client_secret with a non-dynamic connection instead."
+        : `Dynamic client registration failed (HTTP ${res.status}).`;
+    throw new OAuthDynamicError(hint, "dcr_failed");
   }
   const json = (await res.json()) as DCRClient;
   if (!json.client_id) {

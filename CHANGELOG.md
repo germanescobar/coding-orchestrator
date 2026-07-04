@@ -110,6 +110,20 @@ and run it; no install required.
   empty store, so the user re-authorizes any affected OAuth schemes
   without the rest of the app being wedged.
 
+- **Note on Figma (and other closed-DCR MCP servers).** The dynamic
+  preset relies on RFC 7591 dynamic client registration, which the
+  MCP spec recommends but does not require. Some servers — Figma's
+  MCP server is the canonical example — return 403 on the
+  registration endpoint and require clients to register through a
+  developer dashboard instead. The spec calls this out explicitly:
+  "Any authorization servers that do not support Dynamic Client
+  Registration need to provide alternative ways to obtain a client
+  ID. For one of these authorization servers, MCP clients will have
+  to either hardcode a client ID… or present a UI to users that
+  allows them to enter these details, after registering an OAuth
+  client themselves." When DCR fails, the form's error message
+  points the user at the manual path.
+
 ## [0.2.0] - 2026-06-28
 
 The second preview release. Headline changes: the orchestrator's on-disk

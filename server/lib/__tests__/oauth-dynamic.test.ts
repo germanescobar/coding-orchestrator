@@ -360,6 +360,52 @@ test("dynamicClientRegistration: rejects when the AS doesn't expose a registrati
   });
 });
 
+test("dynamicClientRegistration: surfaces the spec-cited escape hatch when the AS returns 403 (closed DCR)", async () => {
+  // The MCP spec is explicit: "Any authorization servers that do not
+  // support Dynamic Client Registration need to provide alternative
+  // ways to obtain a client ID. For one of these authorization
+  // servers, MCP clients will have to either hardcode a client ID… or
+  // present a UI to users that allows them to enter these details,
+  // after registering an OAuth client themselves." Figma is the
+  // canonical example: its `/v1/oauth/mcp/register` endpoint returns
+  // 403 to anonymous callers. Our error message should reflect that
+  // and point the user at the manual path.
+  await withMockAs(
+    [
+      { method: "GET", url: "/.well-known/oauth-authorization-server", status: 200, body: {} },
+      { method: "POST", url: "/register", status: 403, body: "Forbidden" },
+    ],
+    async ({ oauth, baseUrl }) => {
+      const metadata = {
+        issuer: `${baseUrl}/`,
+        authorization_endpoint: `${baseUrl}/authorize`,
+        token_endpoint: `${baseUrl}/token`,
+        registration_endpoint: `${baseUrl}/register`,
+      };
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === `${baseUrl}/register`) {
+          return new Response("Forbidden", { status: 403 });
+        }
+        return fetch(url, init);
+      };
+      await assert.rejects(
+        () => oauth.dynamicClientRegistration(metadata, fetchImpl),
+        (err: Error) => {
+          assert.ok(err instanceof oauth.OAuthDynamicError);
+          assert.equal(err.code, "dcr_failed");
+          // The message should mention "dynamic client registration"
+          // and the manual-path hint ("developer dashboard" or
+          // equivalent) so the form can show the user what to do.
+          assert.match(err.message, /dynamic client registration/i);
+          assert.match(err.message, /developer dashboard/i);
+          return true;
+        }
+      );
+    }
+  );
+});
+
 test("startInteractiveOauth: PKCE happy path discovers, registers, opens browser, exchanges the code", async () => {
   await withMockAs(
     [
