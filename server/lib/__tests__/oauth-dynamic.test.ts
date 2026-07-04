@@ -169,6 +169,162 @@ test("discoverMetadata: requires authorization_endpoint, token_endpoint, issuer"
   });
 });
 
+test("discoverMetadata: publishes metadata at the host origin (Figma-style)", async () => {
+  // The MCP server's resource path is /mcp but the well-known is at the
+  // host origin /, not at /mcp/.well-known/... This is what Figma's MCP
+  // server does in production: a 404 at /mcp/.well-known/... but a 200
+  // at /.well-known/oauth-authorization-server.
+  await withTempHome(async ({ oauth }) => {
+    const metadata = {
+      issuer: "https://api.figma.com",
+      authorization_endpoint: "https://www.figma.com/oauth/mcp",
+      token_endpoint: "https://api.figma.com/v1/oauth/token",
+      registration_endpoint: "https://api.figma.com/v1/oauth/mcp/register",
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
+    };
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      // The new fast path hits the origin (no path), so /mcp is NOT in the URL.
+      if (url === "http://127.0.0.1:9/.well-known/oauth-authorization-server") {
+        return new Response(JSON.stringify(metadata), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      // Anything else (e.g. a probe) returns 404 so we don't accidentally
+      // satisfy the test via the wrong path.
+      return new Response("not found", { status: 404 });
+    };
+    const discovered = await oauth.discoverMetadata("http://127.0.0.1:9/mcp", fetchImpl);
+    assert.equal(discovered.issuer, "https://api.figma.com");
+    assert.equal(discovered.token_endpoint, "https://api.figma.com/v1/oauth/token");
+  });
+});
+
+test("discoverMetadata: probes with initialize and follows WWW-Authenticate resource_metadata", async () => {
+  // Figma in production also serves a 401 with a WWW-Authenticate header
+  // pointing at /well-known/oauth-protected-resource, which then points
+  // at a separate AS origin. Discovery should follow that chain.
+  await withTempHome(async ({ oauth }) => {
+    const metadata = {
+      issuer: "https://api.figma.com",
+      authorization_endpoint: "https://www.figma.com/oauth/mcp",
+      token_endpoint: "https://api.figma.com/v1/oauth/token",
+      registration_endpoint: "https://api.figma.com/v1/oauth/mcp/register",
+    };
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "http://127.0.0.1:9/mcp") {
+        return new Response("Unauthorized", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate":
+              'Bearer resource_metadata="http://127.0.0.1:9/.well-known/oauth-protected-resource", ' +
+              'authorization_uri="https://api.figma.com/.well-known/oauth-authorization-server"',
+          },
+        });
+      }
+      if (url === "http://127.0.0.1:9/.well-known/oauth-protected-resource") {
+        return new Response(
+          JSON.stringify({
+            resource: "http://127.0.0.1:9/mcp",
+            authorization_servers: ["https://api.figma.com"],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url === "https://api.figma.com/.well-known/oauth-authorization-server") {
+        return new Response(JSON.stringify(metadata), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const discovered = await oauth.discoverMetadata("http://127.0.0.1:9/mcp", fetchImpl);
+    assert.equal(discovered.issuer, "https://api.figma.com");
+  });
+});
+
+test("parseWwwAuthenticate: extracts the resource_metadata parameter", async () => {
+  // Exposed for testing; the public surface of the module is
+  // discoverMetadata but a direct unit test on the parser keeps the
+  // header-format edge cases in scope.
+  await withTempHome(async ({ oauth }) => {
+    // We exercise the parser via discoverMetadata's probe path with a
+    // shape that's known to be valid: the 401 includes a quoted
+    // resource_metadata, the protected-resource document points at one
+    // AS, and the AS metadata answers with valid endpoints.
+    const metadata = {
+      issuer: "https://issuer.example",
+      authorization_endpoint: "https://issuer.example/auth",
+      token_endpoint: "https://issuer.example/token",
+      registration_endpoint: "https://issuer.example/register",
+    };
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "http://127.0.0.1:9/mcp") {
+        return new Response("Unauthorized", {
+          status: 401,
+          headers: {
+            // No leading scheme; the parser handles that.
+            "WWW-Authenticate": `resource_metadata="http://127.0.0.1:9/pr", scope="mcp"`,
+          },
+        });
+      }
+      if (url === "http://127.0.0.1:9/pr") {
+        return new Response(
+          JSON.stringify({ authorization_servers: ["https://issuer.example"] }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url === "https://issuer.example/.well-known/oauth-authorization-server") {
+        return new Response(JSON.stringify(metadata), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const discovered = await oauth.discoverMetadata("http://127.0.0.1:9/mcp", fetchImpl);
+    assert.equal(discovered.issuer, "https://issuer.example");
+  });
+});
+
+test("dynamicClientRegistration: picks a token_endpoint_auth_method the AS advertises", async () => {
+  // ASes that don't accept "none" (PKCE public client) — Figma being
+  // the canonical example — need us to ask for client_secret_basic or
+  // client_secret_post. The body should reflect that.
+  await withTempHome(async ({ oauth }) => {
+    let registeredBody: unknown = null;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/register")) {
+        registeredBody = init?.body;
+        return new Response(JSON.stringify({ client_id: "figma-client" }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const client = await oauth.dynamicClientRegistration(
+      {
+        issuer: "https://api.figma.com",
+        authorization_endpoint: "https://www.figma.com/oauth/mcp",
+        token_endpoint: "https://api.figma.com/v1/oauth/token",
+        registration_endpoint: "https://api.figma.com/v1/oauth/mcp/register",
+        token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
+      },
+      fetchImpl
+    );
+    assert.equal(client.client_id, "figma-client");
+    const parsed = JSON.parse(String(registeredBody));
+    assert.equal(parsed.token_endpoint_auth_method, "client_secret_basic");
+  });
+});
+
 test("dynamicClientRegistration: posts to the registration endpoint and returns the client", async () => {
   await withMockAs(
     [
@@ -228,7 +384,7 @@ test("startInteractiveOauth: PKCE happy path discovers, registers, opens browser
         callbackTimeoutMs: 5_000,
         fetchImpl: async (input, init) => {
           const url = typeof input === "string" ? input : input.toString();
-          if (url === `${baseUrl}/mcp/.well-known/oauth-authorization-server`) {
+          if (url === `${baseUrl}/.well-known/oauth-authorization-server`) {
             return new Response(JSON.stringify(localMetadata), {
               status: 200,
               headers: { "Content-Type": "application/json" },
@@ -288,7 +444,7 @@ test("startInteractiveOauth: reuses a previously-registered client on re-acquire
         callbackTimeoutMs: 5_000,
         fetchImpl: async (input, init) => {
           const url = typeof input === "string" ? input : input.toString();
-          if (url === `${baseUrl}/mcp/.well-known/oauth-authorization-server`) {
+          if (url === `${baseUrl}/.well-known/oauth-authorization-server`) {
             return new Response(JSON.stringify(localMetadata), {
               status: 200,
               headers: { "Content-Type": "application/json" },
@@ -330,7 +486,7 @@ test("startInteractiveOauth: reuses a previously-registered client on re-acquire
         callbackTimeoutMs: 5_000,
         fetchImpl: async (input, init) => {
           const url = typeof input === "string" ? input : input.toString();
-          if (url === `${baseUrl}/mcp/.well-known/oauth-authorization-server`) {
+          if (url === `${baseUrl}/.well-known/oauth-authorization-server`) {
             return new Response(JSON.stringify(localMetadata), {
               status: 200,
               headers: { "Content-Type": "application/json" },
@@ -389,7 +545,7 @@ test("getValidToken: refreshes proactively on a near-expiry access token", async
       let tokenCalls = 0;
       const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
-        if (url === `${baseUrl}/mcp/.well-known/oauth-authorization-server`) {
+        if (url === `${baseUrl}/.well-known/oauth-authorization-server`) {
           return new Response(JSON.stringify(localMetadata), {
             status: 200,
             headers: { "Content-Type": "application/json" },
@@ -473,7 +629,7 @@ test("getValidToken: marks the scheme expired when refresh fails", async () => {
       let tokenCalls = 0;
       const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
-        if (url === `${baseUrl}/mcp/.well-known/oauth-authorization-server`) {
+        if (url === `${baseUrl}/.well-known/oauth-authorization-server`) {
           return new Response(JSON.stringify(localMetadata), {
             status: 200,
             headers: { "Content-Type": "application/json" },

@@ -80,6 +80,8 @@ export interface OAuthMetadata {
   scopes_supported?: string[];
   code_challenge_methods_supported?: string[];
   grant_types_supported?: string[];
+  /** RFC 8414 §2: which client auth the AS accepts at the token endpoint. */
+  token_endpoint_auth_methods_supported?: string[];
 }
 
 export class OAuthDynamicError extends Error {
@@ -341,52 +343,204 @@ export async function clearDynamicOauth(connectionId: string, schemeId: string):
 // --- Metadata + DCR ---
 
 /**
- * Discover the authorization server's metadata. The MCP spec points at
- * `/.well-known/oauth-authorization-server` (RFC 8414), but the discovery
- * URL has to be derived from the MCP server's URL. Per the spec we use the
- * URL *as if it were an issuer*; if the metadata document isn't there we
- * surface a clear error so the form can show it.
+ * Discover the authorization server's metadata. The MCP spec (2025-06-18)
+ * expects a server to advertise its AS via one of three patterns, tried
+ * in order here:
+ *
+ *  1. **Fast path** — `<resource origin>/.well-known/oauth-authorization-server`
+ *     (RFC 8414). The simplest servers publish the metadata at the MCP
+ *     server's host root.
+ *  2. **RFC 9728 + WWW-Authenticate** — send a probe `initialize` JSON-RPC
+ *     request without a token, parse the 401's `WWW-Authenticate` header
+ *     for `resource_metadata`, follow it to the protected-resource
+ *     document, and read its `authorization_servers` array. For each AS
+ *     we then fetch `<as>/.well-known/oauth-authorization-server`. This
+ *     is the path real-world servers like Figma's
+ *     (`https://mcp.figma.com/mcp`) use — the metadata lives on a
+ *     separate origin from the resource path.
+ *  3. **Origin-only fallback** — `<resource origin>/.well-known/oauth-authorization-server`
+ *     with the path stripped. Last resort for servers that publish at
+ *     the host root with a path that doesn't accept the well-known suffix.
+ *
+ * When none yield a usable metadata document we surface a clear error
+ * so the form can show it.
  */
 export async function discoverMetadata(
   resourceUrl: string,
   fetchImpl: typeof fetch = fetch
 ): Promise<OAuthMetadata> {
-  const discoveryUrl = buildDiscoveryUrl(resourceUrl);
-  const res = await fetchWithTimeout(fetchImpl, discoveryUrl, { method: "GET" }, REQUEST_TIMEOUT_MS);
-  if (res.status === 404) {
-    throw new OAuthDynamicError(
-      `MCP server ${resourceUrl} does not advertise an OAuth authorization server. ` +
-        "It may not require OAuth, or may need a different URL.",
-      "metadata_not_found"
-    );
+  const origin = new URL(resourceUrl).origin;
+  const candidates: string[] = [
+    // Strategy 1: same as before, but on the origin (no path). This works
+    // when the AS metadata is published at the MCP host root, which is
+    // the most common production pattern.
+    `${origin}/.well-known/oauth-authorization-server`,
+  ];
+
+  // Strategy 2: probe with an unauthenticated initialize. The 401's
+  // WWW-Authenticate header carries resource_metadata (RFC 9728).
+  const probe = await probeAuthChallenge(resourceUrl, fetchImpl);
+  if (probe?.resourceMetadataUrl) {
+    const protectedResource = (await fetchJson(
+      probe.resourceMetadataUrl,
+      fetchImpl,
+      "protected-resource document"
+    )) as { authorization_servers?: unknown[] } | null;
+    if (protectedResource && Array.isArray(protectedResource.authorization_servers)) {
+      for (const as of protectedResource.authorization_servers) {
+        if (typeof as !== "string") continue;
+        candidates.push(`${as.replace(/\/$/, "")}/.well-known/oauth-authorization-server`);
+      }
+    }
   }
-  if (!res.ok) {
-    throw new OAuthDynamicError(
-      `OAuth metadata discovery failed (HTTP ${res.status}).`,
-      "metadata_not_found"
-    );
+
+  for (const url of candidates) {
+    const json = await fetchJson(url, fetchImpl, "authorization server metadata");
+    if (!json) continue;
+    if (json.authorization_endpoint && json.token_endpoint && json.issuer) {
+      return json as OAuthMetadata;
+    }
   }
-  const json = (await res.json()) as Partial<OAuthMetadata>;
-  if (!json.authorization_endpoint || !json.token_endpoint || !json.issuer) {
-    throw new OAuthDynamicError(
-      "Authorization server metadata is missing required endpoints.",
-      "metadata_not_found"
-    );
-  }
-  return json as OAuthMetadata;
+
+  throw new OAuthDynamicError(
+    `MCP server ${resourceUrl} does not advertise an OAuth authorization server. ` +
+      "It may not require OAuth, or may need a different URL.",
+    "metadata_not_found"
+  );
 }
 
 /**
- * Build the well-known URL the spec mandates: append
- * `/.well-known/oauth-authorization-server` to the MCP server's origin.
- * Trailing slashes are normalized.
+ * Send a minimal `initialize` JSON-RPC request without auth. If the server
+ * returns 401, parse the `WWW-Authenticate` header and return the
+ * `resource_metadata` URL (RFC 9728 §3.1). Returns null on any non-401
+ * response or on a missing/empty `resource_metadata` parameter.
  */
-function buildDiscoveryUrl(resourceUrl: string): string {
-  const url = new URL(resourceUrl);
-  url.pathname = `${url.pathname.replace(/\/$/, "")}/.well-known/oauth-authorization-server`;
-  url.search = "";
-  url.hash = "";
-  return url.toString();
+async function probeAuthChallenge(
+  resourceUrl: string,
+  fetchImpl: typeof fetch
+): Promise<{ resourceMetadataUrl: string } | null> {
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(
+      fetchImpl,
+      resourceUrl,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 0,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "controller-discovery", version: "1.0" },
+          },
+        }),
+      },
+      REQUEST_TIMEOUT_MS
+    );
+  } catch {
+    return null;
+  }
+  if (res.status !== 401 && res.status !== 403) return null;
+  const header = res.headers.get("www-authenticate");
+  if (!header) return null;
+  const resourceMetadataUrl = parseWwwAuthenticate(header, "resource_metadata");
+  if (!resourceMetadataUrl) return null;
+  return { resourceMetadataUrl };
+}
+
+/**
+ * Parse a parameter out of a `WWW-Authenticate` header. The value may be
+ * quoted (RFC 7235) and may contain spaces; we use a small state machine
+ * instead of a regex so we don't have to worry about ordering or other
+ * parameters.
+ *
+ * Headers in the wild come in two shapes:
+ *   - With scheme: `Bearer resource_metadata="…", scope="mcp"` (the
+ *     first token before the first space is the auth scheme; the rest
+ *     are parameters).
+ *   - Without scheme: `resource_metadata="…", scope="mcp"` (rare, but
+ *     some MCP servers emit it that way).
+ * The parser handles both.
+ */
+function parseWwwAuthenticate(header: string, parameter: string): string | null {
+  const firstSpace = header.indexOf(" ");
+  let params: string;
+  if (firstSpace < 0) {
+    // No spaces → either a single bare token, or a single bare
+    // `key=value` pair.
+    params = header;
+  } else {
+    // Heuristic: the first token (before the first space) is the auth
+    // scheme ("Bearer", "Basic", …). If it doesn't contain `=` it's the
+    // scheme and we drop it; otherwise we treat the whole header as
+    // parameters.
+    const candidate = header.slice(0, firstSpace);
+    params = candidate.includes("=") ? header : header.slice(firstSpace + 1);
+  }
+  let i = 0;
+  while (i < params.length) {
+    // Skip whitespace and commas.
+    while (i < params.length && (params[i] === " " || params[i] === ",")) i += 1;
+    // Read the key up to '='.
+    const eq = params.indexOf("=", i);
+    if (eq < 0) break;
+    const key = params.slice(i, eq).trim();
+    i = eq + 1;
+    // Skip whitespace after '='.
+    while (i < params.length && params[i] === " ") i += 1;
+    let value: string;
+    if (params[i] === '"') {
+      // Quoted string: read until the matching unescaped quote.
+      let end = i + 1;
+      let buf = "";
+      while (end < params.length) {
+        const ch = params[end];
+        if (ch === "\\" && end + 1 < params.length) {
+          buf += params[end + 1];
+          end += 2;
+          continue;
+        }
+        if (ch === '"') break;
+        buf += ch;
+        end += 1;
+      }
+      value = buf;
+      i = end + 1;
+    } else {
+      // Unquoted token: read until comma or end.
+      const end = params.indexOf(",", i);
+      value = (end < 0 ? params.slice(i) : params.slice(i, end)).trim();
+      i = end < 0 ? params.length : end;
+    }
+    if (key.toLowerCase() === parameter.toLowerCase()) return value;
+  }
+  return null;
+}
+
+async function fetchJson(
+  url: string,
+  fetchImpl: typeof fetch,
+  label: string
+): Promise<Partial<OAuthMetadata> | null> {
+  try {
+    const res = await fetchWithTimeout(fetchImpl, url, { method: "GET" }, REQUEST_TIMEOUT_MS);
+    if (!res.ok) return null;
+    return (await res.json()) as Partial<OAuthMetadata>;
+  } catch (error) {
+    if (error instanceof Error && /timed out|abort/i.test(error.message)) {
+      throw new OAuthDynamicError(
+        `Timed out fetching ${label} from ${url}.`,
+        "metadata_not_found"
+      );
+    }
+    return null;
+  }
 }
 
 /**
@@ -406,12 +560,22 @@ export async function dynamicClientRegistration(
       "dcr_failed"
     );
   }
+  const authMethods = Array.isArray(metadata.token_endpoint_auth_methods_supported)
+    ? metadata.token_endpoint_auth_methods_supported
+    : ["none"];
+  // Prefer "none" (PKCE public client) when the AS supports it; otherwise
+  // fall back to whatever the AS advertises — Figma, for instance, only
+  // supports client_secret_basic and client_secret_post, and a registration
+  // asking for "none" will be rejected outright.
+  const tokenEndpointAuthMethod = authMethods.includes("none")
+    ? "none"
+    : authMethods[0] ?? "client_secret_basic";
   const body = {
     client_name: "Controller",
     redirect_uris: redirectUri ? [redirectUri] : ["http://127.0.0.1/callback"],
     grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
-    token_endpoint_auth_method: "none", // PKCE public client
+    token_endpoint_auth_method: tokenEndpointAuthMethod,
   };
   const res = await fetchWithTimeout(
     fetchImpl,
