@@ -449,7 +449,7 @@ export function SkillsSection() {
               {viewError}
             </div>
           ) : (
-            <div className="space-y-2">
+            <div className="min-w-0 space-y-2">
               <div className="flex justify-end">
                 <Button
                   size="sm"
@@ -465,7 +465,7 @@ export function SkillsSection() {
                   {viewBody}
                 </pre>
               ) : (
-                <div className="prose prose-invert prose-sm max-h-[60vh] max-w-none overflow-auto break-words rounded-md border border-border bg-muted/30 px-3 py-2">
+                <div className="prose prose-invert prose-sm min-w-0 max-h-[60vh] max-w-none overflow-auto break-words rounded-md border border-border bg-muted/30 px-3 py-2">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
                     {viewBody}
                   </ReactMarkdown>
