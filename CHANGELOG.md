@@ -76,53 +76,32 @@ and run it; no install required.
 
 ## [Unreleased]
 
-- **Integrations: OAuth (dynamic / MCP) auth scheme** (#280). The
-  "OAuth (dynamic / MCP)" preset is now selectable in the Add-scheme
-  picker. Clicking **Connect** runs the full RFC 8414 + RFC 7591 + PKCE
-  flow against the MCP server's authorization server: metadata
-  discovery, dynamic client registration, a loopback browser-redirect
-  callback, and token storage in the encrypted secret store. Subsequent
-  agent runs attach the access token as a bearer; the scheme
-  proactively refreshes on expiry and the UI shows a **Reconnect**
-  action when re-auth is required.
+## [0.3.0] - 2026-07-05
 
-  Discovery follows the MCP spec: tries the host-origin
-  `/.well-known/oauth-authorization-server` first, then probes
-  `initialize` and follows `WWW-Authenticate` `resource_metadata`
-  (RFC 9728) to the protected-resource document, then reads the AS
-  list. This matches the real-world pattern of servers like Figma's
-  that publish the AS metadata on a different origin from the
-  resource path. DCR honors the AS's
-  `token_endpoint_auth_methods_supported` (Figma requires
-  `client_secret_basic` or `client_secret_post`, not the PKCE-public
-  `none`).
+### Added
 
-- **Secret store: opt-in encryption, recovery on stale ciphertext**
-  (#280). The at-rest store for integration secrets now defaults to
-  the 0600 plaintext envelope; the encrypted envelope is used only
-  when `CONTROLLER_ENCRYPT_SECRETS=1` is set. Reason: the project
-  ships only ad-hoc-signed Electron builds, and each rebuild changes
-  the app's keychain identity, so the old encrypted envelope became
-  unreadable by the new build (the "Error while decrypting the
-  ciphertext provided to safeStorage.decryptString" error). On any
-  un-recoverable read the file is renamed to
-  `integration-secrets.json.broken-<iso>` and the app returns an
-  empty store, so the user re-authorizes any affected OAuth schemes
-  without the rest of the app being wedged.
+- **Integrations: OAuth (dynamic / MCP) auth scheme** ([#280](https://github.com/germanescobar/controller/pull/280)). A new "OAuth (dynamic / MCP)" preset in the Add-scheme picker. Clicking **Connect** runs the full RFC 8414 + RFC 7591 + PKCE flow against the MCP server's authorization server: metadata discovery, dynamic client registration, a loopback browser-redirect callback, and token storage in the secret store. Subsequent agent runs attach the access token as a bearer; the scheme proactively refreshes on expiry and the UI shows a **Reconnect** action when re-auth is required.
+- **CLI: `integrations create` and `integrations list --all`** ([#279](https://github.com/germanescobar/controller/pull/279)). Adds a `create` subcommand for adding integrations from the terminal and a `--all` flag on `list` that shows non-installed integrations.
+- **Controller Mode: auto-advance after approval + structured-input submit** ([#277](https://github.com/germanescobar/controller/pull/277)). The on-radar focus queue now advances to the next session after an approval gate, and structured-input fields can be submitted as part of the same turn.
+- **Cloudflare as an Anita model provider** ([#291](https://github.com/germanescobar/controller/pull/291)). Cloudflare-hosted models are now selectable as an Anita provider.
+- **Restore Fable 5 to the Claude model list** ([#282](https://github.com/germanescobar/controller/pull/282)).
 
-- **Note on Figma (and other closed-DCR MCP servers).** The dynamic
-  preset relies on RFC 7591 dynamic client registration, which the
-  MCP spec recommends but does not require. Some servers — Figma's
-  MCP server is the canonical example — return 403 on the
-  registration endpoint and require clients to register through a
-  developer dashboard instead. The spec calls this out explicitly:
-  "Any authorization servers that do not support Dynamic Client
-  Registration need to provide alternative ways to obtain a client
-  ID. For one of these authorization servers, MCP clients will have
-  to either hardcode a client ID… or present a UI to users that
-  allows them to enter these details, after registering an OAuth
-  client themselves." When DCR fails, the form's error message
-  points the user at the manual path.
+### Changed
+
+- **Secret store: opt-in encryption, recovery on stale ciphertext** ([#280](https://github.com/germanescobar/controller/pull/280)). The at-rest store for integration secrets now defaults to the 0600 plaintext envelope; the encrypted envelope is used only when `CONTROLLER_ENCRYPT_SECRETS=1` is set. On any un-recoverable read the file is renamed to `integration-secrets.json.broken-<iso>` and the app returns an empty store.
+
+### Removed
+
+- **Groq model provider** ([#293](https://github.com/germanescobar/controller/pull/293)).
+
+### Fixed
+
+- **Dialog overflow on long, non-wrapping code blocks in SKILL.md** ([#290](https://github.com/germanescobar/controller/pull/290)). Skill dialogs now scroll cleanly when displayed source contains wide unbreakable lines.
+- **Revert auto-advance toast copy from #284** ([#288](https://github.com/germanescobar/controller/pull/288)).
+
+### Docs
+
+- **Clarify `controller-worktrees` default behavior** ([#283](https://github.com/germanescobar/controller/pull/283)). The skill description now states the default is to create a worktree and start a session.
 
 ## [0.2.0] - 2026-06-28
 
