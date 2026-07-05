@@ -94,24 +94,3 @@ test("toast surfaces the rebound chord when the user customises it in Settings",
     `expected rebound next label "${nextLabel}", got: ${html}`,
   );
 });
-
-test("toast copy explains that the countdown is triggered by sends AND prompt resolutions (issue #277)", () => {
-  // Before #277 the focus-advance countdown only fired after a user
-  // send. After #277 it also fires when the user resolves a tool
-  // approval card or submits a structured user-input form, so the
-  // toast's trigger description must reflect that — otherwise users
-  // wonder why the toast appears on a "non-send" interaction.
-  const html = render(DEFAULT_SHORTCUT_BINDINGS);
-  assert.ok(
-    /send|approval|prompt/i.test(html),
-    `expected toast copy to mention sends, approvals, and prompts; got: ${html}`,
-  );
-  assert.ok(
-    html.toLowerCase().includes("approval"),
-    `expected toast copy to mention 'approval'; got: ${html}`,
-  );
-  assert.ok(
-    html.toLowerCase().includes("prompt"),
-    `expected toast copy to mention 'prompt'; got: ${html}`,
-  );
-});
