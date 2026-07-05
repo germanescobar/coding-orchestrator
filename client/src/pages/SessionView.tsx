@@ -1716,7 +1716,7 @@ const AssistantBlock = memo(function AssistantBlock({
   const normalizedText = normalizeMarkdownText(text);
   return (
     <div className="space-y-2">
-      <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words">
+      <div className="prose prose-invert prose-sm min-w-0 max-w-none overflow-x-auto break-words">
         <ReactMarkdown components={markdownComponents} remarkPlugins={remarkPlugins} urlTransform={controllerUrlTransform}>
           {normalizedText}
         </ReactMarkdown>
@@ -1754,7 +1754,7 @@ const ReasoningBlock = memo(function ReasoningBlock({ text }: { text: unknown })
       </button>
       {expanded && (
         <div className="px-4 py-2 bg-background/30">
-          <div className="prose prose-invert prose-sm max-w-none overflow-x-auto break-words text-muted-foreground/80 text-[13px]">
+          <div className="prose prose-invert prose-sm min-w-0 max-w-none overflow-x-auto break-words text-muted-foreground/80 text-[13px]">
             <ReactMarkdown components={markdownComponents} remarkPlugins={remarkPlugins} urlTransform={controllerUrlTransform}>
               {normalizedText}
             </ReactMarkdown>
