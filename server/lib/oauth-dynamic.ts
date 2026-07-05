@@ -136,8 +136,10 @@ export async function getValidToken(
   }
 
   // Stale or empty cache — see if we can refresh without user interaction.
-  const aboutToExpire = stored.expiresAt - Date.now() < EXPIRY_SKEW_MS;
-  if (aboutToExpire && stored.refreshToken) {
+  const isExpired = stored.expiresAt <= Date.now();
+  const isAboutToExpire = stored.expiresAt - Date.now() < EXPIRY_SKEW_MS;
+  const canRefresh = typeof stored.refreshToken === "string" && stored.refreshToken.length > 0;
+  if ((isExpired || isAboutToExpire) && canRefresh) {
     try {
       const refreshed = await refreshAccessToken(stored, fetchImpl);
       cache.set(key, toCached(refreshed));
@@ -152,6 +154,15 @@ export async function getValidToken(
       await markAcquired(connection.id, scheme, { status: "expired" });
       return null;
     }
+  }
+
+  if (isExpired) {
+    // No refresh token and the stored token has already expired. The
+    // previous behavior would have returned the expired access token
+    // and let agents send a 401 — better to surface a clean reauth
+    // signal so the UI shows Reconnect.
+    await markAcquired(connection.id, scheme, { status: "expired" });
+    return null;
   }
 
   // Token still valid; warm the cache.
@@ -841,7 +852,16 @@ async function refreshAccessToken(stored: OAuthDynamicSecret, fetchImpl: typeof 
   // Refresh responses don't always include a new refresh_token; keep the
   // existing one when the AS omits it.
   if (!json.refresh_token && stored.refreshToken) json.refresh_token = stored.refreshToken;
-  return tokenResponseToSecret(json, { client_id: stored.clientId }, stored.metadata);
+  return tokenResponseToSecret(
+    json,
+    { client_id: stored.clientId, client_secret: stored.clientSecret },
+    stored.metadata,
+    {
+      clientSecret: stored.clientSecret,
+      scopes: stored.scopes,
+      resource: stored.resource,
+    }
+  );
 }
 
 async function parseTokenResponse(res: Response): Promise<unknown> {
@@ -872,7 +892,13 @@ async function parseTokenResponse(res: Response): Promise<unknown> {
 function tokenResponseToSecret(
   json: Record<string, unknown>,
   client: { client_id: string; client_secret?: string },
-  metadata: OAuthMetadata
+  metadata: OAuthMetadata,
+  // The previous secret, when refreshing. Carries forward fields the
+  // token endpoint doesn't echo on a refresh response: clientSecret,
+  // scopes, resource. Without this, ASes that require the same client
+  // secret / scope / resource on every refresh call would accept the
+  // first refresh and then start failing.
+  prior?: { clientSecret?: string; scopes?: string; resource?: string }
 ): OAuthDynamicSecret {
   const accessToken = json.access_token;
   if (typeof accessToken !== "string" || !accessToken) {
@@ -885,8 +911,13 @@ function tokenResponseToSecret(
     refreshToken,
     expiresAt: Date.now() + expiresIn * 1000 - EXPIRY_SKEW_MS,
     clientId: client.client_id,
-    clientSecret: client.client_secret,
+    // The freshest value wins: a refresh response can rotate the
+    // client_secret (rare but allowed by RFC 7591 §3.2.1). Otherwise
+    // carry forward the stored value.
+    clientSecret: client.client_secret ?? prior?.clientSecret,
     metadata,
+    scopes: prior?.scopes,
+    resource: prior?.resource,
   };
 }
 

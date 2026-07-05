@@ -741,6 +741,118 @@ test("getValidToken: marks the scheme expired when refresh fails", async () => {
   );
 });
 
+test("getValidToken: marks the scheme expired when the access token expires and there is no refresh token", async () => {
+  // Codex review #285 (P2): previously, an AS that issues access
+  // tokens without a refresh token would let `getValidToken` keep
+  // returning the expired access token — agents would send 401s
+  // forever instead of seeing the "Reconnect" affordance.
+  await withTempHome(async ({ integrations, oauth }) => {
+    const connection = await makeConnection(integrations, "http://127.0.0.1:9999/");
+    const scheme = schemeOf(connection);
+    const { writeConnectionSecrets } = await import("../integrations.js");
+    const secrets = await integrations.getConnectionSecrets(connection.id);
+    secrets[scheme.id] = JSON.stringify({
+      accessToken: "EXPIRED",
+      // no refreshToken — the AS doesn't issue one
+      expiresAt: Date.now() - 1_000,
+      clientId: "client",
+      metadata: METADATA,
+    });
+    await writeConnectionSecrets(connection.id, secrets);
+
+    const fresh = await integrations.getConnection(connection.id);
+    assert.ok(fresh);
+    const freshScheme = schemeOf(fresh);
+    const token = await oauth.getValidToken(fresh, freshScheme);
+    assert.equal(token, null);
+
+    const final = await integrations.getConnection(connection.id);
+    assert.ok(final);
+    assert.equal(final.auth.schemes[0]?.acquired?.status, "expired");
+  });
+});
+
+test("refreshAccessToken: preserves clientSecret, scopes, and resource on the persisted secret", async () => {
+  // Codex review #285 (P2): previously, the refreshed secret was
+  // built with only `client_id` and `metadata`, so any stored
+  // clientSecret / scopes / resource was dropped. ASes that require
+  // the same client secret or the same `resource` indicator on
+  // every refresh call (Figma requires `client_secret_basic`; RFC
+  // 8707 requires `resource`) would accept the first refresh by
+  // accident and then start failing.
+  await withMockAs(
+    [{ method: "GET", url: "/.well-known/oauth-authorization-server", status: 200, body: {} }],
+    async ({ integrations, oauth, baseUrl }) => {
+      const localMetadata = {
+        issuer: `${baseUrl}/`,
+        authorization_endpoint: `${baseUrl}/authorize`,
+        token_endpoint: `${baseUrl}/token`,
+        registration_endpoint: `${baseUrl}/register`,
+        token_endpoint_auth_methods_supported: ["client_secret_basic"],
+      };
+      const connection = await makeConnection(integrations, `${baseUrl}/mcp`);
+      const scheme = schemeOf(connection);
+      const { writeConnectionSecrets } = await import("../integrations.js");
+      const secrets = await integrations.getConnectionSecrets(connection.id);
+      // Inject a stored secret whose expiry is already in the past so
+      // the next `getValidToken` call will refresh it.
+      secrets[scheme.id] = JSON.stringify({
+        accessToken: "AT-OLD",
+        refreshToken: "RT-1",
+        expiresAt: Date.now() - 60_000,
+        clientId: "dyn-1",
+        clientSecret: "shh",
+        metadata: localMetadata,
+        scopes: "files:read mcp:connect",
+        resource: "https://mcp.figma.com/mcp",
+      });
+      await writeConnectionSecrets(connection.id, secrets);
+
+      const tokenCalls: { body: string; contentType: string | null }[] = [];
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === `${baseUrl}/token`) {
+          const body = init?.body;
+          tokenCalls.push({
+            body: typeof body === "string" ? body : body?.toString() ?? "",
+            contentType: init?.headers ? new Headers(init.headers).get("content-type") : null,
+          });
+          return new Response(
+            JSON.stringify({ access_token: "AT-NEW", refresh_token: "RT-2", expires_in: 3600 }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response("not found", { status: 404 });
+      };
+
+      const fresh = await integrations.getConnection(connection.id);
+      assert.ok(fresh);
+      const freshScheme = schemeOf(fresh);
+      const token = await oauth.getValidToken(fresh, freshScheme, fetchImpl as typeof fetch);
+      assert.equal(token, "AT-NEW");
+
+      // The refresh request must include the client_secret (so the AS
+      // can authenticate the call) and the resource indicator.
+      const lastBody = tokenCalls[0]?.body ?? "";
+      assert.match(lastBody, /client_secret=shh/);
+      assert.match(lastBody, /resource=https%3A%2F%2Fmcp\.figma\.com%2Fmcp/);
+      assert.match(lastBody, /scope=files%3Aread(\+|%20)mcp%3Aconnect/);
+
+      // The persisted secret must keep the clientSecret, scopes, and
+      // resource so a *second* refresh (after this one expires) still
+      // works.
+      const refreshed = await integrations.getConnection(connection.id);
+      assert.ok(refreshed);
+      const reloadedSecrets = await integrations.getConnectionSecrets(refreshed.id);
+      const persisted = JSON.parse(reloadedSecrets[scheme.id] ?? "{}");
+      assert.equal(persisted.clientSecret, "shh");
+      assert.equal(persisted.scopes, "files:read mcp:connect");
+      assert.equal(persisted.resource, "https://mcp.figma.com/mcp");
+      assert.equal(persisted.refreshToken, "RT-2");
+    }
+  );
+});
+
 test("acquireStatus: returns 'connected' with an expiry while the token is valid", async () => {
   await withTempHome(async ({ integrations, oauth }) => {
     const connection = await makeConnection(integrations, "http://127.0.0.1:9999/");
