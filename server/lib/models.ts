@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
-  getApiKey,
   getApiKeyField,
   getApiKeyEnvVars,
   PROVIDERS,
@@ -133,38 +132,6 @@ async function fetchOllamaModels(): Promise<Model[]> {
   }
 }
 
-async function fetchGroqModels(apiKey: string): Promise<Model[]> {
-  try {
-    const response = await fetch("https://api.groq.com/openai/v1/models", {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (!response.ok) return [];
-    const data = (await response.json()) as {
-      data: Array<{ id: string; owned_by?: string; active?: boolean }>;
-    };
-    const NON_LLM_PATTERNS = [
-      "whisper",
-      "distil-whisper",
-      "playai",
-      "qwen2-audio",
-      "orpheus",
-      "prompt-guard",
-      "safeguard",
-      "compound",
-    ];
-    return data.data
-      .filter((m) => !NON_LLM_PATTERNS.some((p) => m.id.includes(p)))
-      .map((m) => ({
-        id: `groq/${m.id}`,
-        name: m.id,
-        provider: "groq",
-        size: "",
-      }));
-  } catch {
-    return [];
-  }
-}
-
 /**
  * Cloudflare model fetcher.
  *
@@ -249,10 +216,6 @@ async function fetchCloudflareModels(
   }
 }
 
-const PROVIDER_FETCHERS: Record<string, (apiKey: string) => Promise<Model[]>> = {
-  groq: fetchGroqModels,
-};
-
 /**
  * Exported for tests. The dispatcher in `fetchAnitaFallbackModels` calls
  * this with the three Cloudflare fields; the export keeps the dispatcher
@@ -322,11 +285,10 @@ async function fetchAnitaFallbackModels(): Promise<Model[]> {
         if (!apiToken) return [];
         return fetchCloudflareModels(accountId, apiToken, aiGatewayId);
       }
-      const key = await getApiKey(p.id);
-      if (!key) return [];
-      const fetcher = PROVIDER_FETCHERS[p.id];
-      if (!fetcher) return [];
-      return fetcher(key);
+      // No other single-field provider ships a fetcher today. If a new
+      // one is added, either special-case it like Cloudflare or wire a
+      // `Record<providerId, fetcher>` map here.
+      return [];
     }),
   ]);
 

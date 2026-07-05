@@ -4,7 +4,7 @@ import type { Model } from "../api.ts";
  * Human-readable provider label for a model. Anita models surface the
  * structured `group` (e.g., "Ollama Cloud", "Local") reported by
  * `anita models --json`; otherwise we fall back to the model id prefix
- * (`ollama-cloud`, `groq`, ...), which is always populated for models
+ * (`ollama-cloud`, `cloudflare`, ...), which is always populated for models
  * returned by the API.
  *
  * Returns an empty string when no provider can be determined so callers
