@@ -46,7 +46,6 @@ function singleFieldProvider(
 }
 
 export const PROVIDERS: ProviderConfig[] = [
-  singleFieldProvider("groq", "Groq", "GROQ_API_KEY"),
   singleFieldProvider("ollama-cloud", "Ollama Cloud", "OLLAMA_API_KEY"),
   singleFieldProvider("openrouter", "OpenRouter", "OPENROUTER_API_KEY"),
   {
@@ -77,7 +76,7 @@ export const PROVIDERS: ProviderConfig[] = [
 
 // Provider ids no longer supported. A stored key for any of these is pruned
 // the next time the store is read so it stops being surfaced or injected.
-const REMOVED_PROVIDER_IDS = ["openai"];
+const REMOVED_PROVIDER_IDS = ["openai", "groq"];
 
 /**
  * Persisted shape: provider id -> field id -> value. The first nesting is

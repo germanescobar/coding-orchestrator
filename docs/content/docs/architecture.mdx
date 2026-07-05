@@ -25,7 +25,7 @@ server/          Express API backend
     sessions.ts      Session & event persistence (JSON/JSONL files)
     projects.ts  Project registry
     api-keys.ts  Provider API key storage (single- and multi-field providers)
-    models.ts    Model list fetchers per provider (Groq, Ollama, Cloudflare, ...)
+    models.ts    Model list fetchers per provider (Ollama, Cloudflare, ...)
   routes/
     sessions.ts  SSE streaming, session CRUD
     projects.ts  Project CRUD
@@ -52,7 +52,7 @@ spawned agent process (`getApiKeyEnvVars`), and the model-list fetchers in
 
 A provider entry is one of two shapes:
 
-- **Single-field** — one editable value, e.g. `GROQ_API_KEY`, `OLLAMA_API_KEY`,
+- **Single-field** — one editable value, e.g. `OLLAMA_API_KEY`,
   `OPENROUTER_API_KEY`. The store, the route, and the UI all collapse to the
   legacy `{ providerId: key }` shape.
 - **Multi-field** — several named values (Cloudflare today: account id, API
@@ -64,12 +64,12 @@ A provider entry is one of two shapes:
 
 `server/lib/models.ts` ships a fetcher per provider that hits the upstream
 `/models` endpoint and returns a flat list of `Model` records. Model ids are
-prefixed with the provider id (`groq/...`, `cloudflare/...`) so the existing
-`groupModelsByProvider` helper in the client renders them in the right
-`<optgroup>` without further work. Adding a new provider is a three-step
-change: append an entry to `PROVIDERS`, wire a fetcher in
-`PROVIDER_FETCHERS` (or a special-cased multi-field branch in
-`fetchAnitaFallbackModels`), and add the matching env-var surface — `getApiKeyEnvVars`
+prefixed with the provider id (`cloudflare/...`, `ollama-cloud/...`) so the
+existing `groupModelsByProvider` helper in the client renders them in the
+right `<optgroup>` without further work. Adding a new provider is a
+three-step change: append an entry to `PROVIDERS`, wire a fetcher in
+`fetchAnitaFallbackModels` (special-case multi-field providers the way
+Cloudflare is), and add the matching env-var surface — `getApiKeyEnvVars`
 picks up the new field automatically.
 
 Removed providers (e.g. an old OpenAI key) and orphaned field ids (e.g. a

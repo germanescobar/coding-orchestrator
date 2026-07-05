@@ -30,21 +30,21 @@ test("PROVIDERS no longer includes OpenAI", () => {
 });
 
 test("a stored OpenAI key is pruned on read", async () => {
-  await withTempHome({ openai: "sk-old", groq: "gk-keep" }, async () => {
+  await withTempHome({ openai: "sk-old", openrouter: "ork-keep" }, async () => {
     const configured = await getConfiguredProviders();
     assert.ok(!configured.includes("openai"));
-    assert.ok(configured.includes("groq"));
+    assert.ok(configured.includes("openrouter"));
 
     const env = await getApiKeyEnvVars();
     assert.equal(env.OPENAI_API_KEY, undefined);
-    assert.equal(env.GROQ_API_KEY, "gk-keep");
+    assert.equal(env.OPENROUTER_API_KEY, "ork-keep");
 
     // Prune persists to disk. The legacy single-value shape is normalized to
     // the multi-field shape on first read, and the removed OpenAI entry is
     // dropped in the same pass.
     const onDisk = JSON.parse(readFileSync(apiKeysFile(), "utf-8"));
     assert.equal("openai" in onDisk, false);
-    assert.deepEqual(onDisk.groq, { apiToken: "gk-keep" });
+    assert.deepEqual(onDisk.openrouter, { apiToken: "ork-keep" });
     assert.ok(existsSync(apiKeysFile()));
   });
 });

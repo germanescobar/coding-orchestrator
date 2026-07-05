@@ -32,8 +32,8 @@ test("modelProviderLabel title-cases underscore-separated provider ids", () => {
 });
 
 test("modelProviderLabel handles a single-segment provider id", () => {
-  const m = model({ provider: "groq" });
-  assert.equal(modelProviderLabel(m), "Groq");
+  const m = model({ provider: "mistral" });
+  assert.equal(modelProviderLabel(m), "Mistral");
 });
 
 test("modelProviderLabel returns empty string when no provider can be derived", () => {

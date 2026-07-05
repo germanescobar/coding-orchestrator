@@ -7,7 +7,7 @@ import {
 /**
  * The Cloudflare model fetcher is the only behavior in `models.ts` that
  * carries issue-specific surface area (gateway id, account id, AI token).
- * Other fetchers (Groq, Ollama) are simple and well-covered by their own
+ * Other fetchers (Ollama) are simple and well-covered by their own
  * callers. Tests focus on routing and shape so a future change to the
  * upstream URL or response wrapper is caught.
  */

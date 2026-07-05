@@ -106,22 +106,22 @@ test("ApiKeysSection renders one row per Cloudflare field with the right labels"
   assert.doesNotMatch(html, /Delete AI Gateway ID/);
 });
 
-const GROQ_PROVIDER: ProviderStatus = {
-  id: "groq",
-  name: "Groq",
+const OPENROUTER_PROVIDER: ProviderStatus = {
+  id: "openrouter",
+  name: "OpenRouter",
   singleField: true,
   fields: [
-    { id: "apiToken", label: "API key", configured: true, hint: "gsk-...abcd", secret: true },
+    { id: "apiToken", label: "API key", configured: true, hint: "sk-or-...abcd", secret: true },
   ],
 };
 
 test("ApiKeysSection renders a single field for single-field providers", () => {
   const html = renderToStaticMarkup(
-    <ApiKeysSection providers={[GROQ_PROVIDER]} onChange={() => {}} />
+    <ApiKeysSection providers={[OPENROUTER_PROVIDER]} onChange={() => {}} />
   );
-  assert.match(html, /Groq/);
+  assert.match(html, /OpenRouter/);
   assert.match(html, /API key/);
-  assert.match(html, /gsk-\.\.\.abcd/);
+  assert.match(html, /sk-or-\.\.\.abcd/);
   // Legacy single-field path only renders the canonical "add / update / delete"
   // surface for the single field — no per-field sub-form, no second input.
   assert.match(html, /Update API key|Add API key/);
