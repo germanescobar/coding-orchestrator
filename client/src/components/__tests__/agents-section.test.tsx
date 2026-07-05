@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
-import { AgentRow } from "../agents-section.tsx";
-import type { AgentStatus } from "../../api.ts";
+import { AgentRow, ApiKeysSection } from "../agents-section.tsx";
+import type { AgentStatus, ProviderStatus } from "../../api.ts";
 
 const NOOP = () => {};
 const NOOP_ASYNC = async () => {};
@@ -71,4 +71,59 @@ test("AgentRow path edit mode exposes explicit confirm and cancel actions", () =
   assert.match(html, /Leave empty to resolve on PATH/);
   assert.match(html, /Confirm path/);
   assert.match(html, /Cancel path edit/);
+});
+
+const CLOUDFLARE_PROVIDER: ProviderStatus = {
+  id: "cloudflare",
+  name: "Cloudflare",
+  singleField: false,
+  fields: [
+    { id: "accountId", label: "Account ID", configured: true, hint: "abcd...wxyz", secret: false },
+    { id: "apiToken", label: "API token", configured: true, hint: "abcd...wxyz", secret: true },
+    { id: "aiGatewayId", label: "AI Gateway ID", configured: false, hint: null, secret: false },
+  ],
+};
+
+test("ApiKeysSection renders one row per Cloudflare field with the right labels", () => {
+  const html = renderToStaticMarkup(
+    <ApiKeysSection providers={[CLOUDFLARE_PROVIDER]} onChange={() => {}} />
+  );
+  assert.match(html, /Cloudflare/);
+  assert.match(html, /Account ID/);
+  assert.match(html, /API token/);
+  assert.match(html, /AI Gateway ID/);
+  // Each configured field surfaces its hint; the unconfigured one doesn't.
+  assert.match(html, /abcd\.\.\.wxyz/);
+  // Multi-field providers expose add / update / delete controls for every
+  // field independently.
+  assert.match(html, /Update Account ID|Add Account ID/);
+  assert.match(html, /Update API token|Add API token/);
+  assert.match(html, /Add AI Gateway ID/);
+  // The unconfigured field should only offer the "add" action, not "update"
+  // or "delete" (no value to mutate or remove yet).
+  assert.match(html, /Add AI Gateway ID/);
+  assert.doesNotMatch(html, /Update AI Gateway ID/);
+  assert.doesNotMatch(html, /Delete AI Gateway ID/);
+});
+
+const GROQ_PROVIDER: ProviderStatus = {
+  id: "groq",
+  name: "Groq",
+  singleField: true,
+  fields: [
+    { id: "apiToken", label: "API key", configured: true, hint: "gsk-...abcd", secret: true },
+  ],
+};
+
+test("ApiKeysSection renders a single field for single-field providers", () => {
+  const html = renderToStaticMarkup(
+    <ApiKeysSection providers={[GROQ_PROVIDER]} onChange={() => {}} />
+  );
+  assert.match(html, /Groq/);
+  assert.match(html, /API key/);
+  assert.match(html, /gsk-\.\.\.abcd/);
+  // Legacy single-field path only renders the canonical "add / update / delete"
+  // surface for the single field — no per-field sub-form, no second input.
+  assert.match(html, /Update API key|Add API key/);
+  assert.match(html, /Delete API key/);
 });
