@@ -14,13 +14,23 @@ Controller ships with integrations for:
 
 | Integration | Kind |
 |---|---|
-| Cloudflare | MCP server |
+| Cloudflare (MCP) | MCP server — for *managing* Cloudflare resources (Workers, KV, DNS, etc.) |
 | Help Scout Docs | REST API |
 | Notion | Native CLI (`ntn`) |
 | Trello | REST API |
 | Interactive Brokers | Local gateway |
 | GitHub Issues | Native CLI (`gh`) |
 | Tavily | Web search / extraction |
+
+> **Cloudflare as a model provider is separate.** To use Cloudflare-hosted
+> models (Workers AI, or anything routed through the [AI
+> Gateway](https://developers.cloudflare.com/ai-gateway/)) from inside
+> Controller, add the **Cloudflare** provider in **Settings → Agents →
+> Anita → API Keys** with your account id, API token, and (optionally)
+> AI Gateway id. That surface picks up the new provider automatically
+> and lists the available models in Anita's default-model picker. The
+> Cloudflare *MCP* integration above is a different concern — it is a
+> tool the agent can call, not a model backend.
 
 ## Credentials stay out of the prompt
 

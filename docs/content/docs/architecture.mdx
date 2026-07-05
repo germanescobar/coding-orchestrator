@@ -24,7 +24,8 @@ server/          Express API backend
     auto-approve.ts  Per-agent auto-approve flag sets (single source of truth)
     sessions.ts      Session & event persistence (JSON/JSONL files)
     projects.ts  Project registry
-    api-keys.ts  API key storage
+    api-keys.ts  Provider API key storage (single- and multi-field providers)
+    models.ts    Model list fetchers per provider (Groq, Ollama, Cloudflare, ...)
   routes/
     sessions.ts  SSE streaming, session CRUD
     projects.ts  Project CRUD
@@ -39,6 +40,41 @@ Claude adapters. The server spawns each agent CLI as a child process, parses its
 JSON output stream, normalizes events into a common shape (`AgentStreamEvent`),
 and forwards them to the client over SSE. Adding a new provider means adding an
 adapter here that maps the CLI's output onto `AgentStreamEvent`.
+
+## Model providers (Anita)
+
+Anita picks the model it talks to from a list of **model providers** registered
+in `server/lib/api-keys.ts`. The `PROVIDERS` array is the single source of
+truth: it drives the API-key rows in **Settings → Agents → Anita → API Keys**
+(via `server/routes/api-keys.ts`), the env-var surface injected into the
+spawned agent process (`getApiKeyEnvVars`), and the model-list fetchers in
+`server/lib/models.ts` that populate Anita's default-model picker.
+
+A provider entry is one of two shapes:
+
+- **Single-field** — one editable value, e.g. `GROQ_API_KEY`, `OLLAMA_API_KEY`,
+  `OPENROUTER_API_KEY`. The store, the route, and the UI all collapse to the
+  legacy `{ providerId: key }` shape.
+- **Multi-field** — several named values (Cloudflare today: account id, API
+  token, AI gateway id). The store carries them as
+  `{ providerId: { fieldId: value } }`, the route exposes one
+  `PUT/DELETE /api-keys/:providerId/:fieldId` per value, and the UI renders
+  one row per field. Account and gateway ids are non-sensitive identifiers;
+  only the API token is treated as a secret.
+
+`server/lib/models.ts` ships a fetcher per provider that hits the upstream
+`/models` endpoint and returns a flat list of `Model` records. Model ids are
+prefixed with the provider id (`groq/...`, `cloudflare/...`) so the existing
+`groupModelsByProvider` helper in the client renders them in the right
+`<optgroup>` without further work. Adding a new provider is a three-step
+change: append an entry to `PROVIDERS`, wire a fetcher in
+`PROVIDER_FETCHERS` (or a special-cased multi-field branch in
+`fetchAnitaFallbackModels`), and add the matching env-var surface — `getApiKeyEnvVars`
+picks up the new field automatically.
+
+Removed providers (e.g. an old OpenAI key) and orphaned field ids (e.g. a
+renamed Cloudflare field) are pruned on the next read; the prune persists to
+disk so the on-disk shape stays consistent with the in-memory view.
 
 ## Session persistence
 

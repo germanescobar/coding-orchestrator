@@ -703,11 +703,25 @@ export type ReasoningEffort =
 
 export type ServiceTier = "fast" | "flex";
 
+export interface ProviderFieldStatus {
+  id: string;
+  label: string;
+  configured: boolean;
+  hint: string | null;
+  secret: boolean;
+}
+
 export interface ProviderStatus {
   id: string;
   name: string;
-  configured: boolean;
-  hint: string | null;
+  /**
+   * When true, the provider exposes a single field and the legacy shape
+   * (one key per provider) applies. The Cloudflare provider is the
+   * canonical multi-field provider; the UI renders one row per field
+   * when `singleField` is false.
+   */
+  singleField: boolean;
+  fields: ProviderFieldStatus[];
 }
 
 export interface AgentProviderInfo {
@@ -922,21 +936,41 @@ export async function fetchProviders(): Promise<ProviderStatus[]> {
   return res.json();
 }
 
-export async function setProviderKey(
-  providerId: string,
-  key: string
-): Promise<void> {
-  const res = await fetch(`${BASE}/api-keys/${providerId}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ key }),
-  });
-  await throwIfNotOk(res, "Failed to save API key");
+export async function deleteProviderKey(providerId: string): Promise<void> {
+  await deleteProviderField(providerId, "apiToken");
 }
 
-export async function deleteProviderKey(providerId: string): Promise<void> {
-  const res = await fetch(`${BASE}/api-keys/${providerId}`, { method: "DELETE" });
-  await throwIfNotOk(res, "Failed to delete API key");
+/**
+ * Set a single field on a provider. Multi-field providers (e.g. Cloudflare)
+ * expose one field per editable value: `accountId`, `apiToken`,
+ * `aiGatewayId`. Single-field providers expose the implicit `apiToken` field.
+ */
+export async function setProviderField(
+  providerId: string,
+  fieldId: string,
+  value: string
+): Promise<void> {
+  const res = await fetch(
+    `${BASE}/api-keys/${encodeURIComponent(providerId)}/${encodeURIComponent(fieldId)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
+    }
+  );
+  await throwIfNotOk(res, "Failed to save field");
+}
+
+/** Remove a single field on a provider. */
+export async function deleteProviderField(
+  providerId: string,
+  fieldId: string
+): Promise<void> {
+  const res = await fetch(
+    `${BASE}/api-keys/${encodeURIComponent(providerId)}/${encodeURIComponent(fieldId)}`,
+    { method: "DELETE" }
+  );
+  await throwIfNotOk(res, "Failed to delete field");
 }
 
 // --- Integrations (issue #130) ---

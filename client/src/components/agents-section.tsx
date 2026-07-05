@@ -6,16 +6,28 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import {
   fetchProviders,
-  setProviderKey,
-  deleteProviderKey,
+  setProviderField,
+  deleteProviderField,
   fetchAgents,
   updateAgent,
   fetchModels,
   type ProviderStatus,
+  type ProviderFieldStatus,
   type AgentStatus,
   type Model,
 } from "../api.ts";
 import { modelProviderLabel } from "../lib/model-labels.ts";
+
+/*
+ * Settings section for enabling agents, setting their CLI paths, and
+ * configuring the model-provider API keys the Anita agent uses. Self-loading so
+ * it can drop into the settings page without the page wiring its data.
+ *
+ * `ApiKeysSection` is exported so the per-field Cloudflare rendering can be
+ * covered by a server-rendered test without needing to mount the full
+ * `AgentsSection` (which loads its own data on mount).
+ */
+export { ApiKeysSection };
 
 // API-key providers are model backends consumed by the Anita agent, so they are
 // rendered nested under the Anita row rather than as a top-level section.
@@ -413,120 +425,197 @@ interface ApiKeysSectionProps {
 }
 
 function ApiKeysSection({ providers, onChange }: ApiKeysSectionProps) {
-  const [editingProvider, setEditingProvider] = useState<string | null>(null);
-  const [keyInput, setKeyInput] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  const handleSave = async (providerId: string) => {
-    if (!keyInput.trim()) return;
-    setSaving(true);
-    try {
-      await setProviderKey(providerId, keyInput.trim());
-      setKeyInput("");
-      setEditingProvider(null);
-      onChange();
-      toast.success("Anita API key updated");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to save Anita API key");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDelete = async (providerId: string) => {
-    try {
-      await deleteProviderKey(providerId);
-      onChange();
-      toast.success("Anita API key deleted");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to delete Anita API key");
-    }
-  };
-
   return (
     <div className="space-y-2">
       <h4 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
         API Keys
       </h4>
       {providers.map((provider) => (
-        <div key={provider.id} className="flex items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-2">
-            <Key className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <div className="min-w-0">
-              <div className="text-sm">{provider.name}</div>
-              {provider.configured && provider.hint && (
-                <div className="text-xs text-muted-foreground font-mono">{provider.hint}</div>
-              )}
-            </div>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-1.5">
-            {editingProvider === provider.id ? (
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  handleSave(provider.id);
-                }}
-                className="flex items-center gap-1.5"
-              >
-                <input
-                  type="password"
-                  value={keyInput}
-                  onChange={(e) => setKeyInput(e.target.value)}
-                  placeholder="Paste key..."
-                  autoFocus
-                  className="w-32 rounded-md border border-border bg-transparent px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                />
-                <Button
-                  type="submit"
-                  size="icon-sm"
-                  variant="ghost"
-                  disabled={saving || !keyInput.trim()}
-                  title="Confirm API key"
-                  aria-label="Confirm API key"
-                >
-                  {saving ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Check className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-              </form>
-            ) : (
-              <>
-                <Button
-                  size="icon-sm"
-                  variant="ghost"
-                  onClick={() => {
-                    setEditingProvider(provider.id);
-                    setKeyInput("");
-                  }}
-                  title={provider.configured ? "Update key" : "Add key"}
-                  aria-label={provider.configured ? "Update key" : "Add key"}
-                >
-                  {provider.configured ? (
-                    <Pencil className="h-3.5 w-3.5" />
-                  ) : (
-                    <Plus className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-                {provider.configured && (
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    onClick={() => handleDelete(provider.id)}
-                    className="text-muted-foreground hover:text-destructive"
-                    title="Delete key"
-                    aria-label="Delete key"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </Button>
-                )}
-              </>
-            )}
-          </div>
-        </div>
+        <ProviderFields
+          key={provider.id}
+          provider={provider}
+          onChange={onChange}
+        />
       ))}
+    </div>
+  );
+}
+
+interface ProviderFieldsProps {
+  provider: ProviderStatus;
+  onChange: () => void;
+}
+
+/**
+ * Renders a provider's editable values. Single-field providers get the
+ * canonical "one input row" shape; multi-field providers (Cloudflare today)
+ * get one row per field, each with its own edit / delete controls and
+ * its own value hint so the user can confirm a value is loaded without
+ * exposing the secret.
+ */
+function ProviderFields({ provider, onChange }: ProviderFieldsProps) {
+  return (
+    <div className="rounded-md border border-border/60">
+      <div className="flex items-center gap-2 px-2 py-1.5">
+        <Key className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 text-sm font-medium">{provider.name}</div>
+      </div>
+      <div className="border-t border-border/60">
+        {provider.fields.map((field, index) => (
+          <ProviderFieldRow
+            key={field.id}
+            providerId={provider.id}
+            field={field}
+            isLast={index === provider.fields.length - 1}
+            onChange={onChange}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface ProviderFieldRowProps {
+  providerId: string;
+  field: ProviderFieldStatus;
+  isLast: boolean;
+  onChange: () => void;
+}
+
+function ProviderFieldRow({
+  providerId,
+  field,
+  isLast,
+  onChange,
+}: ProviderFieldRowProps) {
+  // Key per (provider, field) so editing one field doesn't reset another's
+  // in-flight input or pending state.
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    if (!value.trim()) return;
+    setSaving(true);
+    try {
+      await setProviderField(providerId, field.id, value.trim());
+      setValue("");
+      setEditing(false);
+      onChange();
+      toast.success(`${field.label} updated`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Failed to save ${field.label}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async () => {
+    try {
+      await deleteProviderField(providerId, field.id);
+      onChange();
+      toast.success(`${field.label} deleted`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Failed to delete ${field.label}`);
+    }
+  };
+
+  return (
+    <div
+      className={`flex items-center justify-between gap-3 px-2 py-1.5 ${
+        isLast ? "" : "border-b border-border/40"
+      }`}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <div className="min-w-0">
+          <div className="text-xs text-muted-foreground">{field.label}</div>
+          {field.configured && field.hint && (
+            <div className="text-xs font-mono text-muted-foreground/80">
+              {field.hint}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-1.5">
+        {editing ? (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              save();
+            }}
+            className="flex items-center gap-1.5"
+          >
+            <input
+              type={field.secret ? "password" : "text"}
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder={field.secret ? "Paste value..." : "Enter value..."}
+              autoFocus
+              className="w-40 rounded-md border border-border bg-transparent px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+            <Button
+              type="submit"
+              size="icon-sm"
+              variant="ghost"
+              disabled={saving || !value.trim()}
+              title="Confirm"
+              aria-label="Confirm"
+            >
+              {saving ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Check className="h-3.5 w-3.5" />
+              )}
+            </Button>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              onClick={() => {
+                setEditing(false);
+                setValue("");
+              }}
+              disabled={saving}
+              title="Cancel"
+              aria-label="Cancel"
+            >
+              <X className="h-3.5 w-3.5" />
+            </Button>
+          </form>
+        ) : (
+          <>
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              onClick={() => {
+                setEditing(true);
+                setValue("");
+              }}
+              title={field.configured ? `Update ${field.label}` : `Add ${field.label}`}
+              aria-label={field.configured ? `Update ${field.label}` : `Add ${field.label}`}
+            >
+              {field.configured ? (
+                <Pencil className="h-3.5 w-3.5" />
+              ) : (
+                <Plus className="h-3.5 w-3.5" />
+              )}
+            </Button>
+            {field.configured && (
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                onClick={remove}
+                className="text-muted-foreground hover:text-destructive"
+                title={`Delete ${field.label}`}
+                aria-label={`Delete ${field.label}`}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }

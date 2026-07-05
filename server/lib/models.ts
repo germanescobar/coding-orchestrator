@@ -1,6 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { getApiKey, getApiKeyEnvVars, PROVIDERS } from "./api-keys.js";
+import {
+  getApiKey,
+  getApiKeyField,
+  getApiKeyEnvVars,
+  PROVIDERS,
+} from "./api-keys.js";
 import { codexAppServerManager } from "./codex-app-server.js";
 import { resolveAgentCommand } from "./agents.js";
 import { childProcessEnv } from "./shell-env.js";
@@ -160,9 +165,100 @@ async function fetchGroqModels(apiKey: string): Promise<Model[]> {
   }
 }
 
+/**
+ * Cloudflare model fetcher.
+ *
+ * Two paths are possible:
+ *
+ * 1. Workers AI REST API at
+ *    `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/models`
+ *    when no AI gateway id is set. The response is OpenAI-compatible; we
+ *    tag the resulting models with the "Cloudflare" group so the picker can
+ *    keep them visually distinct from gateway-routed models.
+ * 2. AI Gateway as a proxy in front of Workers AI (and other upstreams) at
+ *    `https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/...` —
+ *    the gateway-advertised models list lives at
+ *    `/v1/{account_id}/{gateway_id}/workers-ai/models`. Tag with the
+ *    "Cloudflare Gateway" group so users can see they are routed through
+ *    the gateway (which gives them unified logging, caching, rate limiting,
+ *    and failover).
+ *
+ * Either path needs the API token; the gateway path additionally needs the
+ * account id and the gateway id. Account id is also required for the direct
+ * path. We never throw on missing fields — we just return an empty list and
+ * the UI surfaces "no models yet" the same way the other providers do.
+ */
+async function fetchCloudflareModels(
+  accountId: string | null,
+  apiToken: string | null,
+  aiGatewayId: string | null
+): Promise<Model[]> {
+  if (!apiToken) return [];
+  if (aiGatewayId && accountId) {
+    try {
+      const url = `https://gateway.ai.cloudflare.com/v1/${accountId}/${aiGatewayId}/workers-ai/models`;
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiToken}` },
+      });
+      if (!response.ok) return [];
+      const data = (await response.json()) as {
+        result?: Array<{ id?: unknown; name?: unknown }>;
+      };
+      const rows = Array.isArray(data.result) ? data.result : [];
+      return rows
+        .filter(
+          (m): m is { id: string; name?: string } =>
+            !!m && typeof m === "object" && typeof m.id === "string" && m.id.length > 0
+        )
+        .map((m) => ({
+          id: `cloudflare/${m.id}`,
+          name: typeof m.name === "string" && m.name ? m.name : m.id,
+          provider: "cloudflare",
+          size: "",
+          group: "Cloudflare Gateway",
+        }));
+    } catch {
+      return [];
+    }
+  }
+  if (!accountId) return [];
+  try {
+    const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/models`;
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+    });
+    if (!response.ok) return [];
+    const data = (await response.json()) as {
+      result?: Array<{ id?: unknown; name?: unknown }>;
+    };
+    const rows = Array.isArray(data.result) ? data.result : [];
+    return rows
+      .filter(
+        (m): m is { id: string; name?: string } =>
+          !!m && typeof m === "object" && typeof m.id === "string" && m.id.length > 0
+      )
+      .map((m) => ({
+        id: `cloudflare/${m.id}`,
+        name: typeof m.name === "string" && m.name ? m.name : m.id,
+        provider: "cloudflare",
+        size: "",
+        group: "Cloudflare",
+      }));
+  } catch {
+    return [];
+  }
+}
+
 const PROVIDER_FETCHERS: Record<string, (apiKey: string) => Promise<Model[]>> = {
   groq: fetchGroqModels,
 };
+
+/**
+ * Exported for tests. The dispatcher in `fetchAnitaFallbackModels` calls
+ * this with the three Cloudflare fields; the export keeps the dispatcher
+ * readable while letting tests target the routing logic in isolation.
+ */
+export const __test__fetchCloudflareModels = fetchCloudflareModels;
 
 const STALE_CODEX_MODEL_IDS = new Set(["gpt-5.3-codex"]);
 
@@ -217,6 +313,15 @@ async function fetchAnitaFallbackModels(): Promise<Model[]> {
   const modelLists = await Promise.all([
     fetchOllamaModels(),
     ...PROVIDERS.map(async (p) => {
+      if (p.id === "cloudflare") {
+        const [accountId, apiToken, aiGatewayId] = await Promise.all([
+          getApiKeyField("cloudflare", "accountId"),
+          getApiKeyField("cloudflare", "apiToken"),
+          getApiKeyField("cloudflare", "aiGatewayId"),
+        ]);
+        if (!apiToken) return [];
+        return fetchCloudflareModels(accountId, apiToken, aiGatewayId);
+      }
       const key = await getApiKey(p.id);
       if (!key) return [];
       const fetcher = PROVIDER_FETCHERS[p.id];
