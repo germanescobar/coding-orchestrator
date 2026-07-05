@@ -76,6 +76,54 @@ and run it; no install required.
 
 ## [Unreleased]
 
+- **Integrations: OAuth (dynamic / MCP) auth scheme** (#280). The
+  "OAuth (dynamic / MCP)" preset is now selectable in the Add-scheme
+  picker. Clicking **Connect** runs the full RFC 8414 + RFC 7591 + PKCE
+  flow against the MCP server's authorization server: metadata
+  discovery, dynamic client registration, a loopback browser-redirect
+  callback, and token storage in the encrypted secret store. Subsequent
+  agent runs attach the access token as a bearer; the scheme
+  proactively refreshes on expiry and the UI shows a **Reconnect**
+  action when re-auth is required.
+
+  Discovery follows the MCP spec: tries the host-origin
+  `/.well-known/oauth-authorization-server` first, then probes
+  `initialize` and follows `WWW-Authenticate` `resource_metadata`
+  (RFC 9728) to the protected-resource document, then reads the AS
+  list. This matches the real-world pattern of servers like Figma's
+  that publish the AS metadata on a different origin from the
+  resource path. DCR honors the AS's
+  `token_endpoint_auth_methods_supported` (Figma requires
+  `client_secret_basic` or `client_secret_post`, not the PKCE-public
+  `none`).
+
+- **Secret store: opt-in encryption, recovery on stale ciphertext**
+  (#280). The at-rest store for integration secrets now defaults to
+  the 0600 plaintext envelope; the encrypted envelope is used only
+  when `CONTROLLER_ENCRYPT_SECRETS=1` is set. Reason: the project
+  ships only ad-hoc-signed Electron builds, and each rebuild changes
+  the app's keychain identity, so the old encrypted envelope became
+  unreadable by the new build (the "Error while decrypting the
+  ciphertext provided to safeStorage.decryptString" error). On any
+  un-recoverable read the file is renamed to
+  `integration-secrets.json.broken-<iso>` and the app returns an
+  empty store, so the user re-authorizes any affected OAuth schemes
+  without the rest of the app being wedged.
+
+- **Note on Figma (and other closed-DCR MCP servers).** The dynamic
+  preset relies on RFC 7591 dynamic client registration, which the
+  MCP spec recommends but does not require. Some servers — Figma's
+  MCP server is the canonical example — return 403 on the
+  registration endpoint and require clients to register through a
+  developer dashboard instead. The spec calls this out explicitly:
+  "Any authorization servers that do not support Dynamic Client
+  Registration need to provide alternative ways to obtain a client
+  ID. For one of these authorization servers, MCP clients will have
+  to either hardcode a client ID… or present a UI to users that
+  allows them to enter these details, after registering an OAuth
+  client themselves." When DCR fails, the form's error message
+  points the user at the manual path.
+
 ## [0.2.0] - 2026-06-28
 
 The second preview release. Headline changes: the orchestrator's on-disk

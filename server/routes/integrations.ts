@@ -14,6 +14,7 @@
 import { Router } from "express";
 import {
   listConnections,
+  getConnection,
   createConnection,
   updateConnection,
   deleteConnection,
@@ -26,6 +27,12 @@ import {
   type AuthSchemeInput,
 } from "../lib/integrations.js";
 import { fetchOpenApiAuth } from "../lib/openapi-auth.js";
+import {
+  startInteractiveOauth,
+  acquireStatus as oauthDynamicStatus,
+  clearDynamicOauth,
+  OAuthDynamicError,
+} from "../lib/oauth-dynamic.js";
 import {
   gatewayList,
   gatewaySearch,
@@ -101,6 +108,75 @@ integrationsRouter.post("/openapi/inspect", async (req, res) => {
   } catch (error) {
     res.status(422).json({ error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+/*
+ * OAuth (dynamic / MCP) acquisition — issue #280.
+ *
+ * These routes let the Integrations form trigger and inspect the interactive
+ * authorization-code flow for `oauth_dynamic` schemes. The actual token
+ * exchange is driven by `startInteractiveOauth` in lib/oauth-dynamic; this
+ * route's job is to look the connection + scheme up, run the flow, and
+ * translate errors into HTTP responses the form can render.
+ */
+integrationsRouter.post("/:id/schemes/:schemeId/acquire", async (req, res) => {
+  const { id, schemeId } = req.params;
+  const connection = await getConnection(id);
+  if (!connection) {
+    res.status(404).json({ error: "Unknown connection" });
+    return;
+  }
+  const scheme = connection.auth.schemes.find((s) => s.id === schemeId);
+  if (!scheme) {
+    res.status(404).json({ error: "Unknown auth scheme" });
+    return;
+  }
+  if (scheme.acquisition !== "oauth_dynamic") {
+    res.status(400).json({ error: "Acquisition is not oauth_dynamic" });
+    return;
+  }
+  try {
+    await startInteractiveOauth(connection, scheme);
+    const status = await oauthDynamicStatus(connection.id, scheme.id);
+    res.json({ ok: true, status });
+  } catch (error) {
+    if (error instanceof OAuthDynamicError) {
+      const status = error.code === "refresh_failed" ? 401 : 400;
+      res.status(status).json({ error: error.message, code: error.code });
+      return;
+    }
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+integrationsRouter.get("/:id/schemes/:schemeId/status", async (req, res) => {
+  const { id, schemeId } = req.params;
+  const status = await oauthDynamicStatus(id, schemeId);
+  if (!status) {
+    res.status(404).json({ error: "Unknown connection or scheme" });
+    return;
+  }
+  res.json(status);
+});
+
+integrationsRouter.delete("/:id/schemes/:schemeId/acquire", async (req, res) => {
+  const { id, schemeId } = req.params;
+  const connection = await getConnection(id);
+  if (!connection) {
+    res.status(404).json({ error: "Unknown connection" });
+    return;
+  }
+  const scheme = connection.auth.schemes.find((s) => s.id === schemeId);
+  if (!scheme) {
+    res.status(404).json({ error: "Unknown auth scheme" });
+    return;
+  }
+  if (scheme.acquisition !== "oauth_dynamic") {
+    res.status(400).json({ error: "Acquisition is not oauth_dynamic" });
+    return;
+  }
+  await clearDynamicOauth(id, schemeId);
+  res.json({ ok: true });
 });
 
 /*

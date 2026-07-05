@@ -53,6 +53,14 @@ export async function resolveConnectionAuth(
       const token = await acquireOAuthToken(connection.id, scheme, secrets[scheme.id]);
       if (token) secrets[scheme.id] = token;
       else delete secrets[scheme.id];
+    } else if (scheme.acquisition === "oauth_dynamic") {
+      // For dynamic OAuth we still resolve the bearer transparently: the
+      // user has authorized before, so the token lives in the secret store.
+      // Proactive refresh on expiry is handled inside the dynamic module.
+      const { getValidToken } = await import("./oauth-dynamic.js");
+      const token = await getValidToken(connection, scheme);
+      if (token) secrets[scheme.id] = token;
+      else delete secrets[scheme.id];
     }
   }
   return resolveAuth(connection.auth.schemes, secrets);

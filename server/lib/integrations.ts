@@ -230,6 +230,27 @@ export async function updateConnection(
   return existing;
 }
 
+/**
+ * Patch a single scheme's `acquired` field without re-running the full
+ * update/validation flow. Used by acquisition modules (OAuth, client-credentials)
+ * to flip the UI state when a token is obtained, refreshed, or expires.
+ */
+export async function updateSchemeAcquired(
+  connectionId: string,
+  schemeId: string,
+  acquired: AcquiredState | undefined
+): Promise<IntegrationConnection | null> {
+  const registry = await readRegistry();
+  const connection = registry.find((c) => c.id === connectionId);
+  if (!connection) return null;
+  const scheme = connection.auth.schemes.find((s) => s.id === schemeId);
+  if (!scheme) return null;
+  scheme.acquired = acquired;
+  connection.updatedAt = new Date().toISOString();
+  await writeRegistry(registry);
+  return connection;
+}
+
 export async function deleteConnection(id: string): Promise<boolean> {
   const registry = await readRegistry();
   const next = registry.filter((c) => c.id !== id);
@@ -342,6 +363,8 @@ async function writeConnectionSecrets(
   else store[connectionId] = secrets;
   await writeSecretJson(integrationSecretsFile(), store);
 }
+
+export { writeConnectionSecrets };
 
 async function removeConnectionSecrets(connectionId: string): Promise<void> {
   const store = await readSecrets();

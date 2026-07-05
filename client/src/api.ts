@@ -1092,6 +1092,53 @@ export async function inspectOpenApiSpec(specUrl: string): Promise<OpenApiAuthIn
   return res.json();
 }
 
+export interface OAuthDynamicStatus {
+  status: "none" | "connected" | "expired";
+  expiresAt?: string;
+}
+
+/**
+ * Kick off the OAuth (dynamic / MCP) acquisition for a scheme (issue #280).
+ * The server discovers the AS, registers a client, opens the user's browser
+ * to the auth URL, captures the redirect, and stores the resulting tokens.
+ * The call blocks until the user finishes the browser flow (or it times
+ * out) so the form can show a single spinner.
+ */
+export async function acquireOAuthDynamic(
+  connectionId: string,
+  schemeId: string
+): Promise<OAuthDynamicStatus> {
+  const res = await fetch(
+    `${BASE}/integrations/${encodeURIComponent(connectionId)}/schemes/${encodeURIComponent(schemeId)}/acquire`,
+    { method: "POST" }
+  );
+  await throwIfNotOk(res, "Failed to start OAuth acquisition");
+  const json = (await res.json()) as { ok: true; status: OAuthDynamicStatus };
+  return json.status;
+}
+
+export async function fetchOAuthDynamicStatus(
+  connectionId: string,
+  schemeId: string
+): Promise<OAuthDynamicStatus> {
+  const res = await fetch(
+    `${BASE}/integrations/${encodeURIComponent(connectionId)}/schemes/${encodeURIComponent(schemeId)}/status`
+  );
+  await throwIfNotOk(res, "Failed to fetch scheme status");
+  return res.json();
+}
+
+export async function disconnectOAuthDynamic(
+  connectionId: string,
+  schemeId: string
+): Promise<void> {
+  const res = await fetch(
+    `${BASE}/integrations/${encodeURIComponent(connectionId)}/schemes/${encodeURIComponent(schemeId)}/acquire`,
+    { method: "DELETE" }
+  );
+  await throwIfNotOk(res, "Failed to disconnect scheme");
+}
+
 export function startSession(
   projectId: string,
   message: string,
