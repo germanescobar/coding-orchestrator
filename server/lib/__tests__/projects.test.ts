@@ -18,7 +18,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { addProject, getProject, updateProject } from "../projects.js";
+import { addProject, findProjectByPath, getProject, updateProject } from "../projects.js";
+import { addWorktree } from "../worktrees.js";
+import { worktreePath } from "../paths.js";
 
 interface Sandbox {
   home: string;
@@ -177,5 +179,99 @@ test("editing a hydrated script round-trips without mangling the body", async ()
     await updateProject(project.id, { runCommands: hydrated?.runCommands });
 
     assert.equal(await fs.readFile(scriptPath(projectPath, "run.sh"), "utf-8"), original);
+  });
+});
+
+/*
+ * findProjectByPath: the cwd-based project lookup the CLI hits when
+ * `<project>` is omitted (or doesn't match by id/name). The lookup
+ * considers both `project.path` (the main worktree root) and every
+ * registered worktree's on-disk path under
+ * `orchestratorHome()/worktrees/<projectId>/<name>`. The latter matters
+ * because Controller-created worktrees do not live under `project.path`
+ * — see `worktreePath()` in `paths.ts` and the review on PR #298.
+ */
+test("findProjectByPath resolves a cwd inside a Controller-created worktree", async () => {
+  // Regression test for the Codex review on PR #298: a session running
+  // in a Controller-created worktree (the exact case the optional
+  // `<project>` resolver was built for) was returning null because the
+  // lookup only checked `project.path`, but those worktrees live at
+  // `orchestratorHome()/worktrees/<projectId>/<name>`. The fix
+  // delegates to `findWorktreeByPath` first.
+  await withSandbox(async ({ projectPath }) => {
+    const project = await addProject("demo", projectPath);
+    const worktreeDir = worktreePath(project.id, "issue-298");
+    await fs.mkdir(worktreeDir, { recursive: true });
+    await addWorktree({
+      projectId: project.id,
+      name: "issue-298",
+      path: worktreeDir,
+      branch: "issue-298",
+      isMain: false,
+    });
+
+    // A file deep inside the worktree resolves to the project.
+    const fromCwd = await findProjectByPath(
+      path.join(worktreeDir, "src", "foo.ts")
+    );
+    assert.ok(fromCwd, "expected to find a project for a cwd inside a registered worktree");
+    assert.equal(fromCwd?.id, project.id);
+    // And so does the worktree root itself.
+    const fromCwdRoot = await findProjectByPath(worktreeDir);
+    assert.equal(fromCwdRoot?.id, project.id);
+  });
+});
+
+test("findProjectByPath matches an exact cwd", async () => {
+  await withSandbox(async ({ projectPath }) => {
+    const project = await addProject("demo", projectPath);
+    const fromCwd = await findProjectByPath(projectPath);
+    assert.equal(fromCwd?.id, project.id);
+  });
+});
+
+test("findProjectByPath resolves symlinks and `..` segments before comparing", async () => {
+  await withSandbox(async ({ projectPath }) => {
+    const project = await addProject("demo", projectPath);
+    // `<projectPath>/sub/..` should normalize to `<projectPath>` and match.
+    const fromCwd = await findProjectByPath(path.join(projectPath, "sub", ".."));
+    assert.equal(fromCwd?.id, project.id);
+  });
+});
+
+test("findProjectByPath returns null when no project owns the cwd", async () => {
+  await withSandbox(async () => {
+    // The sandbox is fresh, no projects added. The lookup must not throw.
+    const orphan = mkdtempSync(path.join(os.tmpdir(), "controller-orphan-"));
+    try {
+      const fromCwd = await findProjectByPath(orphan);
+      assert.equal(fromCwd, null);
+    } finally {
+      rmSync(orphan, { recursive: true, force: true });
+    }
+  });
+});
+
+test("findProjectByPath picks the most specific project (longest-prefix match)", async () => {
+  await withSandbox(async () => {
+    // Two projects, one nested inside the other. The deeper one should
+    // win for paths inside it; the outer one for paths that are inside
+    // it but outside the inner one.
+    const outer = mkdtempSync(path.join(os.tmpdir(), "controller-outer-"));
+    const inner = path.join(outer, "nested-project");
+    await fs.mkdir(inner, { recursive: true });
+    try {
+      const outerProject = await addProject("outer", outer);
+      const innerProject = await addProject("inner", inner);
+
+      // Inside the inner project: inner wins (longer prefix).
+      const insideInner = await findProjectByPath(path.join(inner, "src", "foo.ts"));
+      assert.equal(insideInner?.id, innerProject.id);
+      // Inside the outer project but outside the inner: outer wins.
+      const insideOuter = await findProjectByPath(outer);
+      assert.equal(insideOuter?.id, outerProject.id);
+    } finally {
+      rmSync(outer, { recursive: true, force: true });
+    }
   });
 });

@@ -41,6 +41,58 @@ export async function getProject(id: string): Promise<Project | null> {
   return record ? hydrate(record) : null;
 }
 
+/**
+ * Find the project that owns the given filesystem path. The orchestrator
+ * already thinks of a session as "pinned to a worktree, owned by a
+ * project", and a session's shell is usually running in one of two
+ * on-disk locations:
+ *
+ *   1. A Controller-created worktree under
+ *      `orchestratorHome()/worktrees/<projectId>/<name>` — this is where
+ *      `worktreePath()` (paths.ts) and `findWorktreeByPath` (worktrees.ts)
+ *      know about.
+ *   2. The project's `path` itself (i.e. the main worktree's root, or any
+ *      other directory the user opened in the project).
+ *
+ * The function tries the worktree-aware lookup first and only falls back
+ * to a `project.path` prefix match when no worktree owns the path. This
+ * means a session running inside a Controller-created worktree — the
+ * exact case the CLI's optional-`<project>` resolver was built for —
+ * resolves to the right project. (Initial PR review from Codex on #298.)
+ *
+ * Returns `null` when no project owns the path. The `cwd` is resolved
+ * before comparison so symlinks and `.`/`..` segments don't bypass the
+ * prefix check.
+ */
+export async function findProjectByPath(targetPath: string): Promise<Project | null> {
+  // Lazy import: `worktrees.ts` already imports from this module, so a
+  // top-level static import would form a cycle. The helper is only
+  // called from the cwd-based project lookup, so the dynamic import
+  // overhead is one extra microtask on a code path that already does
+  // disk I/O for the project list.
+  const { findWorktreeByPath } = await import("./worktrees.js");
+  const worktree = await findWorktreeByPath(targetPath);
+  if (worktree) {
+    return getProject(worktree.projectId);
+  }
+  const resolved = path.resolve(targetPath);
+  const projects = await getProjects();
+  let best: Project | null = null;
+  let bestLen = -1;
+  for (const project of projects) {
+    if (!project.path) continue;
+    const projectPath = path.resolve(project.path);
+    const inside =
+      resolved === projectPath ||
+      resolved.startsWith(projectPath + path.sep);
+    if (inside && projectPath.length > bestLen) {
+      best = project;
+      bestLen = projectPath.length;
+    }
+  }
+  return best;
+}
+
 export async function addProject(
   name: string,
   projectPath: string,

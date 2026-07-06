@@ -87,24 +87,28 @@ const USAGE = `Usage:
   controller skills import-discover
   controller skills import [--provider <id>] [--source <path>] [--scope <scope>] [--overwrite]... [--all]
 
-  controller worktrees list <project>
-  controller worktrees create <project> --name <name> [--branch <branch>] [--base <baseBranch>]
+  controller worktrees list [<project>]
+  controller worktrees create [<project>] --name <name> [--branch <branch>] [--base <baseBranch>]
   controller worktrees delete <project> <worktreeId>
 
   <project> accepts either the project's id (UUID) or its human name. The
-  CLI resolves names to ids against the orchestrator's project list.
+  CLI resolves names to ids against the orchestrator's project list. If
+  <project> is omitted (or doesn't match by id/name), the CLI falls back
+  to the project that owns the current working directory, so an agent
+  running inside a worktree doesn't have to memorize a project name.
 
-  controller sessions start <project> --worktree <worktreeId> --message <text> \\
+  controller sessions start [<project>] --worktree <worktreeId> --message <text> \\
       [--provider codex|claude|anita] [--model <model>] [--mode default|plan] [--skill <name>]
 
   \`sessions start\` kicks off a new agent run on the given worktree and prints
   a URL the user can open in Controller to follow along. The CLI does not
   stream transcript events; the run is persisted to disk and the UI subscribes
-  to the existing event-list endpoint for live updates.
+  to the existing event-list endpoint for live updates. <project> is optional
+  and falls back to the project that owns cwd (see the worktrees section).
 
-  controller schedules list <project> [--enabled-only]
+  controller schedules list [<project>] [--enabled-only]
   controller schedules show <project> <scheduleId>
-  controller schedules add <project> --worktree <id> --prompt <text> \\
+  controller schedules add [<project>] --worktree <id> --prompt <text> \\
       [--at <iso>] [--cron <expr>] [--timezone <tz>] \\
       [--every minute|hour|day|weekday] [--on-day <0-6>] [--at-hour <0-23>] [--at-minute <0-59>] \\
       [--provider codex|claude|anita] [--model <id>] [--mode default|plan] \\
@@ -118,7 +122,8 @@ const USAGE = `Usage:
   for a one-shot run, or \`--cron <expr>\` / \`--every\` for a recurring one.
   \`--every day|weekday\` fires at \`--at-hour\`:\`--at-minute\` (default 09:00) in
   \`--timezone\` (default the server's). The run fires on the next scheduler
-  tick after the target time.`;
+  tick after the target time. <project> is optional on \`list\`/\`add\` and
+  falls back to cwd (see the worktrees section).`;
 
 // Exposed for tests: only auto-run `main()` when this file is the script the
 // process was launched as, so unit tests can import the helpers without
@@ -244,8 +249,52 @@ async function deleteJson(serverUrl, route) {
 // id (UUID) or the project's human name. We fetch the project list once and
 // match in JS so the server doesn't need a name-lookup endpoint just to make
 // the CLI more human-friendly.
+//
+// When `<project>` is omitted (or doesn't match by id/name), we also try
+// resolving by the agent's `cwd` against `GET /api/projects?cwd=...`. The
+// orchestrator already thinks of a session as "pinned to a worktree owned
+// by a project rooted at `project.path`", so mapping a shell cwd back to
+// its project is the obvious next step — agents no longer have to memorize
+// a project name or id to run `worktrees create` from a worktree shell.
 export async function resolveProjectId(serverUrl, ref) {
-  if (!ref) fail("a <project> (id or name) is required");
+  // Try the supplied ref by id / name first. If it matches, use that
+  // match — explicit user input wins over cwd-based heuristics.
+  if (ref) {
+    const projects = await fetchProjectList(serverUrl);
+    const match = projects.find((p) => p && p.id === ref);
+    if (match) return match.id;
+    const byName = projects.find((p) => p && p.name === ref);
+    if (byName) return byName.id;
+    // No id/name match — fall through to the cwd-based lookup. The
+    // agent is almost always in a worktree of the project they want;
+    // silently using the cwd-resolved project is the whole point of
+    // this fallback (a typo'd name shouldn't make `worktrees create`
+    // fail when the orchestrator already knows what project the
+    // session is in).
+  }
+  const cwd = process.cwd();
+  const fromCwd = await resolveProjectByCwd(serverUrl, cwd);
+  if (fromCwd) return fromCwd.id;
+  // Final miss: surface a useful error. If the user supplied a ref
+  // and we couldn't match it, name the cwd in the error so they
+  // understand both halves of the failure.
+  if (ref) {
+    fail(
+      `No project matches "${ref}" (and cwd ${cwd} is not part of any onboarded project). ` +
+        `Pass the project's id (UUID) or its human name, or onboard the project first.`
+    );
+  }
+  fail(
+    `Could not determine the current project from cwd ${cwd} ` +
+      `(no project owns this path). Pass the project id or name explicitly, ` +
+      `or run from inside a project that's been onboarded via Controller.`
+  );
+}
+
+// Fetch the project list once and reuse it for id/name matching. Kept
+// separate from `resolveProjectId` so the test suite can stub just the
+// project list without exercising the cwd fallback path.
+export async function fetchProjectList(serverUrl) {
   const url = `${serverUrl.replace(/\/$/, "")}/api/projects`;
   let response;
   try {
@@ -265,27 +314,57 @@ export async function resolveProjectId(serverUrl, ref) {
   if (!Array.isArray(projects)) {
     fail("Unexpected project list response shape");
   }
-  const match = projects.find((p) => p && p.id === ref);
-  if (match) return match.id;
-  const byName = projects.find((p) => p && p.name === ref);
-  if (byName) return byName.id;
-  fail(`No project matches "${ref}"`);
+  return projects;
+}
+
+// Hit the cwd-based project lookup. Returns `null` on miss or any error —
+// callers fall through to the user-facing error path with full context.
+// The shape is `{ project: Project | null }` (see
+// `server/routes/projects.ts`), not the bare-array shape.
+export async function resolveProjectByCwd(serverUrl, cwd) {
+  if (!cwd) return null;
+  const url = `${serverUrl.replace(/\/$/, "")}/api/projects?cwd=${encodeURIComponent(cwd)}`;
+  let response;
+  try {
+    response = await fetch(url);
+  } catch {
+    return null;
+  }
+  if (response.status >= 400) return null;
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== "object") return null;
+  return body.project ?? null;
 }
 
 // --- worktrees surface (issue #190) ---
 
 export function parseWorktrees(argv) {
-  const [command, project, ...rest] = argv;
+  const [command, ...rest] = argv;
   if (!command) fail(`Unknown worktrees command\n${USAGE}`);
-  if (!project) fail(`worktrees ${command} requires a <project>`);
+  // `<project>` is the optional first positional after the subcommand. If
+  // the next token starts with `--` (or is missing), no project was given
+  // and the CLI falls back to resolving by cwd via `resolveProjectId`.
+  // This keeps `controller worktrees create --name foo` working — the
+  // `--name` flag is the first argument, not the project.
+  let project = "";
+  let args = rest;
+  if (rest[0] !== undefined && !rest[0].startsWith("--")) {
+    project = rest[0];
+    args = rest.slice(1);
+  }
   switch (command) {
     case "list":
       return { project, action: "list" };
     case "create": {
-      const name = flagValue(rest, "--name");
+      const name = flagValue(args, "--name");
       if (!name) fail("worktrees create requires --name <name>");
-      const branch = flagValue(rest, "--branch");
-      const base = flagValue(rest, "--base");
+      const branch = flagValue(args, "--branch");
+      const base = flagValue(args, "--base");
       return {
         project,
         action: "create",
@@ -297,8 +376,8 @@ export function parseWorktrees(argv) {
       };
     }
     case "delete": {
-      if (!rest[0]) fail("worktrees delete requires a <worktreeId>");
-      return { project, action: "delete", worktreeId: rest[0] };
+      if (!args[0]) fail("worktrees delete requires a <worktreeId>");
+      return { project, action: "delete", worktreeId: args[0] };
     }
     default:
       fail(`Unknown worktrees command: ${command}\n${USAGE}`);
@@ -429,26 +508,34 @@ async function getJson(serverUrl, route) {
 // --- sessions surface (issue #190) ---
 
 export function parseSessions(argv) {
-  const [command, project, ...rest] = argv;
+  const [command, ...rest] = argv;
   if (!command) fail(`Unknown sessions command\n${USAGE}`);
-  if (!project) fail(`sessions ${command} requires a <project>`);
+  // `<project>` is the optional first positional. If the next token
+  // starts with `--`, the user didn't supply a project; the run path
+  // resolves it from cwd via `resolveProjectId`.
+  let project = "";
+  let args = rest;
+  if (rest[0] !== undefined && !rest[0].startsWith("--")) {
+    project = rest[0];
+    args = rest.slice(1);
+  }
   switch (command) {
     case "start": {
-      const worktreeId = flagValue(rest, "--worktree");
+      const worktreeId = flagValue(args, "--worktree");
       if (!worktreeId) fail("sessions start requires --worktree <worktreeId>");
-      const provider = flagValue(rest, "--provider");
-      const model = flagValue(rest, "--model");
-      const mode = flagValue(rest, "--mode");
-      const skill = flagValue(rest, "--skill");
+      const provider = flagValue(args, "--provider");
+      const model = flagValue(args, "--model");
+      const mode = flagValue(args, "--mode");
+      const skill = flagValue(args, "--skill");
       // `--message` is the last flag: everything after it is the message
       // text, verbatim. This matches the shell idiom of quoting the
       // prompt at the end of the command and avoids forcing the agent
       // to escape whitespace inside the body.
-      const messageIdx = rest.indexOf("--message");
+      const messageIdx = args.indexOf("--message");
       if (messageIdx < 0) {
         fail("sessions start requires --message <text>");
       }
-      const trailing = rest.slice(messageIdx + 1);
+      const trailing = args.slice(messageIdx + 1);
       // Reject any known option flag that appears after `--message`'s
       // value — otherwise the flag and its argument would be appended to
       // the prompt and silently corrupt the agent's first turn.
@@ -547,37 +634,45 @@ function clampInt(value, min, max) {
 }
 
 export function parseSchedules(argv) {
-  const [command, project, ...rest] = argv;
+  const [command, ...rest] = argv;
   if (!command) fail(`Unknown schedules command\n${USAGE}`);
-  if (!project) fail(`schedules ${command} requires a <project>`);
+  // `<project>` is the optional first positional. If the next token
+  // starts with `--` (or is missing), the user didn't supply a project
+  // and the run path falls back to cwd.
+  let project = "";
+  let args = rest;
+  if (rest[0] !== undefined && !rest[0].startsWith("--")) {
+    project = rest[0];
+    args = rest.slice(1);
+  }
   switch (command) {
     case "list":
-      return { project, action: "list", includeDisabled: !rest.includes("--enabled-only") };
+      return { project, action: "list", includeDisabled: !args.includes("--enabled-only") };
     case "show":
-      if (!rest[0]) fail("schedules show requires a <scheduleId>");
-      return { project, action: "show", scheduleId: rest[0] };
+      if (!args[0]) fail("schedules show requires a <scheduleId>");
+      return { project, action: "show", scheduleId: args[0] };
     case "runs":
-      if (!rest[0]) fail("schedules runs requires a <scheduleId>");
-      return { project, action: "runs", scheduleId: rest[0] };
+      if (!args[0]) fail("schedules runs requires a <scheduleId>");
+      return { project, action: "runs", scheduleId: args[0] };
     case "enable":
-      if (!rest[0]) fail("schedules enable requires a <scheduleId>");
-      return { project, action: "enable", scheduleId: rest[0] };
+      if (!args[0]) fail("schedules enable requires a <scheduleId>");
+      return { project, action: "enable", scheduleId: args[0] };
     case "disable":
-      if (!rest[0]) fail("schedules disable requires a <scheduleId>");
-      return { project, action: "disable", scheduleId: rest[0] };
+      if (!args[0]) fail("schedules disable requires a <scheduleId>");
+      return { project, action: "disable", scheduleId: args[0] };
     case "remove":
-      if (!rest[0]) fail("schedules remove requires a <scheduleId>");
-      return { project, action: "remove", scheduleId: rest[0] };
+      if (!args[0]) fail("schedules remove requires a <scheduleId>");
+      return { project, action: "remove", scheduleId: args[0] };
     case "add": {
-      const worktreeId = flagValue(rest, "--worktree");
+      const worktreeId = flagValue(args, "--worktree");
       if (!worktreeId) fail("schedules add requires --worktree <worktreeId>");
-      const prompt = flagValue(rest, "--prompt");
+      const prompt = flagValue(args, "--prompt");
       if (!prompt || !prompt.trim()) fail("schedules add requires --prompt <text>");
 
-      const at = flagValue(rest, "--at");
-      const explicitCron = flagValue(rest, "--cron");
-      const every = flagValue(rest, "--every");
-      const onDay = flagValue(rest, "--on-day");
+      const at = flagValue(args, "--at");
+      const explicitCron = flagValue(args, "--cron");
+      const every = flagValue(args, "--every");
+      const onDay = flagValue(args, "--on-day");
       // An explicit --cron wins; otherwise derive one from the structured
       // preset flags. Falling through to neither means a one-shot --at.
       let cron = explicitCron ?? null;
@@ -585,8 +680,8 @@ export function parseSchedules(argv) {
         cron = presetToCron({
           every,
           onDay: onDay != null ? Number(onDay) : undefined,
-          atHour: flagValue(rest, "--at-hour"),
-          atMinute: flagValue(rest, "--at-minute"),
+          atHour: flagValue(args, "--at-hour"),
+          atMinute: flagValue(args, "--at-minute"),
         });
         if (!cron) fail("schedules add: --every must be minute|hour|day|weekday, or pass --on-day <0-6>");
       }
@@ -594,12 +689,12 @@ export function parseSchedules(argv) {
         fail("schedules add requires --at <iso> (one-shot) or --cron/--every (recurring)");
       }
 
-      const timezone = flagValue(rest, "--timezone");
-      const provider = flagValue(rest, "--provider");
-      const model = flagValue(rest, "--model");
-      const mode = flagValue(rest, "--mode");
-      const enabled = flagValue(rest, "--enabled");
-      const source = flagValue(rest, "--source");
+      const timezone = flagValue(args, "--timezone");
+      const provider = flagValue(args, "--provider");
+      const model = flagValue(args, "--model");
+      const mode = flagValue(args, "--mode");
+      const enabled = flagValue(args, "--enabled");
+      const source = flagValue(args, "--source");
 
       return {
         project,

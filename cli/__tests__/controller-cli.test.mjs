@@ -253,6 +253,330 @@ test("parseWorktrees maps list/create/delete to the right actions", async () => 
   );
 });
 
+// ---------------------------------------------------------------------------
+// project resolution: cwd-based fallback (sessions struggled to find the
+// project when they didn't know its name — this lets the CLI resolve the
+// project that owns the agent's shell `cwd` instead of requiring an id/name).
+// ---------------------------------------------------------------------------
+
+test("parseWorktrees accepts a missing <project> (resolved later from cwd)", async () => {
+  const cli = await loadCli();
+  assert.deepEqual(
+    cli.parseWorktrees(["list"]),
+    { project: "", action: "list" }
+  );
+  // When the user skips the <project> positional, the next token (a
+  // flag) is the parser's signal that the project was omitted. The
+  // run path then resolves the project from cwd via `resolveProjectId`.
+  assert.deepEqual(
+    cli.parseWorktrees(["create", "--name", "issue-1"]),
+    { project: "", action: "create", body: { name: "issue-1" } }
+  );
+  // Supplying a project explicitly still works exactly as before.
+  assert.deepEqual(
+    cli.parseWorktrees(["create", "demo", "--name", "issue-1"]),
+    { project: "demo", action: "create", body: { name: "issue-1" } }
+  );
+});
+
+test("parseSessions accepts a missing <project> (resolved later from cwd)", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseSessions([
+    "start",
+    "--worktree",
+    "wt-123",
+    "--message",
+    "Implement the project-mgmt block",
+  ]);
+  assert.equal(parsed.project, "");
+  assert.equal(parsed.action, "start");
+  assert.equal(parsed.body.worktreeId, "wt-123");
+  assert.equal(parsed.body.message, "Implement the project-mgmt block");
+});
+
+test("parseSchedules accepts a missing <project> on list and add", async () => {
+  const cli = await loadCli();
+  assert.equal(cli.parseSchedules(["list"]).project, "");
+  assert.equal(cli.parseSchedules(["list", "--enabled-only"]).project, "");
+  const add = cli.parseSchedules([
+    "add",
+    "--worktree",
+    "wt-1",
+    "--prompt",
+    "morning health check",
+    "--at",
+    "2026-06-26T08:00:00.000Z",
+  ]);
+  assert.equal(add.project, "");
+  assert.equal(add.action, "add");
+});
+
+test("resolveProjectId resolves <project> by id", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "http://controller.test/api/projects");
+    return { status: 200, json: async () => [{ id: "proj-uuid-1", name: "demo" }] };
+  };
+  try {
+    const id = await cli.resolveProjectId("http://controller.test", "proj-uuid-1");
+    assert.equal(id, "proj-uuid-1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resolveProjectId resolves <project> by name", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "http://controller.test/api/projects");
+    return {
+      status: 200,
+      json: async () => [
+        { id: "proj-uuid-1", name: "controller" },
+        { id: "proj-uuid-2", name: "demo" },
+      ],
+    };
+  };
+  try {
+    const id = await cli.resolveProjectId("http://controller.test", "demo");
+    assert.equal(id, "proj-uuid-2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resolveProjectByCwd hits /api/projects?cwd=<cwd> and unwraps the {project} envelope", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url) => {
+    captured = String(url);
+    return { status: 200, json: async () => ({ project: { id: "proj-uuid-1", name: "demo" } }) };
+  };
+  try {
+    const project = await cli.resolveProjectByCwd("http://controller.test", "/tmp/worktrees/proj-uuid-1/main");
+    assert.equal(project?.id, "proj-uuid-1");
+    assert.equal(project?.name, "demo");
+    // The query string is URL-encoded so spaces / special chars in the
+    // path don't break the roundtrip.
+    assert.match(captured, /\/api\/projects\?cwd=/);
+    assert.ok(captured.includes("proj-uuid-1"), `expected cwd in url, got ${captured}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resolveProjectByCwd returns null when the server has no project for cwd", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ status: 200, json: async () => ({ project: null }) });
+  try {
+    const project = await cli.resolveProjectByCwd("http://controller.test", "/tmp/orphan");
+    assert.equal(project, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resolveProjectByCwd returns null on a network error (caller falls through to a clear error)", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("ECONNREFUSED"); };
+  try {
+    const project = await cli.resolveProjectByCwd("http://controller.test", "/tmp/whatever");
+    assert.equal(project, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resolveProjectId falls back to cwd when no <project> is supplied", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalCwd = process.cwd();
+  // chdir into a fake worktree dir so the resolved cwd is deterministic.
+  const fs = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ctrl-resolve-"));
+  process.chdir(dir);
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).endsWith("/api/projects")) {
+      // Bare list (no `?cwd=`) shouldn't be hit when no ref is supplied.
+      return { status: 200, json: async () => [{ id: "should-not-use", name: "should-not-use" }] };
+    }
+    if (String(url).includes("/api/projects?cwd=")) {
+      return { status: 200, json: async () => ({ project: { id: "proj-from-cwd", name: "FromCwd" } }) };
+    }
+    throw new Error(`unexpected fetch in test: ${url}`);
+  };
+  try {
+    const id = await cli.resolveProjectId("http://controller.test", "");
+    assert.equal(id, "proj-from-cwd");
+    // Only the cwd-based endpoint was hit — the bare project list is
+    // skipped when there's no ref to match against.
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].includes("/api/projects?cwd="), `expected cwd endpoint, got ${calls[0]}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.chdir(originalCwd);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveProjectId falls back to cwd when the supplied <project> doesn't match by id or name", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalCwd = process.cwd();
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).endsWith("/api/projects")) {
+      // The supplied ref "wrong-name" doesn't match by id or name; the
+      // CLI should fall through to the cwd-based lookup.
+      return {
+        status: 200,
+        json: async () => [
+          { id: "proj-uuid-1", name: "controller" },
+          { id: "proj-uuid-2", name: "demo" },
+        ],
+      };
+    }
+    if (String(url).includes("/api/projects?cwd=")) {
+      return { status: 200, json: async () => ({ project: { id: "proj-uuid-2", name: "demo" } }) };
+    }
+    throw new Error(`unexpected fetch in test: ${url}`);
+  };
+  try {
+    const id = await cli.resolveProjectId("http://controller.test", "wrong-name");
+    // The cwd-resolved project wins, even though the ref didn't match.
+    // This is the whole point of the fallback — the orchestrator knows
+    // what project the session is in, so an agent's typo'd name
+    // shouldn't make `worktrees create` fail.
+    assert.equal(id, "proj-uuid-2");
+    assert.equal(calls.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.chdir(originalCwd);
+  }
+});
+
+test("resolveProjectId errors with a clear message when no ref and cwd is not part of any project", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  globalThis.fetch = async () => ({ status: 200, json: async () => ({ project: null }) });
+  try {
+    await assert.rejects(
+      async () => await cli.resolveProjectId("http://controller.test", ""),
+      /__exit__/
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /Could not determine the current project from cwd/);
+});
+
+test("resolveProjectId errors with the cwd context when a ref was supplied but didn't match", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/api/projects")) {
+      return {
+        status: 200,
+        json: async () => [{ id: "proj-uuid-1", name: "controller" }],
+      };
+    }
+    return { status: 200, json: async () => ({ project: null }) };
+  };
+  try {
+    await assert.rejects(
+      async () => await cli.resolveProjectId("http://controller.test", "wrong-name"),
+      /__exit__/
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /No project matches "wrong-name"/);
+  // The error should mention the cwd so the agent understands both
+  // halves of the failure (bad ref AND not part of any project).
+  assert.ok(
+    stderrText.includes(`cwd ${process.cwd()}`),
+    `expected stderr to mention cwd ${process.cwd()}, got: ${stderrText}`
+  );
+});
+
+test("runWorktrees list with no <project> resolves the project from cwd", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const calls = [];
+  const stdoutChunks = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes("/api/projects?cwd=")) {
+      return { status: 200, json: async () => ({ project: { id: "proj-from-cwd", name: "FromCwd" } }) };
+    }
+    if (String(url).endsWith("/api/projects/proj-from-cwd/worktrees")) {
+      return {
+        status: 200,
+        json: async () => [
+          { id: "wt-1", name: "main", branch: "main", isMain: true, path: "/tmp/wt/main" },
+        ],
+      };
+    }
+    throw new Error(`unexpected fetch in test: ${url}`);
+  };
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runWorktrees(["list"], "http://controller.test");
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  // The cwd-based project lookup is the only project lookup, and the
+  // worktree list hits the project id from that lookup.
+  assert.ok(calls.some((c) => c.includes("/api/projects?cwd=")), "expected cwd lookup");
+  assert.ok(calls.some((c) => c.endsWith("/api/projects/proj-from-cwd/worktrees")), "expected worktree list");
+  assert.match(stdoutChunks.join(""), /wt-1  main  main  \[main\]/);
+});
+
 test("parseSessions maps start to a session-start payload, including the verbatim --message text", async () => {
   const cli = await loadCli();
   const parsed = cli.parseSessions([

@@ -1,12 +1,31 @@
 import { Router } from "express";
-import { getProjects, addProject, updateProject, deleteProject } from "../lib/projects.js";
+import {
+  getProjects,
+  getProject,
+  findProjectByPath,
+  addProject,
+  updateProject,
+  deleteProject,
+} from "../lib/projects.js";
 import { ensureMainWorktree } from "../lib/worktrees.js";
 import { emitProjectEvent } from "../lib/events.js";
 
 export const projectsRouter = Router();
 
-projectsRouter.get("/", async (_req, res) => {
+projectsRouter.get("/", async (req, res) => {
   try {
+    // `?cwd=<absolutePath>` returns the project whose `path` is an
+    // ancestor of `cwd` (longest-prefix match), or `{ project: null }`
+    // when no onboarded project owns it. The bare-array shape is
+    // preserved when the query param is absent, so existing callers —
+    // including the CLI's name-lookup in `resolveProjectId` — keep
+    // working unchanged.
+    const cwd = typeof req.query.cwd === "string" ? req.query.cwd.trim() : "";
+    if (cwd) {
+      const project = await findProjectByPath(cwd);
+      res.json({ project });
+      return;
+    }
     const projects = await getProjects();
     res.json(projects);
   } catch (err) {

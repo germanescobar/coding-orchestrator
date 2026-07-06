@@ -521,26 +521,36 @@ conversation on it.
 
 ## Commands
 
-- \`${cliPath} worktrees list <project>\` — list the worktrees on a project.
-- \`${cliPath} worktrees create <project> --name <name> [--branch <branch>] [--base <baseBranch>]\` — create a new worktree. Streams the setup-script output as it runs; the new worktree's id is printed on success.
+- \`${cliPath} worktrees list [<project>]\` — list the worktrees on a project. \`<project>\` is optional: if omitted, the CLI resolves the project from the current working directory.
+- \`${cliPath} worktrees create [<project>] --name <name> [--branch <branch>] [--base <baseBranch>]\` — create a new worktree. Streams the setup-script output as it runs; the new worktree's id is printed on success. \`<project>\` is optional and falls back to the project that owns cwd.
 - \`${cliPath} worktrees delete <project> <worktreeId>\` — delete a worktree. The worktree must not have an active session.
-- \`${cliPath} sessions start <project> --worktree <worktreeId> --message <text> [--provider codex|claude|anita] [--model <model>] [--mode default|plan] [--skill <name>]\` — kick off a new agent turn on a worktree and print the session URL.
+- \`${cliPath} sessions start [<project>] --worktree <worktreeId> --message <text> [--provider codex|claude|anita] [--model <model>] [--mode default|plan] [--skill <name>]\` — kick off a new agent turn on a worktree and print the session URL. \`<project>\` is optional and falls back to the project that owns cwd.
 
 ## Picking a project
 
-\`<project>\` accepts either the project's UUID or its human name. To find the
-human name that matches the current working directory, read the orchestrator's
-project list. The file lives next to the CLI at \`<controller-install>/projects.json\`,
-so the path is derived from the CLI itself and follows the install if it
-ever moves:
+\`<project>\` accepts the project's UUID or its human name. In addition:
 
-\`\`\`sh
-PROJECTS_JSON="\$(dirname "\$(dirname '${cliPath}')")/projects.json"
-jq -r --arg pwd "\$(pwd)" '.[] | select(.path == \$pwd) | .name' "\$PROJECTS_JSON"
-\`\`\`
+- **You can omit \`<project>\` entirely** when running from inside a
+  project (the project root, a worktree, or any subdirectory). The CLI
+  resolves the project from \`cwd\` against the orchestrator's project
+  list and picks the project whose \`path\` is an ancestor of \`pwd\`.
+  Prefer this form when you're already inside a worktree.
+- **If you pass \`<project>\` and it doesn't match by id or name**, the
+  CLI also tries the cwd-based resolution and uses that match. The
+  orchestrator already knows what project your session is in — there's
+  no need to memorize a name.
+- To find the human name for the current project, read the
+  orchestrator's project list. The file lives next to the CLI at
+  \`<controller-install>/projects.json\`, so the path is derived from
+  the CLI itself and follows the install if it ever moves:
 
-Match the entry whose \`path\` field equals the repo root (\`pwd\`), then pass
-that name directly to the CLI — no UUID lookup needed.
+  \`\`\`sh
+  PROJECTS_JSON="\$(dirname "\$(dirname '${cliPath}')")/projects.json"
+  jq -r --arg pwd "\$(pwd)" '.[] | select(.path == \$pwd) | .name' "\$PROJECTS_JSON"
+  \`\`\`
+
+  Match the entry whose \`path\` field equals the repo root (\`pwd\`), then pass
+  that name directly to the CLI — no UUID lookup needed.
 
 ## Workflow
 
@@ -637,9 +647,9 @@ command below is run as \`${cliPath} schedules <command>\`.
 
 ## Commands
 
-- \`${cliPath} schedules list <project> [--enabled-only]\` — list a project's schedules (includes disabled by default).
+- \`${cliPath} schedules list [<project>] [--enabled-only]\` — list a project's schedules (includes disabled by default). \`<project>\` is optional and falls back to the project that owns cwd.
 - \`${cliPath} schedules show <project> <scheduleId>\` — print one schedule's full JSON (next run, last run, last error).
-- \`${cliPath} schedules add <project> --worktree <worktreeId> --prompt <text> [--at <iso>] [--cron <expr>] [--every minute|hour|day|weekday] [--on-day <0-6>] [--at-hour <0-23>] [--at-minute <0-59>] [--timezone <tz>] [--provider codex|claude|anita] [--model <model>] [--mode default|plan]\` — register a schedule.
+- \`${cliPath} schedules add [<project>] --worktree <worktreeId> --prompt <text> [--at <iso>] [--cron <expr>] [--every minute|hour|day|weekday] [--on-day <0-6>] [--at-hour <0-23>] [--at-minute <0-59>] [--timezone <tz>] [--provider codex|claude|anita] [--model <model>] [--mode default|plan]\` — register a schedule. \`<project>\` is optional and falls back to cwd.
 - \`${cliPath} schedules enable <project> <scheduleId>\` — re-enable a paused schedule.
 - \`${cliPath} schedules disable <project> <scheduleId>\` — pause a schedule without deleting it.
 - \`${cliPath} schedules remove <project> <scheduleId>\` — delete a schedule.
