@@ -424,6 +424,15 @@ worktreesRouter.put("/:projectId/terminal-tabs", async (req, res) => {
   const body = req.body as { tabs?: unknown; removeTerminalId?: unknown };
   const removeTerminalId =
     typeof body.removeTerminalId === "string" ? body.removeTerminalId : undefined;
+  // Issue #296: the user closing a tab is authoritative. The WebSocket-based
+  // close path can lose the kill (the WS may still be CONNECTING, or the
+  // unmount calls plain `ws.close()` which the server treats as a disconnect),
+  // and the next 2s `getTerminalTabs` poll would re-merge the still-alive tmux
+  // session as a fresh tab. Kill the underlying PTY here, before
+  // `setTerminalTabs` reads `listTmuxTerminalIds`, so the tab cannot come back.
+  if (removeTerminalId) {
+    ptyManager.kill(`${project.id}:${worktree.id}:${removeTerminalId}`);
+  }
   const tabs = await setTerminalTabs(project.id, worktree.id, body.tabs, {
     removeTerminalId,
   });
