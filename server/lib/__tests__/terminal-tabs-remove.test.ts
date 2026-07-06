@@ -248,3 +248,89 @@ test("PUT /terminal-tabs without removeTerminalId leaves existing tmux sessions 
     }
   });
 });
+
+test("PUT /terminal-tabs with removeTerminalId also kills a legacy coding-orchestrator- tmux session", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+
+  await withRoutes(async ({ baseUrl, projectId, worktreeId, worktreePath }) => {
+    const { ptyManager, tmuxSessionNames } = await import("../../lib/pty-manager.js");
+    const terminalId = "legacytab";
+    const sessionId = `${projectId}:${worktreeId}:${terminalId}`;
+
+    // Synthesize a legacy-prefix tmux session for this id. A pre-rename
+    // build created it under the `coding-orchestrator-` prefix; the
+    // periodic `getTerminalTabs` poll still discovers it because
+    // `listTmuxTerminalIds` matches both prefixes. The close path must
+    // kill it too, otherwise the tab resurfaces on the next poll
+    // (review feedback on #296).
+    const [, legacyName] = tmuxSessionNames(sessionId);
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        "tmux",
+        ["new-session", "-d", "-s", legacyName, "-c", worktreePath, "sleep 60"],
+        { env: { ...process.env } }
+      );
+      let stderr = "";
+      child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+      child.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`tmux new-session failed (${code}): ${stderr}`));
+      });
+      child.on("error", reject);
+    });
+
+    try {
+      // Sanity: the legacy session exists and the current-prefix session
+      // does not (we never called `getOrCreate` for this id).
+      const before = listTmuxSessions();
+      assert.ok(
+        before.includes(legacyName),
+        `expected legacy tmux session ${legacyName} to exist, saw: ${before.join(", ")}`
+      );
+      assert.equal(ptyManager.has(sessionId), false);
+
+      // Seed a tab entry (as if the legacy session had been re-discovered
+      // and surfaced in the UI) and then close it.
+      await putTabs(baseUrl, projectId, worktreeId, {
+        tabs: [{ id: "default", label: "Terminal 1" }, { id: terminalId, label: "Terminal 2" }],
+      });
+
+      const res = await putTabs(baseUrl, projectId, worktreeId, {
+        tabs: [{ id: "default", label: "Terminal 1" }],
+        removeTerminalId: terminalId,
+      });
+      assert.equal(res.status, 200);
+
+      // The legacy session must be gone — otherwise the next poll would
+      // re-merge it.
+      const after = listTmuxSessions();
+      assert.ok(
+        !after.includes(legacyName),
+        `expected legacy tmux session ${legacyName} to be killed by close, saw: ${after.join(", ")}`
+      );
+
+      // And the next poll does not re-add the closed tab.
+      const getRes = await fetch(
+        `${baseUrl}/${projectId}/terminal-tabs?worktreeId=${worktreeId}`
+      );
+      assert.equal(getRes.status, 200);
+      const getBody = (await getRes.json()) as { tabs: Array<{ id: string }> };
+      assert.deepEqual(
+        getBody.tabs.map((t) => t.id),
+        ["default"],
+        "the next poll must not re-merge a legacy tmux session the close killed"
+      );
+    } finally {
+      // Best-effort cleanup in case the assertion failed and the session
+      // is still around.
+      try {
+        execFileSync("tmux", ["kill-session", "-t", `=${legacyName}`], { stdio: "ignore" });
+      } catch {
+        // Already gone.
+      }
+    }
+  });
+});

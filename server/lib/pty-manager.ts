@@ -50,6 +50,21 @@ function tmuxSessionName(sessionId: string): string {
   return `${TMUX_SESSION_PREFIX}${safeId}-${hash}`;
 }
 
+/* All tmux session names a logical `sessionId` could map to — the current
+ * `controller-...` name plus the `coding-orchestrator-...` name used by builds
+ * before the rename. Single-id kills (issue #296) must cover both, otherwise
+ * a legacy session survives the close and the next `getTerminalTabs` poll
+ * re-discovers it via `listTmuxTerminalIds` and re-adds the tab. Exported for
+ * tests that need to reference the legacy name shape directly. */
+export function tmuxSessionNames(sessionId: string): string[] {
+  const safeId = sanitizeTmuxName(sessionId).slice(0, 160);
+  const hash = crypto.createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+  return [
+    `${TMUX_SESSION_PREFIX}${safeId}-${hash}`,
+    `${LEGACY_TMUX_SESSION_PREFIX}${safeId}-${hash}`,
+  ];
+}
+
 function tmuxFirstPaneTarget(sessionName: string): string {
   return `${sessionName}:0.0`;
 }
@@ -340,14 +355,19 @@ class PtyManager {
     return this.sessions.has(sessionId);
   }
 
-  /** Kill and remove a PTY. */
+  /** Kill and remove a PTY. Also kills the underlying tmux session for both
+   * the current and the pre-rename legacy session name (issue #296) — the
+   * periodic `getTerminalTabs` poll discovers both, so a close that only
+   * killed the current name would let a legacy session resurface. */
   kill(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (session) {
       session.pty.kill();
       this.sessions.delete(sessionId);
     }
-    killTmuxSession(tmuxSessionName(sessionId));
+    for (const name of tmuxSessionNames(sessionId)) {
+      killTmuxSession(name);
+    }
   }
 
   /** Kill and remove every PTY whose session id starts with a prefix. */
