@@ -41,6 +41,37 @@ export async function getProject(id: string): Promise<Project | null> {
   return record ? hydrate(record) : null;
 }
 
+/**
+ * Find the project that owns the given filesystem path, matching the
+ * longest path prefix across every onboarded project. Mirrors
+ * `findWorktreeByPath` in `worktrees.ts`: the orchestrator already thinks
+ * of a session as "pinned to a worktree, owned by a project, with the
+ * project's main worktree rooted at `project.path`" — given a shell
+ * `cwd`, this is the function that maps it back to the project.
+ *
+ * Returns `null` when no project's `path` is an ancestor of `cwd`. The
+ * `cwd` is resolved before comparison so symlinks and `.`/`..` segments
+ * don't bypass the prefix check.
+ */
+export async function findProjectByPath(targetPath: string): Promise<Project | null> {
+  const resolved = path.resolve(targetPath);
+  const projects = await getProjects();
+  let best: Project | null = null;
+  let bestLen = -1;
+  for (const project of projects) {
+    if (!project.path) continue;
+    const projectPath = path.resolve(project.path);
+    const inside =
+      resolved === projectPath ||
+      resolved.startsWith(projectPath + path.sep);
+    if (inside && projectPath.length > bestLen) {
+      best = project;
+      bestLen = projectPath.length;
+    }
+  }
+  return best;
+}
+
 export async function addProject(
   name: string,
   projectPath: string,

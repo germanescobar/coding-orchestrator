@@ -225,10 +225,10 @@ test("browser, integrations, and skills bodies advertise concrete commands", asy
       unifiedSkillFile(orchestrator, "controller-schedules"),
       "utf-8"
     );
-    assert.match(schedules, cliCommandRegex(cliPath, "schedules list <project>"));
+    assert.match(schedules, cliCommandRegex(cliPath, "schedules list [<project>]"));
     assert.match(
       schedules,
-      cliCommandRegex(cliPath, "schedules add <project> --worktree <worktreeId>")
+      cliCommandRegex(cliPath, "schedules add [<project>] --worktree <worktreeId>")
     );
     assert.match(schedules, cliCommandRegex(cliPath, "schedules runs <project> <scheduleId>"));
 
@@ -245,14 +245,16 @@ test("browser, integrations, and skills bodies advertise concrete commands", asy
     // the agent preamble (issue #190). It must surface the full
     // `worktrees` + `sessions` CLI surface so the agent can copy/paste
     // every command from `controller skills describe controller-worktrees`.
+    // The `\[<project>\]` form is the optional-positional shape added so
+    // sessions can omit `<project>` and let the CLI fall back to cwd.
     const worktrees = readFileSync(
       unifiedSkillFile(orchestrator, "controller-worktrees"),
       "utf-8"
     );
-    assert.match(worktrees, cliCommandRegex(cliPath, "worktrees list <project>"));
+    assert.match(worktrees, cliCommandRegex(cliPath, "worktrees list [<project>]"));
     assert.match(
       worktrees,
-      cliCommandRegex(cliPath, "worktrees create <project> --name <name>")
+      cliCommandRegex(cliPath, "worktrees create [<project>] --name <name>")
     );
     assert.match(
       worktrees,
@@ -260,7 +262,7 @@ test("browser, integrations, and skills bodies advertise concrete commands", asy
     );
     assert.match(
       worktrees,
-      cliCommandRegex(cliPath, "sessions start <project> --worktree <worktreeId>")
+      cliCommandRegex(cliPath, "sessions start [<project>] --worktree <worktreeId>")
     );
     // Notes that `<project>` accepts an id or a human name, and how to discover it.
     // The path is derived from the CLI itself so it follows the install.

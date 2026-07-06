@@ -76,6 +76,10 @@ and run it; no install required.
 
 ## [Unreleased]
 
+### Added
+
+- **CLI: cwd-based project resolution for `worktrees` / `sessions` / `schedules`**. The `<project>` positional is now optional on `worktrees list`, `worktrees create`, `sessions start`, `schedules list`, and `schedules add` — the CLI resolves the project that owns the agent's shell `cwd` (longest-prefix match on `project.path`) when the positional is missing. A new `GET /api/projects?cwd=<absolutePath>` endpoint on the server returns `{ project: Project | null }` for the lookup, mirroring the existing `findWorktreeByPath` helper. The bare `GET /api/projects` array shape is unchanged. When a `<project>` is supplied but doesn't match by id or name, the CLI also tries the cwd lookup and uses that match, so a typo'd name from inside a worktree no longer makes `worktrees create` fail. The error message includes the cwd and a "did you mean" hint when nothing resolves. The `controller-worktrees` and `controller-schedules` managed skills document the new behavior; the `controller worktrees create --name foo` and `controller sessions start --worktree <id> --message "..."` forms now work from any shell inside an onboarded project.
+
 ## [0.3.0] - 2026-07-05
 
 ### Added

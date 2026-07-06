@@ -18,7 +18,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { addProject, getProject, updateProject } from "../projects.js";
+import { addProject, findProjectByPath, getProject, updateProject } from "../projects.js";
 
 interface Sandbox {
   home: string;
@@ -177,5 +177,77 @@ test("editing a hydrated script round-trips without mangling the body", async ()
     await updateProject(project.id, { runCommands: hydrated?.runCommands });
 
     assert.equal(await fs.readFile(scriptPath(projectPath, "run.sh"), "utf-8"), original);
+  });
+});
+
+/*
+ * findProjectByPath: the cwd-based project lookup the CLI hits when
+ * `<project>` is omitted (or doesn't match by id/name). It returns the
+ * project whose `path` is the longest ancestor of the supplied cwd.
+ */
+test("findProjectByPath returns the project that owns the cwd", async () => {
+  await withSandbox(async ({ projectPath }) => {
+    const project = await addProject("demo", projectPath);
+    // Pretend a worktree lives at `<projectPath>/.worktrees/issue-42`.
+    const worktree = path.join(projectPath, ".worktrees", "issue-42");
+    await fs.mkdir(worktree, { recursive: true });
+
+    const fromCwd = await findProjectByPath(worktree);
+    assert.ok(fromCwd, "expected to find a project for the worktree cwd");
+    assert.equal(fromCwd?.id, project.id);
+  });
+});
+
+test("findProjectByPath matches an exact cwd", async () => {
+  await withSandbox(async ({ projectPath }) => {
+    const project = await addProject("demo", projectPath);
+    const fromCwd = await findProjectByPath(projectPath);
+    assert.equal(fromCwd?.id, project.id);
+  });
+});
+
+test("findProjectByPath resolves symlinks and `..` segments before comparing", async () => {
+  await withSandbox(async ({ projectPath }) => {
+    const project = await addProject("demo", projectPath);
+    // `<projectPath>/sub/..` should normalize to `<projectPath>` and match.
+    const fromCwd = await findProjectByPath(path.join(projectPath, "sub", ".."));
+    assert.equal(fromCwd?.id, project.id);
+  });
+});
+
+test("findProjectByPath returns null when no project owns the cwd", async () => {
+  await withSandbox(async () => {
+    // The sandbox is fresh, no projects added. The lookup must not throw.
+    const orphan = mkdtempSync(path.join(os.tmpdir(), "controller-orphan-"));
+    try {
+      const fromCwd = await findProjectByPath(orphan);
+      assert.equal(fromCwd, null);
+    } finally {
+      rmSync(orphan, { recursive: true, force: true });
+    }
+  });
+});
+
+test("findProjectByPath picks the most specific project (longest-prefix match)", async () => {
+  await withSandbox(async () => {
+    // Two projects, one nested inside the other. The deeper one should
+    // win for paths inside it; the outer one for paths that are inside
+    // it but outside the inner one.
+    const outer = mkdtempSync(path.join(os.tmpdir(), "controller-outer-"));
+    const inner = path.join(outer, "nested-project");
+    await fs.mkdir(inner, { recursive: true });
+    try {
+      const outerProject = await addProject("outer", outer);
+      const innerProject = await addProject("inner", inner);
+
+      // Inside the inner project: inner wins (longer prefix).
+      const insideInner = await findProjectByPath(path.join(inner, "src", "foo.ts"));
+      assert.equal(insideInner?.id, innerProject.id);
+      // Inside the outer project but outside the inner: outer wins.
+      const insideOuter = await findProjectByPath(outer);
+      assert.equal(insideOuter?.id, outerProject.id);
+    } finally {
+      rmSync(outer, { recursive: true, force: true });
+    }
   });
 });
