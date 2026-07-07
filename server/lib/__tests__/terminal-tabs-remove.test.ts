@@ -144,9 +144,10 @@ test("PUT /terminal-tabs with removeTerminalId kills the underlying tmux session
   }
 
   await withRoutes(async ({ baseUrl, projectId, worktreeId, worktreePath }) => {
-    const { ptyManager } = await import("../../lib/pty-manager.js");
+    const { ptyManager, tmuxSessionNames } = await import("../../lib/pty-manager.js");
     const terminalId = "ghost";
     const sessionId = `${projectId}:${worktreeId}:${terminalId}`;
+    const expectedNames = tmuxSessionNames(sessionId);
 
     // Simulate the worst case from the bug: the user clicked X *before*
     // any WebSocket ever opened. PTY exists (because `run-script` or the
@@ -168,12 +169,9 @@ test("PUT /terminal-tabs with removeTerminalId kills the underlying tmux session
 
     // Confirm the tmux session is alive before the close.
     const beforeSessions = listTmuxSessions();
-    const expectedNamePattern = new RegExp(
-      `(controller|coding-orchestrator)-.*${terminalId.slice(0, 4)}`
-    );
     assert.ok(
-      beforeSessions.some((name) => expectedNamePattern.test(name)),
-      `expected a tmux session for ${terminalId} to exist before close, saw: ${beforeSessions.join(", ")}`
+      beforeSessions.some((name) => expectedNames.includes(name)),
+      `expected tmux session ${expectedNames.join(" or ")} to exist before close, saw: ${beforeSessions.join(", ")}`
     );
 
     // The fix: PUT with `removeTerminalId` kills the tmux session before
@@ -196,8 +194,8 @@ test("PUT /terminal-tabs with removeTerminalId kills the underlying tmux session
     // poll reads via `listTmuxTerminalIds`).
     const afterSessions = listTmuxSessions();
     assert.ok(
-      !afterSessions.some((name) => expectedNamePattern.test(name)),
-      `expected no tmux session for ${terminalId} to remain, saw: ${afterSessions.join(", ")}`
+      !afterSessions.some((name) => expectedNames.includes(name)),
+      `expected no tmux session ${expectedNames.join(" or ")} to remain, saw: ${afterSessions.join(", ")}`
     );
 
     // And a subsequent `getTerminalTabs` (the periodic poll that

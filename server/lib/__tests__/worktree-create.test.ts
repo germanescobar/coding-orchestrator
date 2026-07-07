@@ -68,6 +68,7 @@ async function buildRepo(
   await runGit(projectPath, ["init", "--bare", "--initial-branch=main", remoteDir]);
 
   await runGit(projectPath, ["init", "--initial-branch=main"]);
+  await runGit(projectPath, ["config", "init.defaultBranch", "main"]);
   await runGit(projectPath, ["config", "user.email", "test@example.com"]);
   await runGit(projectPath, ["config", "user.name", "Test"]);
   await runGit(projectPath, ["config", "commit.gpgsign", "false"]);
@@ -348,6 +349,7 @@ test("falls back to local ref when no origin remote is configured", async () => 
   await withCreateEnv(async ({ projectPath }) => {
     // Note: no buildRepo() — just init a plain repo with no remote.
     await runGit(projectPath, ["init", "--initial-branch=main"]);
+    await runGit(projectPath, ["config", "init.defaultBranch", "main"]);
     await runGit(projectPath, ["config", "user.email", "test@example.com"]);
     await runGit(projectPath, ["config", "user.name", "Test"]);
     await runGit(projectPath, ["config", "commit.gpgsign", "false"]);
