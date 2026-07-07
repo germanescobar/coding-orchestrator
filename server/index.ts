@@ -214,6 +214,10 @@ terminalWss.on("connection", (ws: WebSocket) => {
 
   ws.on("close", () => {
     unsubscribe?.();
+    unsubscribe = null;
+    if (ptyKey) {
+      ptyManager.detachIfIdle(ptyKey);
+    }
   });
 });
 

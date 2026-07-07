@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
-import { ptyManager, lastLines } from "../pty-manager.js";
+import { ptyManager, lastLines, tmuxSessionNames } from "../pty-manager.js";
 
 /*
  * Issue #261: unit coverage for the terminal surface's `ptyManager` additions.
@@ -40,6 +40,8 @@ function tmuxAvailable(): boolean {
     return false;
   }
 }
+
+const PTY_OUTPUT_TIMEOUT_MS = 8000;
 
 test("listByPrefix, snapshot and tail observe a live terminal", async (t) => {
   if (!tmuxAvailable()) {
@@ -91,7 +93,7 @@ test("listByPrefix, snapshot and tail observe a live terminal", async (t) => {
     await new Promise((resolve) => setTimeout(resolve, 200));
     ptyManager.runCommand(inScope, cwd, "echo " + sentinel);
 
-    const timeout = new Promise((resolve) => setTimeout(resolve, 4000));
+    const timeout = new Promise((resolve) => setTimeout(resolve, PTY_OUTPUT_TIMEOUT_MS));
     await Promise.race([reader, timeout]);
     controller.abort();
 
@@ -150,7 +152,7 @@ test("runCommand sends the exact command string to the shell via send-keys", asy
       }
     })();
 
-    const timeout = new Promise((resolve) => setTimeout(resolve, 4000));
+    const timeout = new Promise((resolve) => setTimeout(resolve, PTY_OUTPUT_TIMEOUT_MS));
     await Promise.race([reader, timeout]);
     controller.abort();
 
@@ -199,7 +201,7 @@ test("getOrCreate applies extra env to the terminal session", async (t) => {
     await new Promise((resolve) => setTimeout(resolve, 200));
     ptyManager.runCommand(sessionId, cwd, "printf '%s\\n' \"$CONTROLLER_TEST_SENTINEL\"");
 
-    const timeout = new Promise((resolve) => setTimeout(resolve, 4000));
+    const timeout = new Promise((resolve) => setTimeout(resolve, PTY_OUTPUT_TIMEOUT_MS));
     await Promise.race([reader, timeout]);
     controller.abort();
 
@@ -207,6 +209,84 @@ test("getOrCreate applies extra env to the terminal session", async (t) => {
       collected.join("").includes(sentinel),
       "expected runCommand env to reach the shell; got: " + collected.join("")
     );
+  } finally {
+    ptyManager.kill(sessionId);
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("detachIfIdle drops only the tmux client PTY", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-detach-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = "p1:w1:detach-" + suffix;
+
+  try {
+    const created = ptyManager.getOrCreate(sessionId, cwd);
+    if (created.error) {
+      t.skip("could not spawn a PTY: " + created.error);
+      return;
+    }
+
+    const unsubscribe = ptyManager.onData(sessionId, () => {});
+    assert.equal(ptyManager.detachIfIdle(sessionId), false);
+    assert.equal(ptyManager.has(sessionId), true);
+    unsubscribe?.();
+
+    assert.equal(ptyManager.detachIfIdle(sessionId), true);
+    assert.equal(ptyManager.has(sessionId), false);
+    execFileSync("tmux", ["has-session", "-t", `=${tmuxSessionNames(sessionId)[0]}`], {
+      stdio: "ignore",
+    });
+
+    const reattached = ptyManager.getOrCreate(sessionId, cwd);
+    assert.equal(reattached.error, undefined);
+    assert.equal(ptyManager.has(sessionId), true);
+  } finally {
+    ptyManager.kill(sessionId);
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Controller tmux sessions use emacs copy-mode keys", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-mode-keys-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = "p1:w1:mode-" + suffix;
+  const sessionName = tmuxSessionNames(sessionId)[0];
+
+  try {
+    const created = ptyManager.getOrCreate(sessionId, cwd);
+    if (created.error) {
+      t.skip("could not spawn a PTY: " + created.error);
+      return;
+    }
+
+    const modeKeys = execFileSync(
+      "tmux",
+      ["show-window-options", "-t", `=${sessionName}`, "-v", "mode-keys"],
+      { encoding: "utf8" }
+    ).trim();
+    assert.equal(modeKeys, "emacs");
+
+    execFileSync("tmux", ["copy-mode", "-t", `${sessionName}:0.0`], { stdio: "ignore" });
+    execFileSync("tmux", ["send-keys", "-t", `${sessionName}:0.0`, "Escape"], {
+      stdio: "ignore",
+    });
+    const paneMode = execFileSync(
+      "tmux",
+      ["display-message", "-p", "-t", `${sessionName}:0.0`, "#{pane_in_mode}"],
+      { encoding: "utf8" }
+    ).trim();
+    assert.equal(paneMode, "0");
   } finally {
     ptyManager.kill(sessionId);
     await fs.rm(cwd, { recursive: true, force: true });
