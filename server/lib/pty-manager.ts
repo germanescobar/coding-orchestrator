@@ -173,6 +173,10 @@ function configureTmuxSession(sessionName: string): void {
   execFileSync("tmux", ["set-option", "-t", sessionName, "history-limit", "50000"], {
     stdio: "ignore",
   });
+
+  execFileSync("tmux", ["set-window-option", "-t", sessionName, "mode-keys", "emacs"], {
+    stdio: "ignore",
+  });
 }
 
 class PtyManager {
@@ -250,7 +254,11 @@ class PtyManager {
   ): void {
     const sessionName = tmuxSessionName(sessionId);
     ensureTmuxSession(sessionName, cwd, extraEnv);
-    runTmux(["send-keys", "-t", tmuxFirstPaneTarget(sessionName), command, "C-m"], {
+    const target = tmuxFirstPaneTarget(sessionName);
+    runTmux(["send-keys", "-t", target, "-l", command], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    runTmux(["send-keys", "-t", target, "Enter"], {
       stdio: ["ignore", "ignore", "pipe"],
     });
   }
@@ -353,6 +361,18 @@ class PtyManager {
   /** Check if a session has a PTY. */
   has(sessionId: string): boolean {
     return this.sessions.has(sessionId);
+  }
+
+  /**
+   * Detach the tmux client PTY when nobody is watching it, leaving the
+   * underlying tmux session and its shell/processes alive for a later attach.
+   */
+  detachIfIdle(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.listeners > 0) return false;
+    session.pty.kill();
+    this.sessions.delete(sessionId);
+    return true;
   }
 
   /** Kill and remove a PTY. Also kills the underlying tmux session for both
