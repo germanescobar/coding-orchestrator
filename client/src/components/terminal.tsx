@@ -68,6 +68,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
     const fitRef = useRef<FitAddon | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const hasAttachedRef = useRef(false);
+    // Issue #296: when the user clicks X while the WebSocket is still
+    // CONNECTING, the imperative `close()` is a no-op (it requires OPEN).
+    // Track that intent here so the `onopen` handler can deliver the `close`
+    // message the moment the connection is up. The server fix (PUT
+    // /terminal-tabs calls ptyManager.kill) is the authoritative one; this
+    // just keeps the WS handshake from stranding an attached tmux session
+    // for ~50–200ms on slow networks.
+    const pendingCloseRef = useRef(false);
 
     useImperativeHandle(ref, () => ({
       sendSpecialKey(key: TerminalSpecialKey) {
@@ -82,8 +90,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
       },
       close() {
         const ws = wsRef.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        ws.send(JSON.stringify({ type: "close" }));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "close" }));
+          return;
+        }
+        // WS not yet OPEN (still CONNECTING, reconnecting, or null). Mark the
+        // intent so `onopen` delivers the `close` as soon as it can; otherwise
+        // the server would see only a plain disconnect and the tmux session
+        // would survive, getting re-merged into the tab list on the next poll
+        // (issue #296).
+        pendingCloseRef.current = true;
       },
     }));
 
@@ -177,6 +193,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(
         wsRef.current = ws;
 
         ws.onopen = () => {
+          // Issue #296: if the user clicked X while we were still CONNECTING,
+          // deliver the close now instead of attaching a tmux session that the
+          // server's `ws.on(close, …)` would otherwise leave alive.
+          if (pendingCloseRef.current) {
+            ws.send(JSON.stringify({ type: "close" }));
+            ws.close(1000);
+            return;
+          }
           ws.send(
             JSON.stringify({
               type: "attach",
