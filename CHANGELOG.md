@@ -76,9 +76,23 @@ and run it; no install required.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Terminal CLI: list / run / snapshot / tail reach tmux-only sessions** (#301). When the user closes a tab the WebSocket disconnect kills the node-pty via `ptyManager.detachIfIdle`, but the underlying tmux session stays alive so the user can re-attach. The agent's `controller terminal list` was gating on the in-memory PTY map and returning "no terminals" in worktrees the user clearly has tabs open in; the same gap made `run` / `snapshot` 404. The agent surface now agrees with the renderer's tmux-driven tab list: `list` uses `ptyManager.listLiveByPrefix` (PTY ∪ live tmux, scoped to the worktree prefix), the `run` / `snapshot` / `tail` gate uses `ptyManager.isLive`, `snapshot` falls back to `tmux capture-pane` for tmux-only sessions, and `tail` attaches a transient PTY via `getOrCreate` and cleans it up via `detachIfIdle` when the iteration ends.
+
+## [0.3.1] - 2026-07-07
+
+> **macOS Gatekeeper:** the macOS build remains ad-hoc-signed and not
+> notarized. On first launch, open **System Settings → Privacy & Security →
+> Security** and click **Open Anyway** for Controller.
+
 ### Added
 
-- **CLI: cwd-based project resolution for `worktrees` / `sessions` / `schedules`**. The `<project>` positional is now optional on `worktrees list`, `worktrees create`, `sessions start`, `schedules list`, and `schedules add` — the CLI resolves the project that owns the agent's shell `cwd` (longest-prefix match on `project.path`) when the positional is missing. A new `GET /api/projects?cwd=<absolutePath>` endpoint on the server returns `{ project: Project | null }` for the lookup, mirroring the existing `findWorktreeByPath` helper. The bare `GET /api/projects` array shape is unchanged. When a `<project>` is supplied but doesn't match by id or name, the CLI also tries the cwd lookup and uses that match, so a typo'd name from inside a worktree no longer makes `worktrees create` fail. The error message includes the cwd and a "did you mean" hint when nothing resolves. The `controller-worktrees` and `controller-schedules` managed skills document the new behavior; the `controller worktrees create --name foo` and `controller sessions start --worktree <id> --message "..."` forms now work from any shell inside an onboarded project.
+- **CLI: cwd-based project resolution for `worktrees` / `sessions` / `schedules`**. The `<project>` positional is now optional on `worktrees list`, `worktrees create`, `sessions start`, `schedules list`, and `schedules add` — the CLI resolves the project that owns the agent's shell `cwd` (longest-prefix match, falling back to a Controller-created worktree's owning project) when the positional is missing. A new `GET /api/projects?cwd=<absolutePath>` endpoint on the server returns `{ project: Project | null }` for the lookup. The bare `GET /api/projects` array shape is unchanged. When a `<project>` is supplied but doesn't match by id or name, the CLI also tries the cwd lookup and uses that match, so a typo'd name from inside a worktree no longer makes `worktrees create` fail. The error message includes the cwd and a "did you mean" hint when nothing resolves. The `controller-worktrees` and `controller-schedules` managed skills document the new behavior; the `controller worktrees create --name foo` and `controller sessions start --worktree <id> --message "..."` forms now work from any shell inside an onboarded project.
+
+### Fixed
+
+- **Terminals: kill tmux session on tab close** (#296). Closing a terminal tab while the WebSocket was still CONNECTING (or without ever opening one) left the underlying tmux session alive; the next 2s `getTerminalTabs` poll would re-discover it via `listTmuxTerminalIds` and re-add the tab. The PUT `/api/projects/:id/terminal-tabs` handler now calls `ptyManager.kill` unconditionally when `removeTerminalId` is set, and the kill path also cleans up the pre-rename `coding-orchestrator-` tmux prefix so legacy sessions don't re-merge. A client-side `pendingCloseRef` belt-and-suspenders delivers a close requested during CONNECTING as soon as the WS opens.
 
 ## [0.3.0] - 2026-07-05
 

@@ -197,3 +197,89 @@ test("a terminal in another worktree is not reachable from this cwd", async (t) 
     }
   });
 });
+
+test("tmux-only terminals (no PTY attached) are reachable from the agent surface", async (t) => {
+  // The bug: when no WebSocket is watching a terminal, `detachIfIdle` kills
+  // the node-pty and removes it from `ptyManager.sessions` — but the tmux
+  // session stays alive so the user can re-attach. The agent's `terminal
+  // list` / `run` / `snapshot` / `tail` were gating on the in-memory PTY
+  // map and returning 0 / 404, even though the user can see the terminal in
+  // the Terminals tab. The Terminals tab list itself is built from live
+  // tmux sessions (`terminal-tabs.ts`), so the agent surface has to agree
+  // or it lies to the agent about what's open.
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+  await withRoutes(async ({ baseUrl, projectId, worktreeId, worktreePath }) => {
+    const { ptyManager, tmuxSessionNames } = await import("../../lib/pty-manager.js");
+    // Spawn a tmux session the same way the WebSocket `attach` path does
+    // — but skip the node-pty step so the session is tmux-only.
+    const sessionId = `${projectId}:${worktreeId}:tmux-only-${Date.now()}`;
+    const tmuxName = tmuxSessionNames(sessionId)[0];
+    try {
+      execFileSync("tmux", [
+        "new-session",
+        "-d",
+        "-s",
+        tmuxName,
+        "-c",
+        worktreePath,
+        "sh -c 'echo TMUX_ONLY_MARKER; sleep 30'",
+      ], { stdio: "ignore" });
+
+      // list sees the tmux-only session.
+      const listed = (await (
+        await command(baseUrl, { cwd: worktreePath, action: "list" })
+      ).json()) as { terminals: Array<{ id: string; attached: boolean }> };
+      const found = listed.terminals.find((t) => t.id.startsWith("tmux-only-"));
+      assert.ok(found, `expected list to surface the tmux-only session, got: ${JSON.stringify(listed.terminals)}`);
+      assert.equal(found.attached, false);
+
+      // snapshot reads the pane content via `tmux capture-pane`.
+      const snapshot = await command(baseUrl, {
+        cwd: worktreePath,
+        action: "snapshot",
+        params: { terminalId: found.id },
+      });
+      assert.equal(snapshot.status, 200);
+      const snapBody = (await snapshot.json()) as { text: string };
+      assert.match(snapBody.text, /TMUX_ONLY_MARKER/);
+
+      // run writes to the same tmux session.
+      const run = await command(baseUrl, {
+        cwd: worktreePath,
+        action: "run",
+        params: { terminalId: found.id, command: "echo POST_RUN_MARKER" },
+      });
+      assert.equal(run.status, 200);
+
+      const snapshotAfter = await command(baseUrl, {
+        cwd: worktreePath,
+        action: "snapshot",
+        params: { terminalId: found.id, lines: 50 },
+      });
+      assert.equal(snapshotAfter.status, 200);
+      const afterBody = (await snapshotAfter.json()) as { text: string };
+      assert.match(afterBody.text, /POST_RUN_MARKER/);
+
+      // A terminal id the user never created still 404s.
+      const ghost = await command(baseUrl, {
+        cwd: worktreePath,
+        action: "run",
+        params: { terminalId: "ghost", command: "echo hi" },
+      });
+      assert.equal(ghost.status, 404);
+    } finally {
+      // Cleanup: kill the tmux session we spawned (no PTY to clean up).
+      for (const name of tmuxSessionNames(sessionId)) {
+        try {
+          execFileSync("tmux", ["kill-session", "-t", `=${name}`], { stdio: "ignore" });
+        } catch {
+          // ignore
+        }
+      }
+      ptyManager.kill(sessionId);
+    }
+  });
+});

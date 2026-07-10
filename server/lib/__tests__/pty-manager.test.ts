@@ -112,6 +112,58 @@ test("listByPrefix, snapshot and tail observe a live terminal", async (t) => {
   }
 });
 
+test("listLiveByPrefix and isLive reach tmux-only sessions", async (t) => {
+  // The user can see a terminal in the Terminals tab even when no
+  // WebSocket is attached — `detachIfIdle` kills the node-pty on WS close
+  // but leaves the tmux session alive. The agent's `terminal list` and
+  // the `run` / `snapshot` / `tail` gates had to agree with the renderer's
+  // tmux-driven tab list, or the agent surface would report 0 terminals in
+  // worktrees the user is actively using. `listLiveByPrefix` and `isLive`
+  // are the methods that close that gap.
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-tmux-only-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = `p1:w1:tmuxonly-${suffix}`;
+  const tmuxName = tmuxSessionNames(sessionId)[0];
+  try {
+    // Spawn a tmux session directly (no node-pty, no `getOrCreate`).
+    execFileSync(
+      "tmux",
+      ["new-session", "-d", "-s", tmuxName, "-c", cwd, "sh -c 'echo HELLO; sleep 30'"],
+      { stdio: "ignore" }
+    );
+
+    // isLive returns true even with no in-memory PTY.
+    assert.equal(ptyManager.has(sessionId), false);
+    assert.equal(ptyManager.isLive(sessionId), true);
+
+    // listLiveByPrefix surfaces the tmux-only session, marked as detached.
+    const live = ptyManager.listLiveByPrefix("p1:w1:");
+    const found = live.find((entry) => entry.id === `tmuxonly-${suffix}`);
+    assert.ok(found, `expected listLiveByPrefix to include the tmux-only session, got: ${JSON.stringify(live)}`);
+    assert.equal(found.attached, false);
+
+    // listByPrefix (the PTY-only version) still excludes it.
+    assert.equal(ptyManager.listByPrefix("p1:w1:").length, 0);
+
+    // snapshot falls back to `tmux capture-pane` and reads the on-screen content.
+    const snap = ptyManager.snapshot(sessionId, 200) ?? "";
+    assert.match(snap, /HELLO/);
+  } finally {
+    for (const name of tmuxSessionNames(sessionId)) {
+      try {
+        execFileSync("tmux", ["kill-session", "-t", `=${name}`], { stdio: "ignore" });
+      } catch {
+        // ignore
+      }
+    }
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runCommand sends the exact command string to the shell via send-keys", async (t) => {
   // The truncation bug this guards against: `runCommand` hands the
   // command string to `tmux send-keys`, so the user's interactive shell

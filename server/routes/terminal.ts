@@ -8,9 +8,13 @@
  * server, not the CLI, owns terminal addressing.
  *
  * Terminals are the persistent tmux-backed PTYs the renderer drives over
- * `/ws/terminal`. Agents can only reach ones the user already has open;
- * creating a terminal stays a UI action, so `run`/`snapshot`/`tail` 404 when
- * the addressed PTY does not exist.
+ * `/ws/terminal`. The `ptyManager` detaches the node-pty when no one is
+ * watching (WS closed) but leaves the tmux session alive so the user can
+ * re-attach. The agent's `terminal list`/`run`/`snapshot`/`tail` accept any
+ * live terminal (PTY OR tmux), otherwise the user can see a terminal the
+ * agent cannot — the agent surface has to agree with the renderer's
+ * tmux-driven tab list or `list` returns 0 in worktrees the user is using.
+ * Creating a terminal stays a UI action.
  */
 
 import { Router, type Request, type Response } from "express";
@@ -61,7 +65,7 @@ terminalRouter.post("/command", async (req: Request, res: Response) => {
 
   if (action === "list") {
     const terminals = ptyManager
-      .listByPrefix(prefix)
+      .listLiveByPrefix(prefix)
       .map(({ id, attached }) => ({ id, label: id, attached }));
     res.json({
       ok: true,
@@ -79,7 +83,7 @@ terminalRouter.post("/command", async (req: Request, res: Response) => {
     return;
   }
   const sessionId = `${prefix}${terminalId}`;
-  if (!ptyManager.has(sessionId)) {
+  if (!ptyManager.isLive(sessionId)) {
     res.status(404).json({
       ok: false,
       error: `No terminal "${terminalId}" is open in this worktree. Open it in the Terminals tab first, or run \`terminal list\`.`,
@@ -113,7 +117,7 @@ terminalRouter.post("/command", async (req: Request, res: Response) => {
 
   // action === "tail"
   const follow = params.follow === true;
-  await streamTail(res, sessionId, follow);
+  await streamTail(res, sessionId, worktree.path, follow);
 });
 
 /** Resolve the `--lines` param to a positive integer, defaulting to 200. */
@@ -127,11 +131,34 @@ function parseLines(value: unknown): number {
  * Stream a terminal's new output to the response as plain text. `--follow`
  * keeps the connection open until the client disconnects; otherwise the stream
  * ends after `TAIL_IDLE_MS` with no new output.
+ *
+ * For tmux-only sessions (PTY detached because no one was watching, tmux
+ * still alive) we `getOrCreate` a transient PTY that attaches to the existing
+ * tmux session. The new node-pty replays the session's history to its
+ * `onData` callback, so the agent sees what the user sees. The PTY is removed
+ * via `detachIfIdle` once the iteration ends, matching the lifecycle the
+ * WebSocket `close` handler uses for renderer panes.
  */
-async function streamTail(res: Response, sessionId: string, follow: boolean): Promise<void> {
+async function streamTail(
+  res: Response,
+  sessionId: string,
+  worktreePath: string,
+  follow: boolean
+): Promise<void> {
+  let cleanup: (() => void) | null = null;
+  if (!ptyManager.has(sessionId)) {
+    const created = ptyManager.getOrCreate(sessionId, worktreePath);
+    if (created.error) {
+      res.status(404).json({ ok: false, error: `Terminal is no longer open: ${created.error}` });
+      return;
+    }
+    cleanup = () => ptyManager.detachIfIdle(sessionId);
+  }
+
   const controller = new AbortController();
   const iterable = ptyManager.tail(sessionId, controller.signal);
   if (!iterable) {
+    cleanup?.();
     res.status(404).json({ ok: false, error: "Terminal is no longer open" });
     return;
   }
@@ -158,5 +185,6 @@ async function streamTail(res: Response, sessionId: string, follow: boolean): Pr
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
     if (!res.writableEnded) res.end();
+    cleanup?.();
   }
 }
