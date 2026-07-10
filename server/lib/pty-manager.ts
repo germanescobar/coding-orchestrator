@@ -98,6 +98,61 @@ function killTmuxSession(sessionName: string): void {
   }
 }
 
+/**
+ * Extract the terminal id from a tmux session name. The tmux name embeds the
+ * sanitized logical sessionId plus a 12-char SHA-256 hash, e.g.
+ * `controller-<projectId>_<worktreeId>_<terminalId>-<hash>`. We strip the
+ * tmux prefix and the trailing hash to recover the terminal id. Returns
+ * `null` when the name doesn't match the expected shape (e.g. a session
+ * owned by another app) so the caller can skip it.
+ */
+function terminalIdFromTmuxSessionName(
+  sessionName: string,
+  targetPrefixes: string[]
+): string | null {
+  const matchedPrefix = targetPrefixes.find((target) => sessionName.startsWith(target));
+  if (!matchedPrefix) return null;
+  const stripped = sessionName
+    .slice(matchedPrefix.length)
+    .replace(/-[0-9a-f]{12}$/, "");
+  return stripped && /^[a-zA-Z0-9._-]+$/.test(stripped) ? stripped : null;
+}
+
+/** True when a tmux session with the given logical id is alive. */
+function tmuxSessionExists(sessionId: string): boolean {
+  for (const name of tmuxSessionNames(sessionId)) {
+    try {
+      execFileSync("tmux", ["has-session", "-t", `=${name}`], { stdio: "ignore" });
+      return true;
+    } catch {
+      // Try the next candidate (legacy prefix) before giving up.
+    }
+  }
+  return false;
+}
+
+/**
+ * Capture the last `lines` lines of the visible pane of a tmux session via
+ * `tmux capture-pane -p`. Used by `snapshot` for tmux-only sessions (no
+ * in-memory PTY buffer to read from). Returns `null` when the session has
+ * been killed or the target has no visible pane.
+ */
+function captureTmuxPane(sessionId: string, lines: number): string | null {
+  for (const name of tmuxSessionNames(sessionId)) {
+    try {
+      const target = `${name}:0.0`;
+      return execFileSync(
+        "tmux",
+        ["capture-pane", "-p", "-t", target, "-S", `-${Math.max(1, lines)}`],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+      );
+    } catch {
+      // Try the next candidate (legacy prefix) before giving up.
+    }
+  }
+  return null;
+}
+
 function buildTmuxShellCommand(env?: Record<string, string>): string {
   const shell = process.env.SHELL || "/bin/sh";
   // Strip Controller's own runtime vars (e.g. NODE_ENV=production, our PORT) so
@@ -304,13 +359,59 @@ class PtyManager {
   }
 
   /**
-   * Return the last `lines` lines of a session's buffered output, or null when
-   * the session does not exist. A pure slice over the existing rolling buffer.
+   * List every live terminal in a worktree, including tmux-only sessions that
+   * have no in-memory PTY. The agent's `terminal list` should always reach a
+   * terminal the user can see in the Terminals tab — that tab list is built
+   * from persisted tabs + live tmux sessions (see `terminal-tabs.ts`), so the
+   * agent surface has to agree or it returns 0 terminals in worktrees the
+   * user is currently using. PTY-backed sessions take precedence on duplicate
+   * ids (their `attached` flag is more informative than the false we'd report
+   * for a tmux-only entry).
+   */
+  listLiveByPrefix(prefix: string): Array<{ id: string; attached: boolean }> {
+    const out = new Map<string, { id: string; attached: boolean }>();
+    for (const [key, session] of this.sessions) {
+      if (key.startsWith(prefix)) {
+        out.set(key.slice(prefix.length), {
+          id: key.slice(prefix.length),
+          attached: session.listeners > 0,
+        });
+      }
+    }
+    const targetPrefixes = tmuxPrefixes(prefix);
+    for (const sessionName of listTmuxSessions()) {
+      const id = terminalIdFromTmuxSessionName(sessionName, targetPrefixes);
+      if (!id || out.has(id)) continue;
+      out.set(id, { id, attached: false });
+    }
+    return Array.from(out.values());
+  }
+
+  /**
+   * True when a terminal is reachable: either a PTY is currently attached
+   * (`this.sessions.has`) or the underlying tmux session is still alive. The
+   * tmux session outlives the PTY — `detachIfIdle` kills the node-pty on WS
+   * close but leaves tmux running, and the user can re-attach from the
+   * Terminals tab. The agent's `terminal run`/`snapshot`/`tail` should treat
+   * a tmux-only session as live too, otherwise the user can see a terminal
+   * the agent cannot.
+   */
+  isLive(sessionId: string): boolean {
+    if (this.sessions.has(sessionId)) return true;
+    return tmuxSessionExists(sessionId);
+  }
+
+  /**
+   * Return the last `lines` lines of a session's output, or null when the
+   * session is not live. PTY-backed sessions read from the in-memory rolling
+   * buffer; tmux-only sessions (PTY was detached by `detachIfIdle` but tmux
+   * is still alive) read from `tmux capture-pane` so the agent gets the
+   * actual on-screen content the user sees.
    */
   snapshot(sessionId: string, lines: number): string | null {
     const session = this.sessions.get(sessionId);
-    if (!session) return null;
-    return lastLines(session.buffer, lines);
+    if (session) return lastLines(session.buffer, lines);
+    return captureTmuxPane(sessionId, lines);
   }
 
   /**
