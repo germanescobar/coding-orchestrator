@@ -4,8 +4,14 @@ import { AgentsSection } from "../components/agents-section.tsx";
 import { IntegrationsSection } from "../components/integrations-section.tsx";
 import { SkillsSection } from "../components/skills-section.tsx";
 import { ShortcutsSection } from "../components/shortcuts-section.tsx";
+import { SchedulesSection } from "../components/schedules-section.tsx";
 
-export type SettingsSection = "agents" | "integrations" | "skills" | "shortcuts";
+export type SettingsSection =
+  | "agents"
+  | "integrations"
+  | "skills"
+  | "shortcuts"
+  | "schedules";
 
 interface SectionSpec {
   id: SettingsSection;
@@ -39,12 +45,32 @@ const SECTIONS: SectionSpec[] = [
     shortLabel: "Shortcuts",
     description: "Customise Controller Mode keyboard shortcuts.",
   },
+  {
+    id: "schedules",
+    label: "Schedules",
+    shortLabel: "Schedules",
+    description:
+      "Schedule future or recurring sessions on the active project's worktrees.",
+  },
 ];
 
 interface SettingsPageProps {
   section: SettingsSection;
   onSectionChange: (section: SettingsSection) => void;
   onClose: () => void;
+  /**
+   * Id of the active project. Required by the Schedules section, which is
+   * project-scoped; other sections ignore it. Optional so the page can be
+   * rendered without a project selected (e.g. on a fresh install), in which
+   * case SchedulesSection is shown in a "no project" empty state.
+   */
+  projectId?: string;
+  /**
+   * Forwarded to the Schedules section so a fired schedule's `sessionId` can
+   * navigate the main view to that session. Mirrors the `controller://`
+   * deep-link path the transcript already uses.
+   */
+  onOpenSession?: (params: { sessionId: string; worktreeId?: string }) => void;
 }
 
 /*
@@ -57,7 +83,13 @@ interface SettingsPageProps {
  * appears next to the page title. On desktop (≥md) we keep the original
  * two-column layout with the section nav on the left.
  */
-export function SettingsPage({ section, onSectionChange, onClose }: SettingsPageProps) {
+export function SettingsPage({
+  section,
+  onSectionChange,
+  onClose,
+  projectId,
+  onOpenSession,
+}: SettingsPageProps) {
   const active = SECTIONS.find((s) => s.id === section) ?? SECTIONS[0];
 
   return (
@@ -149,6 +181,18 @@ export function SettingsPage({ section, onSectionChange, onClose }: SettingsPage
           {active.id === "integrations" && <IntegrationsSection />}
           {active.id === "skills" && <SkillsSection />}
           {active.id === "shortcuts" && <ShortcutsSection />}
+          {active.id === "schedules" && (
+            projectId ? (
+              <SchedulesSection
+                projectId={projectId}
+                onOpenSession={onOpenSession}
+              />
+            ) : (
+              <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+                Select a project to manage its schedules.
+              </div>
+            )
+          )}
         </div>
       </div>
     </div>

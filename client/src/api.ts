@@ -1688,3 +1688,115 @@ export async function resetShortcutBindings(): Promise<ShortcutBindings> {
   const res = await fetch(`${BASE}/shortcuts`, { method: "DELETE" });
   return res.json();
 }
+
+// --- Schedules (issue #303) ---
+//
+// Mirrors the server's `Schedule` / `ScheduleInput` shapes (server/lib/schedules.ts).
+// The UI is a thin client over the existing REST surface: list, create, toggle
+// enabled, delete, and inspect runs. Editing a trigger is intentionally out of
+// scope — the server has no PUT route for it (issue #303 non-goals).
+
+export type ScheduleSource = "user" | "agent";
+
+export interface Schedule {
+  id: string;
+  projectId: string;
+  worktreeId: string;
+  prompt: string;
+  provider?: string;
+  model?: string;
+  mode?: "default" | "plan";
+  cron: string | null;
+  timezone: string;
+  runAt: string | null;
+  nextRunAt: string;
+  lastRunAt: string | null;
+  lastRunSessionId: string | null;
+  lastError: string | null;
+  source: ScheduleSource;
+  enabled: boolean;
+  createdAt: string;
+  createdBy: string | null;
+}
+
+export interface ScheduleInput {
+  worktreeId: string;
+  prompt: string;
+  provider?: string;
+  model?: string;
+  mode?: "default" | "plan";
+  cron?: string | null;
+  timezone?: string;
+  runAt?: string | null;
+  enabled?: boolean;
+  source?: ScheduleSource;
+  createdBy?: string | null;
+}
+
+export interface ScheduleRun {
+  firedAt: string;
+  sessionId: string | null;
+  error: string | null;
+}
+
+function schedulePath(projectId: string, scheduleId?: string): string {
+  const base = `${BASE}/projects/${projectId}/schedules`;
+  return scheduleId ? `${base}/${scheduleId}` : base;
+}
+
+export async function fetchSchedules(
+  projectId: string,
+  includeDisabled = true
+): Promise<Schedule[]> {
+  const params = new URLSearchParams({ includeDisabled: String(includeDisabled) });
+  const res = await fetch(`${schedulePath(projectId)}?${params}`);
+  await throwIfNotOk(res, "Failed to fetch schedules");
+  const body = (await res.json()) as unknown;
+  return Array.isArray(body) ? (body as Schedule[]) : [];
+}
+
+export async function createSchedule(
+  projectId: string,
+  input: ScheduleInput
+): Promise<Schedule> {
+  const res = await fetch(schedulePath(projectId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  await throwIfNotOk(res, "Failed to create schedule");
+  return res.json();
+}
+
+export async function setScheduleEnabled(
+  projectId: string,
+  scheduleId: string,
+  enabled: boolean
+): Promise<Schedule> {
+  const action = enabled ? "enable" : "disable";
+  const res = await fetch(`${schedulePath(projectId, scheduleId)}/${action}`, {
+    method: "POST",
+  });
+  await throwIfNotOk(res, `Failed to ${action} schedule`);
+  return res.json();
+}
+
+export async function deleteSchedule(
+  projectId: string,
+  scheduleId: string
+): Promise<void> {
+  const res = await fetch(schedulePath(projectId, scheduleId), {
+    method: "DELETE",
+  });
+  await throwIfNotOk(res, "Failed to delete schedule");
+}
+
+export async function fetchScheduleRuns(
+  projectId: string,
+  scheduleId: string
+): Promise<ScheduleRun[]> {
+  const res = await fetch(`${schedulePath(projectId, scheduleId)}/runs`);
+  await throwIfNotOk(res, "Failed to fetch schedule runs");
+  const body = (await res.json()) as unknown;
+  return Array.isArray(body) ? (body as ScheduleRun[]) : [];
+}

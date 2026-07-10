@@ -358,6 +358,21 @@ function AppBody() {
     handleSelectSession(target.projectId, target.sessionId, target.worktreeId);
   }, []);
 
+  /**
+   * Open a session referenced by a schedule run. The Schedules section only
+   * carries the bare `sessionId` (no `controller://` envelope), so we
+   * resolve the project from `activeProjectId` and pass through the
+   * `worktreeId` from the schedule record. Mirrors `handleOpenConversation`
+   * but tolerates a missing `worktreeId`.
+   */
+  const handleOpenSessionFromSchedule = useCallback(
+    (params: { sessionId: string; worktreeId?: string }) => {
+      if (!activeProjectId) return;
+      handleSelectSession(activeProjectId, params.sessionId, params.worktreeId);
+    },
+    [activeProjectId]
+  );
+
   const handleNewThread = (projectId: string, worktreeId?: string) => {
     setActiveProjectId(projectId);
     setView({ page: "session", projectId, worktreeId });
@@ -799,6 +814,8 @@ function AppBody() {
             section={activeView.section}
             onSectionChange={(section) => setView({ page: "settings", section })}
             onClose={() => setView(preSettingsViewRef.current)}
+            projectId={activeProjectId ?? undefined}
+            onOpenSession={handleOpenSessionFromSchedule}
           />
         )}
         </AppErrorBoundary>
