@@ -1739,6 +1739,17 @@ export interface ScheduleRun {
   error: string | null;
 }
 
+/**
+ * A schedule paired with its owning project's id and a label, so the
+ * cross-project Schedules section can render a single list without the
+ * caller having to track which project each row came from. The
+ * `projectName` is denormalised at fetch time and is purely a display
+ * hint; the `projectId` is the source of truth.
+ */
+export interface ScheduleWithProject extends Schedule {
+  projectName: string;
+}
+
 function schedulePath(projectId: string, scheduleId?: string): string {
   const base = `${BASE}/projects/${projectId}/schedules`;
   return scheduleId ? `${base}/${scheduleId}` : base;
@@ -1753,6 +1764,37 @@ export async function fetchSchedules(
   await throwIfNotOk(res, "Failed to fetch schedules");
   const body = (await res.json()) as unknown;
   return Array.isArray(body) ? (body as Schedule[]) : [];
+}
+
+/**
+ * Fetch every project's schedules in parallel and merge them into a
+ * single list annotated with the owning project's display name.
+ *
+ * The server doesn't expose a `/api/schedules` cross-project endpoint
+ * by design (issue #303 — the CLI is the source of truth for the data
+ * model), so this is a client-side fan-out. It's the same shape every
+ * per-project page already uses, just collected in one place.
+ */
+export async function fetchAllSchedules(
+  includeDisabled = true
+): Promise<ScheduleWithProject[]> {
+  const projects = await fetchProjects();
+  const results = await Promise.all(
+    projects.map(async (project) => {
+      try {
+        const schedules = await fetchSchedules(project.id, includeDisabled);
+        return schedules.map((schedule) => ({
+          ...schedule,
+          projectName: project.name,
+        }));
+      } catch {
+        // One project's schedules failing shouldn't blank the whole
+        // view — log the failure server-side and skip it.
+        return [] as ScheduleWithProject[];
+      }
+    }),
+  );
+  return results.flat();
 }
 
 export async function createSchedule(

@@ -50,7 +50,7 @@ const SECTIONS: SectionSpec[] = [
     label: "Schedules",
     shortLabel: "Schedules",
     description:
-      "Schedule future or recurring sessions on the active project's worktrees.",
+      "Schedule future or recurring sessions on any project's worktree.",
   },
 ];
 
@@ -59,10 +59,11 @@ interface SettingsPageProps {
   onSectionChange: (section: SettingsSection) => void;
   onClose: () => void;
   /**
-   * Id of the active project. Required by the Schedules section, which is
-   * project-scoped; other sections ignore it. Optional so the page can be
-   * rendered without a project selected (e.g. on a fresh install), in which
-   * case SchedulesSection is shown in a "no project" empty state.
+   * Id of the active project. Optional — only used by sections that
+   * are project-scoped. The Schedules section is now cross-project
+   * (per review feedback) and ignores it. Kept on the page type so
+   * future project-scoped sections can opt in without another prop
+   * churn.
    */
   projectId?: string;
   /**
@@ -87,7 +88,6 @@ export function SettingsPage({
   section,
   onSectionChange,
   onClose,
-  projectId,
   onOpenSession,
 }: SettingsPageProps) {
   const active = SECTIONS.find((s) => s.id === section) ?? SECTIONS[0];
@@ -182,16 +182,7 @@ export function SettingsPage({
           {active.id === "skills" && <SkillsSection />}
           {active.id === "shortcuts" && <ShortcutsSection />}
           {active.id === "schedules" && (
-            projectId ? (
-              <SchedulesSection
-                projectId={projectId}
-                onOpenSession={onOpenSession}
-              />
-            ) : (
-              <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-                Select a project to manage its schedules.
-              </div>
-            )
+            <SchedulesSection onOpenSession={onOpenSession} />
           )}
         </div>
       </div>

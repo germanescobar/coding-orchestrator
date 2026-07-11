@@ -6,7 +6,12 @@ import {
   ScheduleRow,
   CreateScheduleForm,
 } from "../schedules-section.tsx";
-import type { Schedule } from "../../api.ts";
+import type {
+  Project,
+  Schedule,
+  ScheduleWithProject,
+  Worktree,
+} from "../../api.ts";
 
 /*
  * Regression test for the Schedules settings section (issue #303).
@@ -15,11 +20,13 @@ import type { Schedule } from "../../api.ts";
  * and the REST surface in `server/routes/schedules.ts`. This file covers what
  * the UI is responsible for:
  *
- *   1. List rendering — `ScheduleRow` surfaces worktree name, prompt
+ *   1. List rendering — `ScheduleRow` surfaces project name, prompt
  *      preview, trigger type, enabled state, last run, and last error.
+ *      The section is cross-project (per review feedback on #303), so
+ *      each row also carries a project badge.
  *   2. Create happy path — `CreateScheduleForm` (extracted from the
- *      dialog wrapper) exposes the worktree selector, prompt, trigger
- *      toggle, and save button.
+ *      dialog wrapper) exposes the project + worktree selectors, the
+ *      prompt, the trigger toggle, and the save button.
  *   3. Delete confirmation — the section renders an `AlertDialog` and
  *      only fires DELETE after the destructive action is confirmed
  *      (verified via the data-testid hooks).
@@ -32,12 +39,29 @@ import type { Schedule } from "../../api.ts";
  * without mounting the full stateful section.
  */
 
-const PROJECT_ID = "project-1";
+const NOOP = () => {};
+const NOOP_STR = (_v: string) => {};
+const NOOP_TRIGGER = (_v: "runAt" | "cron") => {};
+const NOOP_ASYNC = async () => [];
 
-const WORKTREES = [
+const PROJECT: Project = {
+  id: "project-1",
+  name: "Anita",
+  path: "/tmp/project-1",
+  createdAt: "2025-01-01T00:00:00.000Z",
+};
+
+const PROJECT_2: Project = {
+  id: "project-2",
+  name: "Germini",
+  path: "/tmp/project-2",
+  createdAt: "2025-01-01T00:00:00.000Z",
+};
+
+const WORKTREES: Worktree[] = [
   {
     id: "wt-1",
-    projectId: PROJECT_ID,
+    projectId: PROJECT.id,
     name: "main",
     path: "/tmp/wt-1",
     isMain: true,
@@ -45,22 +69,18 @@ const WORKTREES = [
   },
   {
     id: "wt-2",
-    projectId: PROJECT_ID,
+    projectId: PROJECT.id,
     name: "feature",
     path: "/tmp/wt-2",
     isMain: false,
     createdAt: "2025-01-01T00:00:00.000Z",
   },
-] as const;
-
-const NOOP = () => {};
-const NOOP_STR = (_v: string) => {};
-const NOOP_TRIGGER = (_v: "runAt" | "cron") => {};
+];
 
 function schedule(overrides: Partial<Schedule> = {}): Schedule {
   return {
     id: "sched-1",
-    projectId: PROJECT_ID,
+    projectId: PROJECT.id,
     worktreeId: "wt-1",
     prompt: "Run the daily digest",
     cron: "0 9 * * *",
@@ -78,14 +98,20 @@ function schedule(overrides: Partial<Schedule> = {}): Schedule {
   };
 }
 
+function withProject(
+  base: Schedule,
+  project: Project
+): ScheduleWithProject {
+  return { ...base, projectName: project.name };
+}
+
 function renderRow(
-  entry: Schedule,
-  options: { worktreeName?: string; toggling?: boolean } = {}
+  entry: ScheduleWithProject,
+  options: { toggling?: boolean } = {}
 ): string {
   return renderToStaticMarkup(
     <ScheduleRow
       schedule={entry}
-      worktreeName={options.worktreeName ?? entry.worktreeId}
       onToggle={NOOP}
       onDelete={NOOP}
       onViewRuns={NOOP}
@@ -98,21 +124,26 @@ function renderRow(
 // 1. List rendering — `ScheduleRow`
 // ---------------------------------------------------------------------------
 
-test("ScheduleRow surfaces the worktree name, trigger, and prompt preview for a cron schedule", () => {
-  const html = renderRow(schedule());
+test("ScheduleRow surfaces the project name, trigger, and prompt preview for a cron schedule", () => {
+  const html = renderRow(withProject(schedule(), PROJECT));
   assert.match(html, /data-testid="schedule-row-sched-1"/);
   assert.match(html, /Run the daily digest/);
+  // Project badge is the first thing in the row.
+  assert.match(html, />Anita</);
   // Trigger label is human-readable: cron expression.
   assert.match(html, /cron: 0 9 \* \* \*/);
   // Source badge.
   assert.match(html, />user</);
   // No "disabled" badge for an enabled row.
-  assert.doesNotMatch(html, /disabled</);
+  assert.doesNotMatch(html, />disabled</);
 });
 
 test("ScheduleRow renders the trigger type and runAt for a one-shot schedule", () => {
   const html = renderRow(
-    schedule({ id: "sched-2", cron: null, runAt: "2025-06-01T00:00:00.000Z" })
+    withProject(
+      schedule({ id: "sched-2", cron: null, runAt: "2025-06-01T00:00:00.000Z" }),
+      PROJECT
+    )
   );
   // The trigger badge switches to "runAt" for one-shots.
   assert.match(html, />runAt</);
@@ -121,37 +152,52 @@ test("ScheduleRow renders the trigger type and runAt for a one-shot schedule", (
 });
 
 test("ScheduleRow shows the disabled badge for a paused schedule", () => {
-  const html = renderRow(schedule({ enabled: false }));
+  const html = renderRow(withProject(schedule({ enabled: false }), PROJECT));
   assert.match(html, />disabled</);
 });
 
 test("ScheduleRow shows the last run timestamp when present", () => {
   const html = renderRow(
-    schedule({ lastRunAt: "2025-04-30T09:00:00.000Z" })
+    withProject(
+      schedule({ lastRunAt: "2025-04-30T09:00:00.000Z" }),
+      PROJECT
+    )
   );
   assert.match(html, /last: 2025-04-30 09:00 UTC/);
 });
 
 test("ScheduleRow surfaces lastError inline when the last fire failed", () => {
   const html = renderRow(
-    schedule({ lastError: "Invalid cron: foo bar baz" })
+    withProject(
+      schedule({ lastError: "Invalid cron: foo bar baz" }),
+      PROJECT
+    )
   );
   assert.match(html, /Invalid cron: foo bar baz/);
 });
 
 test("ScheduleRow exposes the enable toggle, runs link, and delete control", () => {
-  const html = renderRow(schedule());
+  const html = renderRow(withProject(schedule(), PROJECT));
   assert.match(html, /data-testid="schedule-toggle-sched-1"/);
   assert.match(html, /data-testid="schedule-runs-sched-1"/);
   assert.match(html, /data-testid="schedule-delete-sched-1"/);
 });
 
 test("ScheduleRow renders a spinner in place of the switch while toggling", () => {
-  const html = renderRow(schedule(), { toggling: true });
+  const html = renderRow(withProject(schedule(), PROJECT), { toggling: true });
   // The switch testid is gone while a toggle is in flight; the spinner
   // takes its place so users see that the action is pending.
   assert.doesNotMatch(html, /data-testid="schedule-toggle-sched-1"/);
   assert.match(html, /animate-spin/);
+});
+
+test("ScheduleRow shows the correct project badge per row in a cross-project list", () => {
+  const a = renderRow(withProject(schedule({ id: "sched-a" }), PROJECT));
+  const b = renderRow(withProject(schedule({ id: "sched-b" }), PROJECT_2));
+  assert.match(a, />Anita</);
+  assert.doesNotMatch(a, />Germini</);
+  assert.match(b, />Germini</);
+  assert.doesNotMatch(b, />Anita</);
 });
 
 // ---------------------------------------------------------------------------
@@ -160,8 +206,11 @@ test("ScheduleRow renders a spinner in place of the switch while toggling", () =
 
 function renderForm(
   options: {
-    worktrees?: typeof WORKTREES | unknown[];
+    projects?: Project[];
+    projectId?: string;
+    worktrees?: Worktree[];
     worktreeId?: string;
+    worktreesLoading?: boolean;
     prompt?: string;
     triggerType?: "runAt" | "cron";
     runAt?: string;
@@ -172,9 +221,13 @@ function renderForm(
 ): string {
   return renderToStaticMarkup(
     <CreateScheduleForm
-      worktrees={(options.worktrees ?? WORKTREES) as never}
-      worktreeId={options.worktreeId ?? "wt-1"}
+      projects={options.projects ?? [PROJECT, PROJECT_2]}
+      projectId={options.projectId ?? PROJECT.id}
+      onProjectChange={NOOP_STR}
+      worktrees={options.worktrees ?? WORKTREES}
+      worktreeId={options.worktreeId ?? WORKTREES[0].id}
       onWorktreeChange={NOOP_STR}
+      worktreesLoading={options.worktreesLoading ?? false}
       prompt={options.prompt ?? ""}
       onPromptChange={NOOP_STR}
       triggerType={options.triggerType ?? "runAt"}
@@ -190,9 +243,14 @@ function renderForm(
   );
 }
 
-test("CreateScheduleForm renders the worktree select populated from the project", () => {
+test("CreateScheduleForm renders the project and worktree selectors populated from props", () => {
   const html = renderForm();
+  assert.match(html, /data-testid="schedule-form-project"/);
   assert.match(html, /data-testid="schedule-form-worktree"/);
+  // The project select lists every project the caller passed in.
+  assert.match(html, /<option value="project-1"[^>]*>Anita<\/option>/);
+  assert.match(html, /<option value="project-2"[^>]*>Germini<\/option>/);
+  // The worktree select lists the worktrees for the selected project.
   assert.match(html, /<option value="wt-1"[^>]*>main<\/option>/);
   assert.match(html, /<option value="wt-2"[^>]*>feature<\/option>/);
 });
@@ -220,9 +278,14 @@ test("CreateScheduleForm renders the cron expression and timezone fields when tr
   assert.doesNotMatch(html, /data-testid="schedule-form-runAt"/);
 });
 
-test("CreateScheduleForm renders an empty-state message when no worktrees exist", () => {
-  const html = renderForm({ worktrees: [], worktreeId: "" });
-  assert.match(html, /No worktrees available/);
+test("CreateScheduleForm renders an empty-state message when no projects exist", () => {
+  const html = renderForm({ projects: [], projectId: "" });
+  assert.match(html, /No projects available/);
+});
+
+test("CreateScheduleForm renders a loading state on the worktree select", () => {
+  const html = renderForm({ worktreesLoading: true });
+  assert.match(html, /Loading worktrees/);
 });
 
 test("CreateScheduleForm surfaces server-side validation errors inline", () => {
@@ -239,12 +302,11 @@ test("SchedulesSection renders the new-schedule button and the section root in s
   // The list and runs drawer are populated async, so the static markup
   // shows the empty/loading state. What we *can* assert statically is the
   // always-present entry point and the test id hooks.
-  const html = renderToStaticMarkup(<SchedulesSection projectId={PROJECT_ID} />);
+  const html = renderToStaticMarkup(<SchedulesSection />);
   assert.match(html, /data-testid="schedule-new"/);
-  // Confirm the section does not throw when given no project id.
-  assert.doesNotThrow(() =>
-    renderToStaticMarkup(<SchedulesSection projectId="" />)
-  );
+  // Confirm the section does not require a project id (the cross-project
+  // view must work even before any project is selected).
+  assert.doesNotThrow(() => renderToStaticMarkup(<SchedulesSection />));
 });
 
 test("SchedulesSection mounts a delete confirm action via the AlertDialog flow", async () => {
@@ -280,8 +342,8 @@ test("SchedulesSection mounts a delete confirm action via the AlertDialog flow",
   // matching DELETE call.
   assert.match(
     source,
-    /deleteSchedule\(projectId, scheduleId\)/,
-    "confirm must invoke deleteSchedule",
+    /deleteSchedule\(schedule\.projectId, schedule\.id\)/,
+    "confirm must invoke deleteSchedule with the row's projectId and id",
   );
 });
 
@@ -290,11 +352,11 @@ test("SchedulesSection mounts a delete confirm action via the AlertDialog flow",
 // ---------------------------------------------------------------------------
 
 test("ScheduleRow renders a Switch whose data-slot is present in both enabled and disabled states", () => {
-  const enabledHtml = renderRow(schedule({ enabled: true }));
+  const enabledHtml = renderRow(withProject(schedule({ enabled: true }), PROJECT));
   assert.match(enabledHtml, /data-testid="schedule-toggle-sched-1"/);
   assert.match(enabledHtml, /data-slot="switch"/);
 
-  const disabledHtml = renderRow(schedule({ enabled: false }));
+  const disabledHtml = renderRow(withProject(schedule({ enabled: false }), PROJECT));
   // The same testid is present; the disabled state is reflected via
   // base-ui's data-checked / data-unchecked attributes and the
   // "disabled" badge.

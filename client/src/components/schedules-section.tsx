@@ -32,35 +32,46 @@ import {
 import {
   createSchedule,
   deleteSchedule,
+  fetchAllSchedules,
+  fetchProjects,
   fetchScheduleRuns,
-  fetchSchedules,
   fetchWorktrees,
   setScheduleEnabled,
+  type Project,
   type Schedule,
   type ScheduleInput,
   type ScheduleRun,
+  type ScheduleWithProject,
   type Worktree,
 } from "../api.ts";
 
 /*
- * Settings panel for the active project's scheduled sessions
- * (issue #303). The Schedules REST surface (server/routes/schedules.ts)
- * already mirrors the CLI, so this component is a thin client: list
- * schedules, create one, toggle enabled, delete (with confirm), and
- * peek at run history.
+ * Settings panel for scheduled sessions (issue #303).
  *
- * Editing an existing schedule's trigger is intentionally not exposed —
- * the server has no PUT route for it and the issue lists it as a
+ * Originally scoped to the active project, but the user-facing review
+ * wanted every project's schedules in one place — the section is the
+ * one place in the app where a "what's about to fire?" overview is
+ * useful, and forcing a project selection up front hides the rest.
+ * The server doesn't expose a cross-project list (the CLI is still
+ * the source of truth for the data model), so this component fans
+ * out client-side: list projects, then list each project's
+ * schedules, then merge.
+ *
+ * Each row carries its `projectId` and a denormalised `projectName`
+ * so the toggle / delete / runs handlers don't need a separate
+ * lookup, and the create form has its own project + worktree picker.
+ *
+ * Editing an existing schedule's trigger is intentionally not exposed
+ * — the server has no PUT route for it and the issue lists it as a
  * follow-up. The form below requires either a one-shot ISO timestamp
  * (`runAt`) or a cron expression plus timezone; the server validates
  * both and surfaces any failure as a 400, which we render inline.
  *
  * Session deep links from a `firedAt` run: the row exposes the
  * `sessionId` as a button that asks the parent to switch views to
- * that session via the `onOpenSession` prop. The view switch reuses
- * the same path `controller://` links take in the transcript, but
- * runs only carry the bare id (no envelope) so we forward a derived
- * target.
+ * that session via the `onOpenSession` prop. Runs only carry the
+ * bare id (no `controller://` envelope) so we forward a derived
+ * target including the worktree id.
  */
 
 const COMMON_TIMEZONES = [
@@ -85,7 +96,6 @@ const COMMON_TIMEZONES = [
 ];
 
 interface SchedulesSectionProps {
-  projectId: string;
   /**
    * Switch the main view to the given session. Used by the runs panel
    * to deep-link a fired schedule's resulting session. Optional — the
@@ -94,14 +104,17 @@ interface SchedulesSectionProps {
   onOpenSession?: (params: { sessionId: string; worktreeId?: string }) => void;
 }
 
-export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionProps) {
-  const [schedules, setSchedules] = useState<Schedule[]>([]);
-  const [worktrees, setWorktrees] = useState<Worktree[]>([]);
+export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
+  const [schedules, setSchedules] = useState<ScheduleWithProject[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [worktreesByProject, setWorktreesByProject] = useState<
+    Record<string, Worktree[]>
+  >({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [runsFor, setRunsFor] = useState<Schedule | null>(null);
+  const [deleting, setDeleting] = useState<ScheduleWithProject | null>(null);
+  const [runsFor, setRunsFor] = useState<ScheduleWithProject | null>(null);
   const [runs, setRuns] = useState<ScheduleRun[]>([]);
   const [runsLoading, setRunsLoading] = useState(false);
   const [runsError, setRunsError] = useState<string | null>(null);
@@ -110,31 +123,53 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [list, worktreeList] = await Promise.all([
-        fetchSchedules(projectId, true),
-        fetchWorktrees(projectId),
+      const [allSchedules, projectList] = await Promise.all([
+        fetchAllSchedules(true),
+        fetchProjects(),
       ]);
-      setSchedules(list);
-      setWorktrees(worktreeList);
+      setSchedules(allSchedules);
+      setProjects(projectList);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load schedules");
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, []);
 
   useEffect(() => {
     void load();
   }, [load]);
 
+  // Lazily load worktrees for a project on demand (the create dialog
+  // needs them; the list view doesn't). Cached per project id so a
+  // user picking the same project twice in a row doesn't re-fetch.
+  const worktreesFor = useCallback(
+    async (projectId: string): Promise<Worktree[]> => {
+      const cached = worktreesByProject[projectId];
+      if (cached) return cached;
+      const list = await fetchWorktrees(projectId);
+      setWorktreesByProject((current) => ({ ...current, [projectId]: list }));
+      return list;
+    },
+    [worktreesByProject]
+  );
+
   const handleToggle = useCallback(
-    async (schedule: Schedule, enabled: boolean) => {
+    async (schedule: ScheduleWithProject, enabled: boolean) => {
       setTogglingId(schedule.id);
       try {
-        const updated = await setScheduleEnabled(projectId, schedule.id, enabled);
+        const updated = await setScheduleEnabled(
+          schedule.projectId,
+          schedule.id,
+          enabled
+        );
         setSchedules((current) =>
-          current.map((entry) => (entry.id === updated.id ? updated : entry))
+          current.map((entry) =>
+            entry.id === updated.id
+              ? { ...updated, projectName: entry.projectName }
+              : entry
+          )
         );
       } catch (err) {
         setError(
@@ -144,15 +179,17 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
         setTogglingId(null);
       }
     },
-    [projectId]
+    []
   );
 
   const handleDelete = useCallback(
-    async (scheduleId: string) => {
+    async (schedule: ScheduleWithProject) => {
       try {
-        await deleteSchedule(projectId, scheduleId);
-        setSchedules((current) => current.filter((entry) => entry.id !== scheduleId));
-        if (runsFor?.id === scheduleId) {
+        await deleteSchedule(schedule.projectId, schedule.id);
+        setSchedules((current) =>
+          current.filter((entry) => entry.id !== schedule.id)
+        );
+        if (runsFor?.id === schedule.id) {
           setRunsFor(null);
           setRuns([]);
         }
@@ -162,35 +199,27 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
         );
       }
     },
-    [projectId, runsFor]
+    [runsFor]
   );
 
-  const openRuns = useCallback(
-    (schedule: Schedule) => {
-      setRunsFor(schedule);
-      setRuns([]);
-      setRunsError(null);
-      setRunsLoading(true);
-      void (async () => {
-        try {
-          const list = await fetchScheduleRuns(projectId, schedule.id);
-          setRuns(list);
-        } catch (err) {
-          setRunsError(
-            err instanceof Error ? err.message : "Failed to load runs"
-          );
-        } finally {
-          setRunsLoading(false);
-        }
-      })();
-    },
-    [projectId]
-  );
-
-  const worktreeName = useCallback(
-    (id: string) => worktrees.find((w) => w.id === id)?.name ?? id,
-    [worktrees]
-  );
+  const openRuns = useCallback((schedule: ScheduleWithProject) => {
+    setRunsFor(schedule);
+    setRuns([]);
+    setRunsError(null);
+    setRunsLoading(true);
+    void (async () => {
+      try {
+        const list = await fetchScheduleRuns(schedule.projectId, schedule.id);
+        setRuns(list);
+      } catch (err) {
+        setRunsError(
+          err instanceof Error ? err.message : "Failed to load runs"
+        );
+      } finally {
+        setRunsLoading(false);
+      }
+    })();
+  }, []);
 
   return (
     <div className="space-y-3">
@@ -225,11 +254,10 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
       <div className="space-y-2">
         {schedules.map((schedule) => (
           <ScheduleRow
-            key={schedule.id}
+            key={`${schedule.projectId}:${schedule.id}`}
             schedule={schedule}
-            worktreeName={worktreeName(schedule.worktreeId)}
             onToggle={(enabled) => void handleToggle(schedule, enabled)}
-            onDelete={() => setDeletingId(schedule.id)}
+            onDelete={() => setDeleting(schedule)}
             onViewRuns={() => openRuns(schedule)}
             toggling={togglingId === schedule.id}
           />
@@ -251,26 +279,33 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
       <CreateScheduleDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
-        projectId={projectId}
-        worktrees={worktrees}
+        projects={projects}
+        loadWorktrees={worktreesFor}
         onCreated={async (created) => {
           setCreateOpen(false);
-          setSchedules((current) => [created, ...current]);
+          // The cross-project list re-fetches from the server, so the
+          // new row's `projectName` is denormalised consistently.
+          await load();
+          void created;
         }}
       />
 
       <AlertDialog
-        open={deletingId !== null}
+        open={deleting !== null}
         onOpenChange={(open) => {
-          if (!open) setDeletingId(null);
+          if (!open) setDeleting(null);
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete this schedule?</AlertDialogTitle>
             <AlertDialogDescription>
-              The schedule and its run history will be removed. This cannot
-              be undone.
+              {deleting && (
+                <>
+                  Schedule on <span className="font-medium">{deleting.projectName}</span>{" "}
+                  and its run history will be removed. This cannot be undone.
+                </>
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -279,9 +314,9 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
               variant="destructive"
               data-testid="schedule-delete-confirm"
               onClick={() => {
-                const id = deletingId;
-                setDeletingId(null);
-                if (id) void handleDelete(id);
+                const target = deleting;
+                setDeleting(null);
+                if (target) void handleDelete(target);
               }}
             >
               Delete
@@ -308,7 +343,7 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
             </DialogTitle>
             {runsFor && (
               <DialogDescription>
-                {worktreeName(runsFor.worktreeId)} ·{" "}
+                {runsFor.projectName} ·{" "}
                 {runsFor.cron
                   ? `cron=${runsFor.cron} (${runsFor.timezone})`
                   : runsFor.runAt
@@ -393,8 +428,7 @@ export function SchedulesSection({ projectId, onOpenSession }: SchedulesSectionP
 }
 
 interface ScheduleRowProps {
-  schedule: Schedule;
-  worktreeName: string;
+  schedule: ScheduleWithProject;
   toggling: boolean;
   onToggle: (enabled: boolean) => void;
   onDelete: () => void;
@@ -403,7 +437,6 @@ interface ScheduleRowProps {
 
 export function ScheduleRow({
   schedule,
-  worktreeName,
   toggling,
   onToggle,
   onDelete,
@@ -421,10 +454,10 @@ export function ScheduleRow({
     >
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-medium truncate" title={worktreeName}>
-            {worktreeName}
-          </span>
-          <Badge variant="outline" className="text-[10px]">
+          <Badge variant="outline" className="text-[10px]" title="Project">
+            {schedule.projectName}
+          </Badge>
+          <Badge variant="secondary" className="text-[10px]">
             {schedule.cron ? "cron" : "runAt"}
           </Badge>
           <Badge variant="secondary" className="text-[10px]">
@@ -436,10 +469,11 @@ export function ScheduleRow({
             </Badge>
           )}
         </div>
-        <p className="mt-1 line-clamp-2 break-words text-xs text-muted-foreground">
+        <p className="mt-1 line-clamp-2 break-words text-xs text-foreground">
           {schedule.prompt}
         </p>
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
+          <span>worktree: {schedule.worktreeId.slice(0, 8)}</span>
           <span>{triggerLabel}</span>
           <span>next: {formatDate(schedule.nextRunAt)}</span>
           {schedule.lastRunAt && (
@@ -494,19 +528,22 @@ export function ScheduleRow({
 interface CreateScheduleDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  projectId: string;
-  worktrees: Worktree[];
-  onCreated: (schedule: Schedule) => void;
+  projects: Project[];
+  loadWorktrees: (projectId: string) => Promise<Worktree[]>;
+  onCreated: (schedule: Schedule) => void | Promise<void>;
 }
 
 export function CreateScheduleDialog({
   open,
   onOpenChange,
-  projectId,
-  worktrees,
+  projects,
+  loadWorktrees,
   onCreated,
 }: CreateScheduleDialogProps) {
+  const [projectId, setProjectId] = useState("");
   const [worktreeId, setWorktreeId] = useState("");
+  const [worktrees, setWorktrees] = useState<Worktree[]>([]);
+  const [worktreesLoading, setWorktreesLoading] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [triggerType, setTriggerType] = useState<"runAt" | "cron">("runAt");
   const [runAt, setRunAt] = useState("");
@@ -515,11 +552,13 @@ export function CreateScheduleDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Reset the form whenever the dialog is closed (so reopening gives a clean
-  // slate) and seed `worktreeId` once worktrees load.
+  // Reset the form on close, and seed the project picker the first time
+  // the dialog opens with a real project list available.
   useEffect(() => {
     if (!open) {
+      setProjectId("");
       setWorktreeId("");
+      setWorktrees([]);
       setPrompt("");
       setTriggerType("runAt");
       setRunAt("");
@@ -529,14 +568,50 @@ export function CreateScheduleDialog({
       setSaving(false);
       return;
     }
-    setWorktreeId((current) => current || worktrees[0]?.id || "");
-  }, [open, worktrees]);
+    setProjectId((current) => current || projects[0]?.id || "");
+  }, [open, projects]);
+
+  // Load the worktrees for the currently-selected project whenever it
+  // changes (or the dialog opens). Worktrees are cached in the parent's
+  // `loadWorktrees` so re-picking the same project is instant.
+  useEffect(() => {
+    if (!open || !projectId) {
+      setWorktrees([]);
+      return;
+    }
+    let cancelled = false;
+    setWorktreesLoading(true);
+    void (async () => {
+      try {
+        const list = await loadWorktrees(projectId);
+        if (!cancelled) {
+          setWorktrees(list);
+          // Reset the worktree selection if it doesn't belong to the
+          // newly-loaded project.
+          setWorktreeId((current) =>
+            list.some((w) => w.id === current) ? current : list[0]?.id ?? ""
+          );
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(
+            err instanceof Error ? err.message : "Failed to load worktrees"
+          );
+        }
+      } finally {
+        if (!cancelled) setWorktreesLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, projectId, loadWorktrees]);
 
   const canSave = useMemo(() => {
-    if (!worktreeId || !prompt.trim()) return false;
+    if (!projectId || !worktreeId || !prompt.trim()) return false;
     if (triggerType === "runAt") return runAt.trim().length > 0;
     return cron.trim().length > 0;
-  }, [worktreeId, prompt, triggerType, runAt, cron]);
+  }, [projectId, worktreeId, prompt, triggerType, runAt, cron]);
 
   const handleSubmit = async () => {
     setSaving(true);
@@ -558,7 +633,7 @@ export function CreateScheduleDialog({
         body.timezone = timezone;
       }
       const created = await createSchedule(projectId, body);
-      onCreated(created);
+      await onCreated(created);
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "Failed to create schedule"
@@ -579,9 +654,13 @@ export function CreateScheduleDialog({
           </DialogDescription>
         </DialogHeader>
         <CreateScheduleForm
+          projects={projects}
+          projectId={projectId}
+          onProjectChange={setProjectId}
           worktrees={worktrees}
           worktreeId={worktreeId}
           onWorktreeChange={setWorktreeId}
+          worktreesLoading={worktreesLoading}
           prompt={prompt}
           onPromptChange={setPrompt}
           triggerType={triggerType}
@@ -623,9 +702,13 @@ export function CreateScheduleDialog({
 }
 
 interface CreateScheduleFormProps {
+  projects: Project[];
+  projectId: string;
+  onProjectChange: (id: string) => void;
   worktrees: Worktree[];
   worktreeId: string;
   onWorktreeChange: (id: string) => void;
+  worktreesLoading: boolean;
   prompt: string;
   onPromptChange: (value: string) => void;
   triggerType: "runAt" | "cron";
@@ -646,9 +729,13 @@ interface CreateScheduleFormProps {
  * regression test can assert on the field-level test ids directly.
  */
 export function CreateScheduleForm({
+  projects,
+  projectId,
+  onProjectChange,
   worktrees,
   worktreeId,
   onWorktreeChange,
+  worktreesLoading,
   prompt,
   onPromptChange,
   triggerType,
@@ -665,6 +752,27 @@ export function CreateScheduleForm({
     <div className="space-y-3">
       <div>
         <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          Project
+        </label>
+        <select
+          value={projectId}
+          onChange={(e) => onProjectChange(e.target.value)}
+          data-testid="schedule-form-project"
+          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+          disabled={projects.length === 0}
+        >
+          {projects.length === 0 && (
+            <option value="">No projects available</option>
+          )}
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label className="mb-1 block text-xs font-medium text-muted-foreground">
           Worktree
         </label>
         <select
@@ -672,9 +780,10 @@ export function CreateScheduleForm({
           onChange={(e) => onWorktreeChange(e.target.value)}
           data-testid="schedule-form-worktree"
           className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-          disabled={worktrees.length === 0}
+          disabled={worktreesLoading || worktrees.length === 0}
         >
-          {worktrees.length === 0 && (
+          {worktreesLoading && <option value="">Loading worktrees…</option>}
+          {!worktreesLoading && worktrees.length === 0 && (
             <option value="">No worktrees available</option>
           )}
           {worktrees.map((w) => (
