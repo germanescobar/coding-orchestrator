@@ -10,10 +10,20 @@
  * VITE_API_PORT. The Vite dev server shares the same env (via
  * concurrently), so its /api proxy target lands on the same port
  * without any coordination step.
+ *
+ * If `.env.local` exists in the working directory, we load it first
+ * so the port preference written by `.coding-orchestrator/setup.sh`
+ * is honoured. Without this, calling `npm run dev` from a clean
+ * shell (no exported `VITE_API_PORT`) would fall back to the
+ * packaged-app default (3102) and the Vite proxy — which DOES read
+ * `.env.local` via Vite's loadEnv — would point at a different port
+ * and every request would 404 or hit the wrong backend.
  */
 
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 
 const DEV_API_BASE_PORT = 3102;
 const MAX_PORT_SEARCH_OFFSET = 100;
@@ -25,6 +35,41 @@ function parseEnvPort(name) {
   const parsed = Number(raw);
   return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
 }
+
+/*
+ * Minimal `.env.local` loader — `KEY=value` lines, comments with `#`,
+ * optional surrounding quotes. Vite has its own richer loader; we
+ * only need the port keys, so a hand-rolled parser is simpler than
+ * pulling in `dotenv`. Only used as a fallback when the parent
+ * shell didn't export the port (e.g. raw `npm run dev` from a fresh
+ * terminal).
+ */
+function loadEnvLocal() {
+  const path = resolvePath(process.cwd(), ".env.local");
+  if (!existsSync(path)) return;
+  const content = readFileSync(path, "utf8");
+  for (const rawLine of content.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    // Don't clobber values the parent shell already set — the
+    // run-script (`run.sh`) exports them on purpose, and that wins.
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadEnvLocal();
 
 function tryBindPort(port, timeoutMs = BIND_TIMEOUT_MS) {
   return new Promise((resolve) => {
