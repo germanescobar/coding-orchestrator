@@ -363,3 +363,110 @@ test("ScheduleRow renders a Switch whose data-slot is present in both enabled an
   assert.match(disabledHtml, /data-slot="switch"/);
   assert.match(disabledHtml, />disabled</);
 });
+
+// ---------------------------------------------------------------------------
+// 5. P2 review fixes (issue #303 cross-project hardening)
+// ---------------------------------------------------------------------------
+
+test("fetchAllSchedules contract exposes failed projects alongside the merged list", async () => {
+  // Issue #303 P2 review: per-project failures must not be silently
+  // dropped. Verify the API surface carries a `failedProjectIds`
+  // array so the section can render a partial-load banner.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const source = readFileSync(
+    fileURLToPath(new URL("../../api.ts", import.meta.url)),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /export interface AllSchedulesResult[\s\S]*failedProjectIds: string\[\]/,
+    "AllSchedulesResult must carry failedProjectIds",
+  );
+  // The new return type and the catch arm that collects failures.
+  assert.match(
+    source,
+    /failedProjectIds\.push\(entry\.project\.id\)/,
+    "fetchAllSchedules must collect per-project failures",
+  );
+});
+
+test("SchedulesSection renders a partial-load banner when fetchAllSchedules reports failed projects", async () => {
+  // We can't drive a fetch via `renderToStaticMarkup`, but the
+  // banner is rendered when `failedProjectNames` is non-empty. The
+  // easiest way to exercise that without a real DOM is to read the
+  // section source and confirm the rendering branch and the
+  // testid hook are still in place — same approach we use for the
+  // delete confirm action.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const source = readFileSync(
+    fileURLToPath(new URL("../schedules-section.tsx", import.meta.url)),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /data-testid="schedule-partial-error"/,
+    "partial-load banner testid must remain stable",
+  );
+  assert.match(
+    source,
+    /failedProjectNames\.length > 0/,
+    "partial-load banner must be conditionally rendered",
+  );
+});
+
+test("Run-link click carries the row's projectId so deep-links land in the right project", async () => {
+  // P2 review on #303: in the cross-project view, opening a run
+  // for a non-active project was navigating to the wrong session
+  // because the click handler didn't include projectId in the
+  // payload. The onClick is inside the Dialog body so we can't
+  // observe it in static markup, but the source contract is the
+  // public hook — keep it pinned.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const source = readFileSync(
+    fileURLToPath(new URL("../schedules-section.tsx", import.meta.url)),
+    "utf8",
+  );
+  // Both halves of the fix must remain in place: the onClick must
+  // pass `projectId: runsFor.projectId`, and the App handler must
+  // prefer `params.projectId` over `activeProjectId`.
+  assert.match(
+    source,
+    /projectId: runsFor\.projectId/,
+    "run onClick must include projectId",
+  );
+  const appSource = readFileSync(
+    fileURLToPath(new URL("../../App.tsx", import.meta.url)),
+    "utf8",
+  );
+  assert.match(
+    appSource,
+    /projectId = params\.projectId \?\? activeProjectId/,
+    "App handler must prefer payload projectId over activeProjectId",
+  );
+});
+
+test("openRuns drops stale responses via a monotonic request id", async () => {
+  // P3 review on #303: if the user clicks Runs for A and then B
+  // before A's request resolves, A's late response would otherwise
+  // overwrite B's runs dialog. The fix bumps a ref on every call
+  // and the async fetcher bails out if a newer request has started.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const source = readFileSync(
+    fileURLToPath(new URL("../schedules-section.tsx", import.meta.url)),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /runsRequestIdRef\.current = requestId/,
+    "openRuns must bump the request id",
+  );
+  assert.match(
+    source,
+    /if \(runsRequestIdRef\.current !== requestId\) return/,
+    "async fetcher must bail out on stale responses",
+  );
+});

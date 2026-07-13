@@ -1750,6 +1750,20 @@ export interface ScheduleWithProject extends Schedule {
   projectName: string;
 }
 
+/**
+ * Result of a cross-project schedule fetch. `schedules` is what the
+ * UI renders; `failedProjectIds` lists projects whose storage we
+ * couldn't read this round, so the section can surface a non-fatal
+ * "some projects failed to load" banner instead of silently
+ * dropping them. Issue #303 P2 review: swallowing per-project
+ * failures made the UI show "No schedules yet" while active
+ * schedules were still around.
+ */
+export interface AllSchedulesResult {
+  schedules: ScheduleWithProject[];
+  failedProjectIds: string[];
+}
+
 function schedulePath(projectId: string, scheduleId?: string): string {
   const base = `${BASE}/projects/${projectId}/schedules`;
   return scheduleId ? `${base}/${scheduleId}` : base;
@@ -1774,27 +1788,47 @@ export async function fetchSchedules(
  * by design (issue #303 — the CLI is the source of truth for the data
  * model), so this is a client-side fan-out. It's the same shape every
  * per-project page already uses, just collected in one place.
+ *
+ * Per-project failures are reported back via `failedProjectIds`
+ * rather than swallowed: in a corrupt-store or transient 500 case,
+ * the user should see "X projects failed to load" rather than an
+ * incomplete list that looks healthy. Issue #303 P2 review.
  */
 export async function fetchAllSchedules(
   includeDisabled = true
-): Promise<ScheduleWithProject[]> {
+): Promise<AllSchedulesResult> {
   const projects = await fetchProjects();
-  const results = await Promise.all(
+  const settled = await Promise.all(
     projects.map(async (project) => {
       try {
         const schedules = await fetchSchedules(project.id, includeDisabled);
-        return schedules.map((schedule) => ({
-          ...schedule,
-          projectName: project.name,
-        }));
-      } catch {
-        // One project's schedules failing shouldn't blank the whole
-        // view — log the failure server-side and skip it.
-        return [] as ScheduleWithProject[];
+        return {
+          ok: true as const,
+          project,
+          schedules: schedules.map((schedule) => ({
+            ...schedule,
+            projectName: project.name,
+          })),
+        };
+      } catch (error) {
+        return {
+          ok: false as const,
+          project,
+          error: error instanceof Error ? error.message : String(error),
+        };
       }
     }),
   );
-  return results.flat();
+  const schedules: ScheduleWithProject[] = [];
+  const failedProjectIds: string[] = [];
+  for (const entry of settled) {
+    if (entry.ok) {
+      schedules.push(...entry.schedules);
+    } else {
+      failedProjectIds.push(entry.project.id);
+    }
+  }
+  return { schedules, failedProjectIds };
 }
 
 export async function createSchedule(

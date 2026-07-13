@@ -69,9 +69,16 @@ interface SettingsPageProps {
   /**
    * Forwarded to the Schedules section so a fired schedule's `sessionId` can
    * navigate the main view to that session. Mirrors the `controller://`
-   * deep-link path the transcript already uses.
+   * deep-link path the transcript already uses. `projectId` is required by
+   * the cross-project Schedules section to land in the right project; the
+   * signature makes it optional so other (single-project) surfaces can opt
+   * in without a breaking change.
    */
-  onOpenSession?: (params: { sessionId: string; worktreeId?: string }) => void;
+  onOpenSession?: (params: {
+    sessionId: string;
+    worktreeId?: string;
+    projectId?: string;
+  }) => void;
 }
 
 /*

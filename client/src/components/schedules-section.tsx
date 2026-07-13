@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -100,8 +100,18 @@ interface SchedulesSectionProps {
    * Switch the main view to the given session. Used by the runs panel
    * to deep-link a fired schedule's resulting session. Optional — the
    * section still works without it, the link just becomes a no-op.
+   *
+   * `projectId` is required to deep-link correctly: the Schedules
+   * section is cross-project, so the run we clicked may belong to
+   * any project — not necessarily the active one. Callers should
+   * always pass it; it's optional only for backwards compatibility
+   * with future single-project sections. (P2 review on #303.)
    */
-  onOpenSession?: (params: { sessionId: string; worktreeId?: string }) => void;
+  onOpenSession?: (params: {
+    sessionId: string;
+    worktreeId?: string;
+    projectId?: string;
+  }) => void;
 }
 
 export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
@@ -112,6 +122,10 @@ export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
   >({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Names of projects whose /schedules fetch failed this round.
+  // Surfaces a non-fatal banner so the user can see *something*
+  // failed even when the list isn't empty (P2 review on #303).
+  const [failedProjectNames, setFailedProjectNames] = useState<string[]>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [deleting, setDeleting] = useState<ScheduleWithProject | null>(null);
   const [runsFor, setRunsFor] = useState<ScheduleWithProject | null>(null);
@@ -119,6 +133,11 @@ export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
   const [runsLoading, setRunsLoading] = useState(false);
   const [runsError, setRunsError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  // Monotonic id for the most recent Runs request. The async fetcher
+  // captures its own id and bails out of the setState calls if a
+  // newer request has started (P3 review on #303 — slow A response
+  // would otherwise clobber B's dialog).
+  const runsRequestIdRef = useRef(0);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -127,8 +146,13 @@ export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
         fetchAllSchedules(true),
         fetchProjects(),
       ]);
-      setSchedules(allSchedules);
+      setSchedules(allSchedules.schedules);
       setProjects(projectList);
+      setFailedProjectNames(
+        allSchedules.failedProjectIds.map(
+          (id) => projectList.find((p) => p.id === id)?.name ?? id
+        ),
+      );
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load schedules");
@@ -207,16 +231,25 @@ export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
     setRuns([]);
     setRunsError(null);
     setRunsLoading(true);
+    // Bump the request id so a slow earlier response can't overwrite
+    // a newer one. The IIFE captures its own id and only writes if it
+    // still matches. (P3 review on #303.)
+    const requestId = runsRequestIdRef.current + 1;
+    runsRequestIdRef.current = requestId;
     void (async () => {
       try {
         const list = await fetchScheduleRuns(schedule.projectId, schedule.id);
+        if (runsRequestIdRef.current !== requestId) return;
         setRuns(list);
       } catch (err) {
+        if (runsRequestIdRef.current !== requestId) return;
         setRunsError(
           err instanceof Error ? err.message : "Failed to load runs"
         );
       } finally {
-        setRunsLoading(false);
+        if (runsRequestIdRef.current === requestId) {
+          setRunsLoading(false);
+        }
       }
     })();
   }, []);
@@ -248,6 +281,26 @@ export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
           data-testid="schedule-error"
         >
           {error}
+        </div>
+      )}
+
+      {failedProjectNames.length > 0 && (
+        <div
+          className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+          data-testid="schedule-partial-error"
+        >
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div>
+            <div className="font-medium">
+              Couldn&apos;t load schedules from{" "}
+              {failedProjectNames.length === 1
+                ? "1 project"
+                : `${failedProjectNames.length} projects`}
+            </div>
+            <div className="mt-0.5 break-words text-amber-200/80">
+              {failedProjectNames.join(", ")}
+            </div>
+          </div>
         </div>
       )}
 
@@ -391,6 +444,7 @@ export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
                           onOpenSession({
                             sessionId: run.sessionId,
                             worktreeId: runsFor.worktreeId,
+                            projectId: runsFor.projectId,
                           });
                         }}
                         title={

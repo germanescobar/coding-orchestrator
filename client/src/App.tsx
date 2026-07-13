@@ -359,16 +359,22 @@ function AppBody() {
   }, []);
 
   /**
-   * Open a session referenced by a schedule run. The Schedules section only
-   * carries the bare `sessionId` (no `controller://` envelope), so we
-   * resolve the project from `activeProjectId` and pass through the
-   * `worktreeId` from the schedule record. Mirrors `handleOpenConversation`
-   * but tolerates a missing `worktreeId`.
+   * Open a session referenced by a schedule run. The Schedules section
+   * passes the run's `projectId` (the cross-project view can show schedules
+   * from any project, not just the active one — issue #303 P2 review), and
+   * we prefer that over `activeProjectId` so deep-links land in the right
+   * project. `activeProjectId` is the fallback for callers that don't pass
+   * it. Mirrors `handleOpenConversation` but tolerates a missing `worktreeId`.
    */
   const handleOpenSessionFromSchedule = useCallback(
-    (params: { sessionId: string; worktreeId?: string }) => {
-      if (!activeProjectId) return;
-      handleSelectSession(activeProjectId, params.sessionId, params.worktreeId);
+    (params: {
+      sessionId: string;
+      worktreeId?: string;
+      projectId?: string;
+    }) => {
+      const projectId = params.projectId ?? activeProjectId;
+      if (!projectId) return;
+      handleSelectSession(projectId, params.sessionId, params.worktreeId);
     },
     [activeProjectId]
   );
