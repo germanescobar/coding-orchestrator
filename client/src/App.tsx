@@ -358,6 +358,27 @@ function AppBody() {
     handleSelectSession(target.projectId, target.sessionId, target.worktreeId);
   }, []);
 
+  /**
+   * Open a session referenced by a schedule run. The Schedules section
+   * passes the run's `projectId` (the cross-project view can show schedules
+   * from any project, not just the active one — issue #303 P2 review), and
+   * we prefer that over `activeProjectId` so deep-links land in the right
+   * project. `activeProjectId` is the fallback for callers that don't pass
+   * it. Mirrors `handleOpenConversation` but tolerates a missing `worktreeId`.
+   */
+  const handleOpenSessionFromSchedule = useCallback(
+    (params: {
+      sessionId: string;
+      worktreeId?: string;
+      projectId?: string;
+    }) => {
+      const projectId = params.projectId ?? activeProjectId;
+      if (!projectId) return;
+      handleSelectSession(projectId, params.sessionId, params.worktreeId);
+    },
+    [activeProjectId]
+  );
+
   const handleNewThread = (projectId: string, worktreeId?: string) => {
     setActiveProjectId(projectId);
     setView({ page: "session", projectId, worktreeId });
@@ -799,6 +820,8 @@ function AppBody() {
             section={activeView.section}
             onSectionChange={(section) => setView({ page: "settings", section })}
             onClose={() => setView(preSettingsViewRef.current)}
+            projectId={activeProjectId ?? undefined}
+            onOpenSession={handleOpenSessionFromSchedule}
           />
         )}
         </AppErrorBoundary>

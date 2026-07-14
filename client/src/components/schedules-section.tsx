@@ -1,0 +1,964 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  Check,
+  Clock,
+  Loader2,
+  Plus,
+  Trash2,
+  X,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+  AlertDialogAction,
+} from "@/components/ui/alert-dialog";
+import {
+  createSchedule,
+  deleteSchedule,
+  fetchAllSchedules,
+  fetchProjects,
+  fetchScheduleRuns,
+  fetchWorktrees,
+  setScheduleEnabled,
+  type Project,
+  type Schedule,
+  type ScheduleInput,
+  type ScheduleRun,
+  type ScheduleWithProject,
+  type Worktree,
+} from "../api.ts";
+
+/*
+ * Settings panel for scheduled sessions (issue #303).
+ *
+ * Originally scoped to the active project, but the user-facing review
+ * wanted every project's schedules in one place — the section is the
+ * one place in the app where a "what's about to fire?" overview is
+ * useful, and forcing a project selection up front hides the rest.
+ * The server doesn't expose a cross-project list (the CLI is still
+ * the source of truth for the data model), so this component fans
+ * out client-side: list projects, then list each project's
+ * schedules, then merge.
+ *
+ * Each row carries its `projectId` and a denormalised `projectName`
+ * so the toggle / delete / runs handlers don't need a separate
+ * lookup, and the create form has its own project + worktree picker.
+ *
+ * Editing an existing schedule's trigger is intentionally not exposed
+ * — the server has no PUT route for it and the issue lists it as a
+ * follow-up. The form below requires either a one-shot ISO timestamp
+ * (`runAt`) or a cron expression plus timezone; the server validates
+ * both and surfaces any failure as a 400, which we render inline.
+ *
+ * Session deep links from a `firedAt` run: the row exposes the
+ * `sessionId` as a button that asks the parent to switch views to
+ * that session via the `onOpenSession` prop. Runs only carry the
+ * bare id (no `controller://` envelope) so we forward a derived
+ * target including the worktree id.
+ */
+
+const COMMON_TIMEZONES = [
+  "UTC",
+  "America/Los_Angeles",
+  "America/Denver",
+  "America/Chicago",
+  "America/New_York",
+  "America/Sao_Paulo",
+  "Europe/London",
+  "Europe/Berlin",
+  "Europe/Paris",
+  "Europe/Madrid",
+  "Africa/Johannesburg",
+  "Asia/Dubai",
+  "Asia/Kolkata",
+  "Asia/Singapore",
+  "Asia/Tokyo",
+  "Asia/Seoul",
+  "Australia/Sydney",
+  "Pacific/Auckland",
+];
+
+interface SchedulesSectionProps {
+  /**
+   * Switch the main view to the given session. Used by the runs panel
+   * to deep-link a fired schedule's resulting session. Optional — the
+   * section still works without it, the link just becomes a no-op.
+   *
+   * `projectId` is required to deep-link correctly: the Schedules
+   * section is cross-project, so the run we clicked may belong to
+   * any project — not necessarily the active one. Callers should
+   * always pass it; it's optional only for backwards compatibility
+   * with future single-project sections. (P2 review on #303.)
+   */
+  onOpenSession?: (params: {
+    sessionId: string;
+    worktreeId?: string;
+    projectId?: string;
+  }) => void;
+}
+
+export function SchedulesSection({ onOpenSession }: SchedulesSectionProps) {
+  const [schedules, setSchedules] = useState<ScheduleWithProject[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [worktreesByProject, setWorktreesByProject] = useState<
+    Record<string, Worktree[]>
+  >({});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Names of projects whose /schedules fetch failed this round.
+  // Surfaces a non-fatal banner so the user can see *something*
+  // failed even when the list isn't empty (P2 review on #303).
+  const [failedProjectNames, setFailedProjectNames] = useState<string[]>([]);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [deleting, setDeleting] = useState<ScheduleWithProject | null>(null);
+  const [runsFor, setRunsFor] = useState<ScheduleWithProject | null>(null);
+  const [runs, setRuns] = useState<ScheduleRun[]>([]);
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
+  // Monotonic id for the most recent Runs request. The async fetcher
+  // captures its own id and bails out of the setState calls if a
+  // newer request has started (P3 review on #303 — slow A response
+  // would otherwise clobber B's dialog).
+  const runsRequestIdRef = useRef(0);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [allSchedules, projectList] = await Promise.all([
+        fetchAllSchedules(true),
+        fetchProjects(),
+      ]);
+      setSchedules(allSchedules.schedules);
+      setProjects(projectList);
+      setFailedProjectNames(
+        allSchedules.failedProjectIds.map(
+          (id) => projectList.find((p) => p.id === id)?.name ?? id
+        ),
+      );
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load schedules");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Lazily load worktrees for a project on demand (the create dialog
+  // needs them; the list view doesn't). Cached per project id so a
+  // user picking the same project twice in a row doesn't re-fetch.
+  const worktreesFor = useCallback(
+    async (projectId: string): Promise<Worktree[]> => {
+      const cached = worktreesByProject[projectId];
+      if (cached) return cached;
+      const list = await fetchWorktrees(projectId);
+      setWorktreesByProject((current) => ({ ...current, [projectId]: list }));
+      return list;
+    },
+    [worktreesByProject]
+  );
+
+  const handleToggle = useCallback(
+    async (schedule: ScheduleWithProject, enabled: boolean) => {
+      setTogglingId(schedule.id);
+      try {
+        const updated = await setScheduleEnabled(
+          schedule.projectId,
+          schedule.id,
+          enabled
+        );
+        setSchedules((current) =>
+          current.map((entry) =>
+            entry.id === updated.id
+              ? { ...updated, projectName: entry.projectName }
+              : entry
+          )
+        );
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : "Failed to update schedule"
+        );
+      } finally {
+        setTogglingId(null);
+      }
+    },
+    []
+  );
+
+  const handleDelete = useCallback(
+    async (schedule: ScheduleWithProject) => {
+      try {
+        await deleteSchedule(schedule.projectId, schedule.id);
+        setSchedules((current) =>
+          current.filter((entry) => entry.id !== schedule.id)
+        );
+        if (runsFor?.id === schedule.id) {
+          setRunsFor(null);
+          setRuns([]);
+        }
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : "Failed to delete schedule"
+        );
+      }
+    },
+    [runsFor]
+  );
+
+  const openRuns = useCallback((schedule: ScheduleWithProject) => {
+    setRunsFor(schedule);
+    setRuns([]);
+    setRunsError(null);
+    setRunsLoading(true);
+    // Bump the request id so a slow earlier response can't overwrite
+    // a newer one. The IIFE captures its own id and only writes if it
+    // still matches. (P3 review on #303.)
+    const requestId = runsRequestIdRef.current + 1;
+    runsRequestIdRef.current = requestId;
+    void (async () => {
+      try {
+        const list = await fetchScheduleRuns(schedule.projectId, schedule.id);
+        if (runsRequestIdRef.current !== requestId) return;
+        setRuns(list);
+      } catch (err) {
+        if (runsRequestIdRef.current !== requestId) return;
+        setRunsError(
+          err instanceof Error ? err.message : "Failed to load runs"
+        );
+      } finally {
+        if (runsRequestIdRef.current === requestId) {
+          setRunsLoading(false);
+        }
+      }
+    })();
+  }, []);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-end">
+        <Button
+          size="sm"
+          onClick={() => setCreateOpen(true)}
+          data-testid="schedule-new"
+          className="gap-1"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          New schedule
+        </Button>
+      </div>
+
+      {loading && schedules.length === 0 && (
+        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading schedules...
+        </div>
+      )}
+
+      {error && (
+        <div
+          className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          data-testid="schedule-error"
+        >
+          {error}
+        </div>
+      )}
+
+      {failedProjectNames.length > 0 && (
+        <div
+          className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+          data-testid="schedule-partial-error"
+        >
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div>
+            <div className="font-medium">
+              Couldn&apos;t load schedules from{" "}
+              {failedProjectNames.length === 1
+                ? "1 project"
+                : `${failedProjectNames.length} projects`}
+            </div>
+            <div className="mt-0.5 break-words text-amber-200/80">
+              {failedProjectNames.join(", ")}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {schedules.map((schedule) => (
+          <ScheduleRow
+            key={`${schedule.projectId}:${schedule.id}`}
+            schedule={schedule}
+            onToggle={(enabled) => void handleToggle(schedule, enabled)}
+            onDelete={() => setDeleting(schedule)}
+            onViewRuns={() => openRuns(schedule)}
+            toggling={togglingId === schedule.id}
+          />
+        ))}
+
+        {!loading && schedules.length === 0 && (
+          <div
+            className="rounded-lg border border-dashed border-border p-6 text-center"
+            data-testid="schedule-empty"
+          >
+            <p className="text-sm text-muted-foreground">
+              No schedules yet. Create one to start a session later or on a
+              recurring basis.
+            </p>
+          </div>
+        )}
+      </div>
+
+      <CreateScheduleDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        projects={projects}
+        loadWorktrees={worktreesFor}
+        onCreated={async (created) => {
+          setCreateOpen(false);
+          // The cross-project list re-fetches from the server, so the
+          // new row's `projectName` is denormalised consistently.
+          await load();
+          void created;
+        }}
+      />
+
+      <AlertDialog
+        open={deleting !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleting(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this schedule?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleting && (
+                <>
+                  Schedule on <span className="font-medium">{deleting.projectName}</span>{" "}
+                  and its run history will be removed. This cannot be undone.
+                </>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              data-testid="schedule-delete-confirm"
+              onClick={() => {
+                const target = deleting;
+                setDeleting(null);
+                if (target) void handleDelete(target);
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <Dialog
+        open={runsFor !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setRunsFor(null);
+            setRuns([]);
+            setRunsError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Clock className="h-4 w-4" />
+              Runs
+            </DialogTitle>
+            {runsFor && (
+              <DialogDescription>
+                {runsFor.projectName} ·{" "}
+                {runsFor.cron
+                  ? `cron=${runsFor.cron} (${runsFor.timezone})`
+                  : runsFor.runAt
+                    ? `one-shot at ${runsFor.runAt}`
+                    : ""}
+              </DialogDescription>
+            )}
+          </DialogHeader>
+          {runsLoading ? (
+            <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading runs...
+            </div>
+          ) : runsError ? (
+            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {runsError}
+            </div>
+          ) : runs.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-border p-4 text-center text-sm text-muted-foreground">
+              No runs yet.
+            </div>
+          ) : (
+            <div className="max-h-80 overflow-y-auto rounded-md border border-border divide-y divide-border">
+              {runs.map((run, idx) => (
+                <div
+                  key={`${run.firedAt}-${idx}`}
+                  className="flex flex-col gap-1 px-3 py-2 text-xs"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-foreground">
+                      {formatDate(run.firedAt)}
+                    </span>
+                    {run.error ? (
+                      <Badge variant="destructive" className="text-[10px]">
+                        error
+                      </Badge>
+                    ) : run.sessionId ? (
+                      <button
+                        type="button"
+                        className="rounded font-mono text-primary hover:underline disabled:no-underline disabled:opacity-50"
+                        data-testid={`schedule-run-session-${idx}`}
+                        disabled={!onOpenSession}
+                        onClick={() => {
+                          if (!onOpenSession || !run.sessionId || !runsFor) return;
+                          onOpenSession({
+                            sessionId: run.sessionId,
+                            worktreeId: runsFor.worktreeId,
+                            projectId: runsFor.projectId,
+                          });
+                        }}
+                        title={
+                          onOpenSession
+                            ? "Open this session"
+                            : "Session deep-link unavailable"
+                        }
+                      >
+                        {run.sessionId.slice(0, 8)}
+                      </button>
+                    ) : (
+                      <Badge variant="outline" className="text-[10px]">
+                        no session
+                      </Badge>
+                    )}
+                  </div>
+                  {run.error && (
+                    <div className="break-words text-destructive">
+                      {run.error}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRunsFor(null)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+interface ScheduleRowProps {
+  schedule: ScheduleWithProject;
+  toggling: boolean;
+  onToggle: (enabled: boolean) => void;
+  onDelete: () => void;
+  onViewRuns: () => void;
+}
+
+export function ScheduleRow({
+  schedule,
+  toggling,
+  onToggle,
+  onDelete,
+  onViewRuns,
+}: ScheduleRowProps) {
+  const triggerLabel = schedule.cron
+    ? `cron: ${schedule.cron}`
+    : schedule.runAt
+      ? `one-shot: ${formatDate(schedule.runAt)}`
+      : "no trigger";
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-lg border border-border p-3 md:flex-row md:items-start md:gap-3"
+      data-testid={`schedule-row-${schedule.id}`}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline" className="text-[10px]" title="Project">
+            {schedule.projectName}
+          </Badge>
+          <Badge variant="secondary" className="text-[10px]">
+            {schedule.cron ? "cron" : "runAt"}
+          </Badge>
+          <Badge variant="secondary" className="text-[10px]">
+            {schedule.source}
+          </Badge>
+          {!schedule.enabled && (
+            <Badge variant="destructive" className="text-[10px]">
+              disabled
+            </Badge>
+          )}
+        </div>
+        <p className="mt-1 line-clamp-2 break-words text-xs text-foreground">
+          {schedule.prompt}
+        </p>
+        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
+          <span>worktree: {schedule.worktreeId.slice(0, 8)}</span>
+          <span>{triggerLabel}</span>
+          <span>next: {formatDate(schedule.nextRunAt)}</span>
+          {schedule.lastRunAt && (
+            <span>last: {formatDate(schedule.lastRunAt)}</span>
+          )}
+        </div>
+        {schedule.lastError && (
+          <div className="mt-1 flex items-start gap-1 rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+            <span className="break-words">{schedule.lastError}</span>
+          </div>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <Button
+          size="sm"
+          variant="ghost"
+          data-testid={`schedule-runs-${schedule.id}`}
+          onClick={onViewRuns}
+          className="gap-1 text-xs"
+        >
+          <Clock className="h-3.5 w-3.5" />
+          Runs
+        </Button>
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="sr-only">Enabled</span>
+          {toggling ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+          ) : (
+            <Switch
+              checked={schedule.enabled}
+              onCheckedChange={(checked) => onToggle(checked)}
+              data-testid={`schedule-toggle-${schedule.id}`}
+            />
+          )}
+        </label>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          data-testid={`schedule-delete-${schedule.id}`}
+          onClick={onDelete}
+          className="text-muted-foreground hover:text-destructive"
+          title="Delete schedule"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+interface CreateScheduleDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  projects: Project[];
+  loadWorktrees: (projectId: string) => Promise<Worktree[]>;
+  onCreated: (schedule: Schedule) => void | Promise<void>;
+}
+
+export function CreateScheduleDialog({
+  open,
+  onOpenChange,
+  projects,
+  loadWorktrees,
+  onCreated,
+}: CreateScheduleDialogProps) {
+  const [projectId, setProjectId] = useState("");
+  const [worktreeId, setWorktreeId] = useState("");
+  const [worktrees, setWorktrees] = useState<Worktree[]>([]);
+  const [worktreesLoading, setWorktreesLoading] = useState(false);
+  const [prompt, setPrompt] = useState("");
+  const [triggerType, setTriggerType] = useState<"runAt" | "cron">("runAt");
+  const [runAt, setRunAt] = useState("");
+  const [cron, setCron] = useState("");
+  const [timezone, setTimezone] = useState("UTC");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset the form on close, and seed the project picker the first time
+  // the dialog opens with a real project list available.
+  useEffect(() => {
+    if (!open) {
+      setProjectId("");
+      setWorktreeId("");
+      setWorktrees([]);
+      setPrompt("");
+      setTriggerType("runAt");
+      setRunAt("");
+      setCron("");
+      setTimezone("UTC");
+      setError(null);
+      setSaving(false);
+      return;
+    }
+    setProjectId((current) => current || projects[0]?.id || "");
+  }, [open, projects]);
+
+  // Load the worktrees for the currently-selected project whenever it
+  // changes (or the dialog opens). Worktrees are cached in the parent's
+  // `loadWorktrees` so re-picking the same project is instant.
+  useEffect(() => {
+    if (!open || !projectId) {
+      setWorktrees([]);
+      return;
+    }
+    let cancelled = false;
+    setWorktreesLoading(true);
+    void (async () => {
+      try {
+        const list = await loadWorktrees(projectId);
+        if (!cancelled) {
+          setWorktrees(list);
+          // Reset the worktree selection if it doesn't belong to the
+          // newly-loaded project.
+          setWorktreeId((current) =>
+            list.some((w) => w.id === current) ? current : list[0]?.id ?? ""
+          );
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(
+            err instanceof Error ? err.message : "Failed to load worktrees"
+          );
+        }
+      } finally {
+        if (!cancelled) setWorktreesLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, projectId, loadWorktrees]);
+
+  const canSave = useMemo(() => {
+    if (!projectId || !worktreeId || !prompt.trim()) return false;
+    if (triggerType === "runAt") return runAt.trim().length > 0;
+    return cron.trim().length > 0;
+  }, [projectId, worktreeId, prompt, triggerType, runAt, cron]);
+
+  const handleSubmit = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const body: ScheduleInput = {
+        worktreeId,
+        prompt: prompt.trim(),
+        createdBy: "ui",
+      };
+      if (triggerType === "runAt") {
+        const parsed = new Date(runAt);
+        if (Number.isNaN(parsed.getTime())) {
+          throw new Error("Invalid date — pick a valid timestamp");
+        }
+        body.runAt = parsed.toISOString();
+      } else {
+        body.cron = cron.trim();
+        body.timezone = timezone;
+      }
+      const created = await createSchedule(projectId, body);
+      await onCreated(created);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to create schedule"
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>New schedule</DialogTitle>
+          <DialogDescription>
+            Start a session on a worktree at a specific time (one-shot) or
+            on a recurring cron expression.
+          </DialogDescription>
+        </DialogHeader>
+        <CreateScheduleForm
+          projects={projects}
+          projectId={projectId}
+          onProjectChange={setProjectId}
+          worktrees={worktrees}
+          worktreeId={worktreeId}
+          onWorktreeChange={setWorktreeId}
+          worktreesLoading={worktreesLoading}
+          prompt={prompt}
+          onPromptChange={setPrompt}
+          triggerType={triggerType}
+          onTriggerTypeChange={setTriggerType}
+          runAt={runAt}
+          onRunAtChange={setRunAt}
+          cron={cron}
+          onCronChange={setCron}
+          timezone={timezone}
+          onTimezoneChange={setTimezone}
+          error={error}
+        />
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={saving}
+          >
+            <X className="h-3.5 w-3.5" />
+            Cancel
+          </Button>
+          <Button
+            onClick={() => void handleSubmit()}
+            disabled={!canSave || saving}
+            data-testid="schedule-form-save"
+          >
+            {saving ? (
+              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Check className="mr-1.5 h-3.5 w-3.5" />
+            )}
+            Create schedule
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+interface CreateScheduleFormProps {
+  projects: Project[];
+  projectId: string;
+  onProjectChange: (id: string) => void;
+  worktrees: Worktree[];
+  worktreeId: string;
+  onWorktreeChange: (id: string) => void;
+  worktreesLoading: boolean;
+  prompt: string;
+  onPromptChange: (value: string) => void;
+  triggerType: "runAt" | "cron";
+  onTriggerTypeChange: (value: "runAt" | "cron") => void;
+  runAt: string;
+  onRunAtChange: (value: string) => void;
+  cron: string;
+  onCronChange: (value: string) => void;
+  timezone: string;
+  onTimezoneChange: (value: string) => void;
+  error: string | null;
+}
+
+/**
+ * Form body for the create-schedule dialog. Extracted from the dialog
+ * wrapper so the field markup is observable to `renderToStaticMarkup`
+ * (Dialog uses a portal that does not render in SSR) and so the
+ * regression test can assert on the field-level test ids directly.
+ */
+export function CreateScheduleForm({
+  projects,
+  projectId,
+  onProjectChange,
+  worktrees,
+  worktreeId,
+  onWorktreeChange,
+  worktreesLoading,
+  prompt,
+  onPromptChange,
+  triggerType,
+  onTriggerTypeChange,
+  runAt,
+  onRunAtChange,
+  cron,
+  onCronChange,
+  timezone,
+  onTimezoneChange,
+  error,
+}: CreateScheduleFormProps) {
+  return (
+    <div className="space-y-3">
+      <div>
+        <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          Project
+        </label>
+        <select
+          value={projectId}
+          onChange={(e) => onProjectChange(e.target.value)}
+          data-testid="schedule-form-project"
+          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+          disabled={projects.length === 0}
+        >
+          {projects.length === 0 && (
+            <option value="">No projects available</option>
+          )}
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          Worktree
+        </label>
+        <select
+          value={worktreeId}
+          onChange={(e) => onWorktreeChange(e.target.value)}
+          data-testid="schedule-form-worktree"
+          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+          disabled={worktreesLoading || worktrees.length === 0}
+        >
+          {worktreesLoading && <option value="">Loading worktrees…</option>}
+          {!worktreesLoading && worktrees.length === 0 && (
+            <option value="">No worktrees available</option>
+          )}
+          {worktrees.map((w) => (
+            <option key={w.id} value={w.id}>
+              {w.name}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          Prompt
+        </label>
+        <textarea
+          value={prompt}
+          onChange={(e) => onPromptChange(e.target.value)}
+          rows={3}
+          data-testid="schedule-form-prompt"
+          placeholder="The prompt to send when the schedule fires"
+          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+      </div>
+      <div>
+        <span className="mb-1 block text-xs font-medium text-muted-foreground">
+          Trigger
+        </span>
+        <div className="flex gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={triggerType === "runAt" ? "default" : "outline"}
+            onClick={() => onTriggerTypeChange("runAt")}
+            data-testid="schedule-form-trigger-runAt"
+          >
+            One-shot
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={triggerType === "cron" ? "default" : "outline"}
+            onClick={() => onTriggerTypeChange("cron")}
+            data-testid="schedule-form-trigger-cron"
+          >
+            Recurring
+          </Button>
+        </div>
+      </div>
+      {triggerType === "runAt" ? (
+        <div>
+          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            Run at (local time)
+          </label>
+          <input
+            type="datetime-local"
+            value={runAt}
+            onChange={(e) => onRunAtChange(e.target.value)}
+            data-testid="schedule-form-runAt"
+            className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              Cron expression
+            </label>
+            <input
+              type="text"
+              value={cron}
+              onChange={(e) => onCronChange(e.target.value)}
+              placeholder="*/5 * * * *"
+              data-testid="schedule-form-cron"
+              className="w-full rounded-md border border-border bg-transparent px-3 py-2 font-mono text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              Timezone
+            </label>
+            <select
+              value={timezone}
+              onChange={(e) => onTimezoneChange(e.target.value)}
+              data-testid="schedule-form-timezone"
+              className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+            >
+              {COMMON_TIMEZONES.map((tz) => (
+                <option key={tz} value={tz}>
+                  {tz}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      )}
+      {error && (
+        <div
+          className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          data-testid="schedule-form-error"
+        >
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Render a date in a stable, short form. We avoid `toLocaleString` so SSR
+ * (static markup) and CSR match — the Settings regression test renders
+ * server-side and a locale-dependent string would fail across machines.
+ */
+function formatDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  // YYYY-MM-DD HH:mm in UTC. Compact enough to fit on a row, but precise
+  // enough to disambiguate near-future runs.
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(
+      date.getUTCDate()
+    )} ` +
+    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())} UTC`
+  );
+}

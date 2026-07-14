@@ -1688,3 +1688,191 @@ export async function resetShortcutBindings(): Promise<ShortcutBindings> {
   const res = await fetch(`${BASE}/shortcuts`, { method: "DELETE" });
   return res.json();
 }
+
+// --- Schedules (issue #303) ---
+//
+// Mirrors the server's `Schedule` / `ScheduleInput` shapes (server/lib/schedules.ts).
+// The UI is a thin client over the existing REST surface: list, create, toggle
+// enabled, delete, and inspect runs. Editing a trigger is intentionally out of
+// scope — the server has no PUT route for it (issue #303 non-goals).
+
+export type ScheduleSource = "user" | "agent";
+
+export interface Schedule {
+  id: string;
+  projectId: string;
+  worktreeId: string;
+  prompt: string;
+  provider?: string;
+  model?: string;
+  mode?: "default" | "plan";
+  cron: string | null;
+  timezone: string;
+  runAt: string | null;
+  nextRunAt: string;
+  lastRunAt: string | null;
+  lastRunSessionId: string | null;
+  lastError: string | null;
+  source: ScheduleSource;
+  enabled: boolean;
+  createdAt: string;
+  createdBy: string | null;
+}
+
+export interface ScheduleInput {
+  worktreeId: string;
+  prompt: string;
+  provider?: string;
+  model?: string;
+  mode?: "default" | "plan";
+  cron?: string | null;
+  timezone?: string;
+  runAt?: string | null;
+  enabled?: boolean;
+  source?: ScheduleSource;
+  createdBy?: string | null;
+}
+
+export interface ScheduleRun {
+  firedAt: string;
+  sessionId: string | null;
+  error: string | null;
+}
+
+/**
+ * A schedule paired with its owning project's id and a label, so the
+ * cross-project Schedules section can render a single list without the
+ * caller having to track which project each row came from. The
+ * `projectName` is denormalised at fetch time and is purely a display
+ * hint; the `projectId` is the source of truth.
+ */
+export interface ScheduleWithProject extends Schedule {
+  projectName: string;
+}
+
+/**
+ * Result of a cross-project schedule fetch. `schedules` is what the
+ * UI renders; `failedProjectIds` lists projects whose storage we
+ * couldn't read this round, so the section can surface a non-fatal
+ * "some projects failed to load" banner instead of silently
+ * dropping them. Issue #303 P2 review: swallowing per-project
+ * failures made the UI show "No schedules yet" while active
+ * schedules were still around.
+ */
+export interface AllSchedulesResult {
+  schedules: ScheduleWithProject[];
+  failedProjectIds: string[];
+}
+
+function schedulePath(projectId: string, scheduleId?: string): string {
+  const base = `${BASE}/projects/${projectId}/schedules`;
+  return scheduleId ? `${base}/${scheduleId}` : base;
+}
+
+export async function fetchSchedules(
+  projectId: string,
+  includeDisabled = true
+): Promise<Schedule[]> {
+  const params = new URLSearchParams({ includeDisabled: String(includeDisabled) });
+  const res = await fetch(`${schedulePath(projectId)}?${params}`);
+  await throwIfNotOk(res, "Failed to fetch schedules");
+  const body = (await res.json()) as unknown;
+  return Array.isArray(body) ? (body as Schedule[]) : [];
+}
+
+/**
+ * Fetch every project's schedules in parallel and merge them into a
+ * single list annotated with the owning project's display name.
+ *
+ * The server doesn't expose a `/api/schedules` cross-project endpoint
+ * by design (issue #303 — the CLI is the source of truth for the data
+ * model), so this is a client-side fan-out. It's the same shape every
+ * per-project page already uses, just collected in one place.
+ *
+ * Per-project failures are reported back via `failedProjectIds`
+ * rather than swallowed: in a corrupt-store or transient 500 case,
+ * the user should see "X projects failed to load" rather than an
+ * incomplete list that looks healthy. Issue #303 P2 review.
+ */
+export async function fetchAllSchedules(
+  includeDisabled = true
+): Promise<AllSchedulesResult> {
+  const projects = await fetchProjects();
+  const settled = await Promise.all(
+    projects.map(async (project) => {
+      try {
+        const schedules = await fetchSchedules(project.id, includeDisabled);
+        return {
+          ok: true as const,
+          project,
+          schedules: schedules.map((schedule) => ({
+            ...schedule,
+            projectName: project.name,
+          })),
+        };
+      } catch (error) {
+        return {
+          ok: false as const,
+          project,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }),
+  );
+  const schedules: ScheduleWithProject[] = [];
+  const failedProjectIds: string[] = [];
+  for (const entry of settled) {
+    if (entry.ok) {
+      schedules.push(...entry.schedules);
+    } else {
+      failedProjectIds.push(entry.project.id);
+    }
+  }
+  return { schedules, failedProjectIds };
+}
+
+export async function createSchedule(
+  projectId: string,
+  input: ScheduleInput
+): Promise<Schedule> {
+  const res = await fetch(schedulePath(projectId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  await throwIfNotOk(res, "Failed to create schedule");
+  return res.json();
+}
+
+export async function setScheduleEnabled(
+  projectId: string,
+  scheduleId: string,
+  enabled: boolean
+): Promise<Schedule> {
+  const action = enabled ? "enable" : "disable";
+  const res = await fetch(`${schedulePath(projectId, scheduleId)}/${action}`, {
+    method: "POST",
+  });
+  await throwIfNotOk(res, `Failed to ${action} schedule`);
+  return res.json();
+}
+
+export async function deleteSchedule(
+  projectId: string,
+  scheduleId: string
+): Promise<void> {
+  const res = await fetch(schedulePath(projectId, scheduleId), {
+    method: "DELETE",
+  });
+  await throwIfNotOk(res, "Failed to delete schedule");
+}
+
+export async function fetchScheduleRuns(
+  projectId: string,
+  scheduleId: string
+): Promise<ScheduleRun[]> {
+  const res = await fetch(`${schedulePath(projectId, scheduleId)}/runs`);
+  await throwIfNotOk(res, "Failed to fetch schedule runs");
+  const body = (await res.json()) as unknown;
+  return Array.isArray(body) ? (body as ScheduleRun[]) : [];
+}

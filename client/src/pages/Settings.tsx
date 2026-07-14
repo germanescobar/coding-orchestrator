@@ -4,8 +4,14 @@ import { AgentsSection } from "../components/agents-section.tsx";
 import { IntegrationsSection } from "../components/integrations-section.tsx";
 import { SkillsSection } from "../components/skills-section.tsx";
 import { ShortcutsSection } from "../components/shortcuts-section.tsx";
+import { SchedulesSection } from "../components/schedules-section.tsx";
 
-export type SettingsSection = "agents" | "integrations" | "skills" | "shortcuts";
+export type SettingsSection =
+  | "agents"
+  | "integrations"
+  | "skills"
+  | "shortcuts"
+  | "schedules";
 
 interface SectionSpec {
   id: SettingsSection;
@@ -39,12 +45,40 @@ const SECTIONS: SectionSpec[] = [
     shortLabel: "Shortcuts",
     description: "Customise Controller Mode keyboard shortcuts.",
   },
+  {
+    id: "schedules",
+    label: "Schedules",
+    shortLabel: "Schedules",
+    description:
+      "Schedule future or recurring sessions on any project's worktree.",
+  },
 ];
 
 interface SettingsPageProps {
   section: SettingsSection;
   onSectionChange: (section: SettingsSection) => void;
   onClose: () => void;
+  /**
+   * Id of the active project. Optional — only used by sections that
+   * are project-scoped. The Schedules section is now cross-project
+   * (per review feedback) and ignores it. Kept on the page type so
+   * future project-scoped sections can opt in without another prop
+   * churn.
+   */
+  projectId?: string;
+  /**
+   * Forwarded to the Schedules section so a fired schedule's `sessionId` can
+   * navigate the main view to that session. Mirrors the `controller://`
+   * deep-link path the transcript already uses. `projectId` is required by
+   * the cross-project Schedules section to land in the right project; the
+   * signature makes it optional so other (single-project) surfaces can opt
+   * in without a breaking change.
+   */
+  onOpenSession?: (params: {
+    sessionId: string;
+    worktreeId?: string;
+    projectId?: string;
+  }) => void;
 }
 
 /*
@@ -57,7 +91,12 @@ interface SettingsPageProps {
  * appears next to the page title. On desktop (≥md) we keep the original
  * two-column layout with the section nav on the left.
  */
-export function SettingsPage({ section, onSectionChange, onClose }: SettingsPageProps) {
+export function SettingsPage({
+  section,
+  onSectionChange,
+  onClose,
+  onOpenSession,
+}: SettingsPageProps) {
   const active = SECTIONS.find((s) => s.id === section) ?? SECTIONS[0];
 
   return (
@@ -149,6 +188,9 @@ export function SettingsPage({ section, onSectionChange, onClose }: SettingsPage
           {active.id === "integrations" && <IntegrationsSection />}
           {active.id === "skills" && <SkillsSection />}
           {active.id === "shortcuts" && <ShortcutsSection />}
+          {active.id === "schedules" && (
+            <SchedulesSection onOpenSession={onOpenSession} />
+          )}
         </div>
       </div>
     </div>
