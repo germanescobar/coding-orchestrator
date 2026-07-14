@@ -76,11 +76,7 @@ and run it; no install required.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Terminal CLI: list / run / snapshot / tail reach tmux-only sessions** (#301). When the user closes a tab the WebSocket disconnect kills the node-pty via `ptyManager.detachIfIdle`, but the underlying tmux session stays alive so the user can re-attach. The agent's `controller terminal list` was gating on the in-memory PTY map and returning "no terminals" in worktrees the user clearly has tabs open in; the same gap made `run` / `snapshot` 404. The agent surface now agrees with the renderer's tmux-driven tab list: `list` uses `ptyManager.listLiveByPrefix` (PTY ∪ live tmux, scoped to the worktree prefix), the `run` / `snapshot` / `tail` gate uses `ptyManager.isLive`, `snapshot` falls back to `tmux capture-pane` for tmux-only sessions, and `tail` attaches a transient PTY via `getOrCreate` and cleans it up via `detachIfIdle` when the iteration ends.
-
-## [0.3.1] - 2026-07-07
+## [0.3.1] - 2026-07-14
 
 > **macOS Gatekeeper:** the macOS build remains ad-hoc-signed and not
 > notarized. On first launch, open **System Settings → Privacy & Security →
@@ -88,11 +84,16 @@ and run it; no install required.
 
 ### Added
 
+- **Settings: Schedules section** (#303). A new **Schedules** entry in the Settings page lets the user manage scheduled sessions without leaving the app. The section lists every project's schedules in one view (worktree, prompt preview, trigger type — one-shot or cron with timezone, next/last run, enabled state, source, last error inline), with a create form that mirrors the CLI, an enable/disable toggle, a delete with confirmation, and a runs drawer that deep-links to a session when a run has one. Server-side validation errors (bad cron / timezone) are surfaced inline. Editing existing schedules is intentionally not exposed — the server has no PUT route for it. The CLI remains the source of truth for the data model; this is a UI over the existing REST surface in `server/routes/schedules.ts`.
 - **CLI: cwd-based project resolution for `worktrees` / `sessions` / `schedules`**. The `<project>` positional is now optional on `worktrees list`, `worktrees create`, `sessions start`, `schedules list`, and `schedules add` — the CLI resolves the project that owns the agent's shell `cwd` (longest-prefix match, falling back to a Controller-created worktree's owning project) when the positional is missing. A new `GET /api/projects?cwd=<absolutePath>` endpoint on the server returns `{ project: Project | null }` for the lookup. The bare `GET /api/projects` array shape is unchanged. When a `<project>` is supplied but doesn't match by id or name, the CLI also tries the cwd lookup and uses that match, so a typo'd name from inside a worktree no longer makes `worktrees create` fail. The error message includes the cwd and a "did you mean" hint when nothing resolves. The `controller-worktrees` and `controller-schedules` managed skills document the new behavior; the `controller worktrees create --name foo` and `controller sessions start --worktree <id> --message "..."` forms now work from any shell inside an onboarded project.
 
 ### Fixed
 
 - **Terminals: kill tmux session on tab close** (#296). Closing a terminal tab while the WebSocket was still CONNECTING (or without ever opening one) left the underlying tmux session alive; the next 2s `getTerminalTabs` poll would re-discover it via `listTmuxTerminalIds` and re-add the tab. The PUT `/api/projects/:id/terminal-tabs` handler now calls `ptyManager.kill` unconditionally when `removeTerminalId` is set, and the kill path also cleans up the pre-rename `coding-orchestrator-` tmux prefix so legacy sessions don't re-merge. A client-side `pendingCloseRef` belt-and-suspenders delivers a close requested during CONNECTING as soon as the WS opens.
+- **Terminals: kill legacy `coding-orchestrator-` tmux sessions on tab close** (#297). Follow-up to #296: the pre-rename `coding-orchestrator-` tmux sessions that some users still have on disk were not being reaped by the new `ptyManager.kill` path because their id format didn't match the post-rename prefix. The cleanup now also targets that legacy prefix so stale tabs from earlier installs don't keep re-materialising.
+- **Terminal CLI: list / run / snapshot / tail reach tmux-only sessions** (#301). When the user closes a tab the WebSocket disconnect kills the node-pty via `ptyManager.detachIfIdle`, but the underlying tmux session stays alive so the user can re-attach. The agent's `controller terminal list` was gating on the in-memory PTY map and returning "no terminals" in worktrees the user clearly has tabs open in; the same gap made `run` / `snapshot` 404. The agent surface now agrees with the renderer's tmux-driven tab list: `list` uses `ptyManager.listLiveByPrefix` (PTY ∪ live tmux, scoped to the worktree prefix), the `run` / `snapshot` / `tail` gate uses `ptyManager.isLive`, `snapshot` falls back to `tmux capture-pane` for tmux-only sessions, and `tail` attaches a transient PTY via `getOrCreate` and cleans it up via `detachIfIdle` when the iteration ends.
+- **Embedded terminal: copy mode state stuck** (#300). The embedded terminal could get stuck in copy mode after a selection (e.g. drag-to-select on Linux) until the user clicked back into the terminal and pressed a key. The component now tracks the active selection / copy mode state on the terminal instance and clears it deterministically when the user clicks elsewhere or the terminal re-mounts.
+- **Tests: fix session lifecycle test flakes** (#299). A handful of `server/lib/__tests__/session*.test.ts` cases were racing the in-process SSE teardown and intermittently failing in CI. The fixtures now await the lifecycle event before asserting, and the cleanup hooks are ordered so the temp project is removed after the session is fully closed.
 
 ## [0.3.0] - 2026-07-05
 
