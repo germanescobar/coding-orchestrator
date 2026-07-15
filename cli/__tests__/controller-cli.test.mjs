@@ -253,6 +253,43 @@ test("parseWorktrees maps list/create/delete to the right actions", async () => 
   );
 });
 
+test("parseWorktrees create rejects an unknown flag (issue #306)", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseWorktrees([
+          "create",
+          "demo",
+          "--name",
+          "wt-1",
+          "--frobnicate",
+          "yes",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /Unknown flag for worktrees create/);
+  assert.match(stderrText, /--frobnicate/);
+  assert.match(stderrText, /--name/);
+});
+
 // ---------------------------------------------------------------------------
 // project resolution: cwd-based fallback (sessions struggled to find the
 // project when they didn't know its name — this lets the CLI resolve the
@@ -665,6 +702,119 @@ test("parseSessions rejects a reserved flag that appears after --message", async
   assert.match(stderrText, /--provider/);
 });
 
+test("parseSessions rejects an unknown flag with a clear error listing valid flags (issue #306)", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseSessions([
+          "start",
+          "--worktree",
+          "wt-1",
+          "--frobnicate",
+          "yes",
+          "--message",
+          "hi",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /Unknown flag for sessions start/);
+  assert.match(stderrText, /--frobnicate/);
+  // The error must list the valid flags so the caller can fix the typo
+  // without reading the source.
+  assert.match(stderrText, /--provider/);
+  assert.match(stderrText, /--agent/);
+});
+
+test("parseSessions accepts --agent as an alias of --provider (issue #306)", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseSessions([
+    "start",
+    "--worktree",
+    "wt-1",
+    "--agent",
+    "claude",
+    "--message",
+    "hi",
+  ]);
+  assert.equal(parsed.body.provider, "claude");
+  assert.equal(parsed.body.worktreeId, "wt-1");
+  assert.equal(parsed.body.message, "hi");
+});
+
+test("parseSessions accepts --agent and --provider when they agree (issue #306)", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseSessions([
+    "start",
+    "--worktree",
+    "wt-1",
+    "--agent",
+    "claude",
+    "--provider",
+    "claude",
+    "--message",
+    "hi",
+  ]);
+  assert.equal(parsed.body.provider, "claude");
+});
+
+test("parseSessions rejects --agent and --provider when they disagree (issue #306)", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseSessions([
+          "start",
+          "--worktree",
+          "wt-1",
+          "--agent",
+          "claude",
+          "--provider",
+          "codex",
+          "--message",
+          "hi",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /--provider/);
+  assert.match(stderrText, /--agent/);
+  assert.match(stderrText, /disagree/);
+});
+
 test("runWorktrees delete sends DELETE and reports success", async () => {
   const cli = await loadCli();
   const originalFetch = globalThis.fetch;
@@ -909,6 +1059,104 @@ test("parseSchedules add requires a trigger (--at or --cron/--every)", async () 
   }
   assert.equal(exitCode, 1);
   assert.match(stderrText, /requires --at .* or --cron/);
+});
+
+test("parseSchedules add rejects an unknown flag (issue #306)", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseSchedules([
+          "add",
+          "demo",
+          "--worktree",
+          "wt-1",
+          "--prompt",
+          "x",
+          "--frobnicate",
+          "yes",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /Unknown flag for schedules add/);
+  assert.match(stderrText, /--frobnicate/);
+  assert.match(stderrText, /--provider/);
+  assert.match(stderrText, /--agent/);
+});
+
+test("parseSchedules add accepts --agent as an alias of --provider (issue #306)", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseSchedules([
+    "add",
+    "demo",
+    "--worktree",
+    "wt-1",
+    "--prompt",
+    "do the thing",
+    "--at",
+    "2026-06-26T08:00:00.000Z",
+    "--agent",
+    "claude",
+  ]);
+  assert.equal(parsed.body.provider, "claude");
+});
+
+test("parseSchedules add rejects --agent and --provider when they disagree (issue #306)", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseSchedules([
+          "add",
+          "demo",
+          "--worktree",
+          "wt-1",
+          "--prompt",
+          "x",
+          "--at",
+          "2026-06-26T08:00:00.000Z",
+          "--agent",
+          "claude",
+          "--provider",
+          "codex",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /disagree/);
 });
 
 test("parseSchedules list defaults to including disabled", async () => {

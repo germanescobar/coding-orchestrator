@@ -98,7 +98,7 @@ const USAGE = `Usage:
   running inside a worktree doesn't have to memorize a project name.
 
   controller sessions start [<project>] --worktree <worktreeId> --message <text> \\
-      [--provider codex|claude|anita] [--model <model>] [--mode default|plan] [--skill <name>]
+      [--provider|--agent codex|claude|anita] [--model <model>] [--mode default|plan] [--skill <name>]
 
   \`sessions start\` kicks off a new agent run on the given worktree and prints
   a URL the user can open in Controller to follow along. The CLI does not
@@ -111,7 +111,7 @@ const USAGE = `Usage:
   controller schedules add [<project>] --worktree <id> --prompt <text> \\
       [--at <iso>] [--cron <expr>] [--timezone <tz>] \\
       [--every minute|hour|day|weekday] [--on-day <0-6>] [--at-hour <0-23>] [--at-minute <0-59>] \\
-      [--provider codex|claude|anita] [--model <id>] [--mode default|plan] \\
+      [--provider|--agent codex|claude|anita] [--model <id>] [--mode default|plan] \\
       [--enabled true|false] [--source user|agent]
   controller schedules enable <project> <scheduleId>
   controller schedules disable <project> <scheduleId>
@@ -361,6 +361,7 @@ export function parseWorktrees(argv) {
     case "list":
       return { project, action: "list" };
     case "create": {
+      assertKnownFlags(args, ["--name", "--branch", "--base"], "worktrees create");
       const name = flagValue(args, "--name");
       if (!name) fail("worktrees create requires --name <name>");
       const branch = flagValue(args, "--branch");
@@ -521,9 +522,39 @@ export function parseSessions(argv) {
   }
   switch (command) {
     case "start": {
+      assertKnownFlags(
+        args,
+        [
+          "--worktree",
+          "--message",
+          "--provider",
+          "--agent",
+          "--model",
+          "--mode",
+          "--skill",
+        ],
+        "sessions start"
+      );
       const worktreeId = flagValue(args, "--worktree");
       if (!worktreeId) fail("sessions start requires --worktree <worktreeId>");
-      const provider = flagValue(args, "--provider");
+      // `--agent` is a forgiving alias for `--provider` (issue #306). The
+      // canonical name stays `--provider` in docs and skill examples; this
+      // alias just keeps a natural typo from silently swapping the agent
+      // to the default provider.
+      const providerFromFlag = flagValue(args, "--provider");
+      const providerFromAlias = flagValue(args, "--agent");
+      let provider = undefined;
+      if (providerFromFlag != null && providerFromAlias != null) {
+        if (providerFromFlag !== providerFromAlias) {
+          fail(
+            `sessions start: --provider (${providerFromFlag}) and --agent (${providerFromAlias}) disagree. ` +
+              `Pass only one of them.`
+          );
+        }
+        provider = providerFromFlag;
+      } else {
+        provider = providerFromFlag ?? providerFromAlias;
+      }
       const model = flagValue(args, "--model");
       const mode = flagValue(args, "--mode");
       const skill = flagValue(args, "--skill");
@@ -542,6 +573,7 @@ export function parseSessions(argv) {
       const RESERVED_FLAGS = [
         "--worktree",
         "--provider",
+        "--agent",
         "--model",
         "--mode",
         "--skill",
@@ -664,6 +696,27 @@ export function parseSchedules(argv) {
       if (!args[0]) fail("schedules remove requires a <scheduleId>");
       return { project, action: "remove", scheduleId: args[0] };
     case "add": {
+      assertKnownFlags(
+        args,
+        [
+          "--worktree",
+          "--prompt",
+          "--at",
+          "--cron",
+          "--every",
+          "--on-day",
+          "--at-hour",
+          "--at-minute",
+          "--timezone",
+          "--provider",
+          "--agent",
+          "--model",
+          "--mode",
+          "--enabled",
+          "--source",
+        ],
+        "schedules add"
+      );
       const worktreeId = flagValue(args, "--worktree");
       if (!worktreeId) fail("schedules add requires --worktree <worktreeId>");
       const prompt = flagValue(args, "--prompt");
@@ -690,7 +743,23 @@ export function parseSchedules(argv) {
       }
 
       const timezone = flagValue(args, "--timezone");
-      const provider = flagValue(args, "--provider");
+      // `--agent` is a forgiving alias for `--provider` (issue #306). When
+      // both are passed with the same value, accept; otherwise fail loudly
+      // so a stray typo doesn't silently swap the scheduled provider.
+      const providerFromFlag = flagValue(args, "--provider");
+      const providerFromAlias = flagValue(args, "--agent");
+      let provider = undefined;
+      if (providerFromFlag != null && providerFromAlias != null) {
+        if (providerFromFlag !== providerFromAlias) {
+          fail(
+            `schedules add: --provider (${providerFromFlag}) and --agent (${providerFromAlias}) disagree. ` +
+              `Pass only one of them.`
+          );
+        }
+        provider = providerFromFlag;
+      } else {
+        provider = providerFromFlag ?? providerFromAlias;
+      }
       const model = flagValue(args, "--model");
       const mode = flagValue(args, "--mode");
       const enabled = flagValue(args, "--enabled");
@@ -1011,6 +1080,23 @@ function parsePairs(rest, flag) {
 function flagValue(rest, flag) {
   const idx = rest.indexOf(flag);
   return idx >= 0 ? rest[idx + 1] : undefined;
+}
+
+// Fails with a clear, actionable error if `args` contains a `--…` token that
+// is not in `known` (issue #306). Without this, a typo like `--agent claude`
+// is silently dropped by `flagValue` and the CLI falls back to the default
+// provider, masking the mistake. The error names the offending flag and
+// lists the valid set so the user can fix it without reading the source.
+function assertKnownFlags(args, known, command) {
+  const knownSet = new Set(known);
+  for (const arg of args) {
+    if (arg.startsWith("--") && !knownSet.has(arg)) {
+      fail(
+        `Unknown flag for ${command}: ${arg}\n` +
+          `Valid flags: ${known.join(", ")}`
+      );
+    }
+  }
 }
 
 // Mirror of the `CONNECTION_MODES` and `ACQUISITIONS` enums in
