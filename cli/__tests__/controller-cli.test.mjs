@@ -661,6 +661,24 @@ test("parseSessions treats the message as the rest of argv (whitespace + trailin
   assert.equal(parsed.body.message, "look at issue 190 and implement the CLI surfaces");
 });
 
+test("parseSessions allows unknown --… tokens inside the --message prompt text (issue #306 regression)", async () => {
+  const cli = await loadCli();
+  // The unknown-flag check must not scan the message body itself, since
+  // `--message` is documented to consume the rest of argv as prompt text
+  // verbatim. Natural phrasings like "explain --help" or "run --json on
+  // the API" must keep working.
+  const parsed = cli.parseSessions([
+    "start",
+    "demo",
+    "--worktree",
+    "wt-123",
+    "--message",
+    "explain --help and run --json on the API",
+  ]);
+  assert.equal(parsed.body.message, "explain --help and run --json on the API");
+  assert.equal(parsed.body.worktreeId, "wt-123");
+});
+
 test("parseSessions rejects a reserved flag that appears after --message", async () => {
   const cli = await loadCli();
   const originalExit = process.exit;

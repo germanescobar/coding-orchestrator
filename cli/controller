@@ -522,8 +522,19 @@ export function parseSessions(argv) {
   }
   switch (command) {
     case "start": {
+      const messageIdx = args.indexOf("--message");
+      if (messageIdx < 0) {
+        fail("sessions start requires --message <text>");
+      }
+      // `--message` is the last flag: everything after it is the message
+      // text, verbatim. This matches the shell idiom of quoting the
+      // prompt at the end of the command and avoids forcing the agent
+      // to escape whitespace inside the body. Because of that, the
+      // unknown-flag check has to be scoped to the tokens *before*
+      // `--message` — otherwise natural prompts like
+      // `--message "explain --json"` would be rejected as typos.
       assertKnownFlags(
-        args,
+        args.slice(0, messageIdx),
         [
           "--worktree",
           "--message",
@@ -558,18 +569,12 @@ export function parseSessions(argv) {
       const model = flagValue(args, "--model");
       const mode = flagValue(args, "--mode");
       const skill = flagValue(args, "--skill");
-      // `--message` is the last flag: everything after it is the message
-      // text, verbatim. This matches the shell idiom of quoting the
-      // prompt at the end of the command and avoids forcing the agent
-      // to escape whitespace inside the body.
-      const messageIdx = args.indexOf("--message");
-      if (messageIdx < 0) {
-        fail("sessions start requires --message <text>");
-      }
       const trailing = args.slice(messageIdx + 1);
       // Reject any known option flag that appears after `--message`'s
       // value — otherwise the flag and its argument would be appended to
-      // the prompt and silently corrupt the agent's first turn.
+      // the prompt and silently corrupt the agent's first turn. Unknown
+      // `--…` tokens here are left alone, because they may be part of
+      // the prompt itself (e.g. `--message "explain --help"`).
       const RESERVED_FLAGS = [
         "--worktree",
         "--provider",
