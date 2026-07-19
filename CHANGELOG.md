@@ -76,6 +76,12 @@ and run it; no install required.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-18
+
+### Fixed
+
+- **CLI: reject unknown flags; accept `--agent` as alias for `--provider`** (#307, fixes #306). The unified `controller` CLI silently accepted unknown `--…` flags because the parsers only read the flags they knew about. A typo like `--agent claude` instead of `--provider claude` was dropped on the floor and the CLI fell back to the default provider, so the user only noticed the mistake when the wrong agent ended up running on the worktree. A new `assertKnownFlags` helper now fails with a clear error naming the offending flag and listing the valid set; `parseSessions start`, `parseWorktrees create`, and `parseSchedules add` all call it with the flags they actually support. `--agent` is accepted as a forgiving alias of `--provider` in `parseSessions start` and `parseSchedules add` — if both are passed and disagree, the CLI fails loudly; if they agree, the value is used. `--provider` stays the canonical name in help text and skill examples, and the `USAGE` block now shows `[--provider|--agent codex|claude|anita]` so the alias is discoverable from `--help`. The check is scoped to the pre-`--message` slice of argv so natural prompts like `--message "explain --help"` keep working.
+
 ## [0.3.1] - 2026-07-14
 
 > **macOS Gatekeeper:** the macOS build remains ad-hoc-signed and not
