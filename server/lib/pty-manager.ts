@@ -33,6 +33,7 @@ export function lastLines(text: string, lines: number): string {
 }
 
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB per session buffer
+const TMUX_COMMAND_TIMEOUT_MS = 2000;
 const TMUX_SESSION_PREFIX = "controller-";
 /* Sessions created by builds before the coding-orchestrator → Controller
  * rename used this prefix. New sessions use TMUX_SESSION_PREFIX; cleanup still
@@ -78,10 +79,10 @@ function tmuxPrefixes(prefix: string): string[] {
 
 function listTmuxSessions(): string[] {
   try {
-    const output = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
+    const output = execTmuxSync(["list-sessions", "-F", "#{session_name}"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-    });
+    }) as string;
     return output.split("\n").map((line) => line.trim()).filter(Boolean);
   } catch {
     return [];
@@ -90,7 +91,7 @@ function listTmuxSessions(): string[] {
 
 function killTmuxSession(sessionName: string): void {
   try {
-    execFileSync("tmux", ["kill-session", "-t", `=${sessionName}`], {
+    execTmuxSync(["kill-session", "-t", `=${sessionName}`], {
       stdio: "ignore",
     });
   } catch {
@@ -122,7 +123,7 @@ function terminalIdFromTmuxSessionName(
 function tmuxSessionExists(sessionId: string): boolean {
   for (const name of tmuxSessionNames(sessionId)) {
     try {
-      execFileSync("tmux", ["has-session", "-t", `=${name}`], { stdio: "ignore" });
+      execTmuxSync(["has-session", "-t", `=${name}`], { stdio: "ignore" });
       return true;
     } catch {
       // Try the next candidate (legacy prefix) before giving up.
@@ -141,11 +142,10 @@ function captureTmuxPane(sessionId: string, lines: number): string | null {
   for (const name of tmuxSessionNames(sessionId)) {
     try {
       const target = `${name}:0.0`;
-      return execFileSync(
-        "tmux",
+      return execTmuxSync(
         ["capture-pane", "-p", "-t", target, "-S", `-${Math.max(1, lines)}`],
         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-      );
+      ) as string;
     } catch {
       // Try the next candidate (legacy prefix) before giving up.
     }
@@ -167,7 +167,7 @@ function buildTmuxShellCommand(env?: Record<string, string>): string {
 
 function runTmux(args: string[], options?: ExecFileSyncOptions): void {
   try {
-    execFileSync("tmux", args, options);
+    execTmuxSync(args, options);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const output = typeof err === "object" && err !== null && "stderr" in err
@@ -178,10 +178,17 @@ function runTmux(args: string[], options?: ExecFileSyncOptions): void {
   }
 }
 
+function execTmuxSync(args: string[], options?: ExecFileSyncOptions): Buffer | string {
+  return execFileSync("tmux", args, {
+    ...options,
+    timeout: options?.timeout ?? TMUX_COMMAND_TIMEOUT_MS,
+  });
+}
+
 function setTmuxEnvironment(sessionName: string, env: Record<string, string>): void {
   for (const [key, value] of Object.entries(env)) {
     try {
-      execFileSync("tmux", ["set-environment", "-t", `=${sessionName}`, key, value], {
+      execTmuxSync(["set-environment", "-t", `=${sessionName}`, key, value], {
         stdio: "ignore",
       });
     } catch {
@@ -193,7 +200,7 @@ function setTmuxEnvironment(sessionName: string, env: Record<string, string>): v
 function ensureTmuxSession(sessionName: string, cwd: string, env?: Record<string, string>): void {
   const exists = (() => {
     try {
-      execFileSync("tmux", ["has-session", "-t", `=${sessionName}`], {
+      execTmuxSync(["has-session", "-t", `=${sessionName}`], {
         stdio: "ignore",
       });
       return true;
@@ -206,7 +213,7 @@ function ensureTmuxSession(sessionName: string, cwd: string, env?: Record<string
     // Always launch through the shell wrapper, even without per-worktree env,
     // so Controller's internal vars are stripped from every tmux session.
     const args = ["new-session", "-d", "-s", sessionName, "-c", cwd, buildTmuxShellCommand(env)];
-    execFileSync("tmux", args, { stdio: "ignore" });
+    execTmuxSync(args, { stdio: "ignore" });
   }
 
   if (env) {
@@ -217,19 +224,19 @@ function ensureTmuxSession(sessionName: string, cwd: string, env?: Record<string
 }
 
 function configureTmuxSession(sessionName: string): void {
-  execFileSync("tmux", ["set-option", "-t", sessionName, "status", "off"], {
+  execTmuxSync(["set-option", "-t", sessionName, "status", "off"], {
     stdio: "ignore",
   });
 
-  execFileSync("tmux", ["set-option", "-t", sessionName, "mouse", "on"], {
+  execTmuxSync(["set-option", "-t", sessionName, "mouse", "on"], {
     stdio: "ignore",
   });
 
-  execFileSync("tmux", ["set-option", "-t", sessionName, "history-limit", "50000"], {
+  execTmuxSync(["set-option", "-t", sessionName, "history-limit", "50000"], {
     stdio: "ignore",
   });
 
-  execFileSync("tmux", ["set-window-option", "-t", sessionName, "mode-keys", "emacs"], {
+  execTmuxSync(["set-window-option", "-t", sessionName, "mode-keys", "emacs"], {
     stdio: "ignore",
   });
 }
