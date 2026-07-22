@@ -11,6 +11,7 @@ const DEFAULT_TERMINAL_TAB: TerminalTab = {
   id: "default",
   label: "Terminal 1",
 };
+const TMUX_COMMAND_TIMEOUT_MS = 2000;
 const TMUX_SESSION_PREFIX = "controller-";
 /* Sessions created by builds before the coding-orchestrator → Controller
  * rename used this prefix. Discovery matches it too so terminals from an older
@@ -37,6 +38,7 @@ function listTmuxTerminalIds(projectId: string, worktreeId: string): string[] {
     output = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: TMUX_COMMAND_TIMEOUT_MS,
     });
   } catch {
     return [];

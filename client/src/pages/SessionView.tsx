@@ -1068,6 +1068,8 @@ function RunDiffFileRow({ file, label }: { file: DiffFile; label: string }) {
 }
 
 const COMPOSER_MAX_LINES = 5;
+const TERMINAL_TABS_POLL_INTERVAL_MS = 2000;
+const TERMINAL_TABS_POLL_ERROR_BACKOFF_MS = 10000;
 const DEFAULT_TERMINAL_ID = "default";
 
 const DEFAULT_TERMINAL_TAB: TerminalTab = {
@@ -3178,9 +3180,21 @@ export function SessionView({
 
   useEffect(() => {
     let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const scheduleSync = (delayMs: number) => {
+      if (cancelled) return;
+      timeoutId = window.setTimeout(() => {
+        void syncTerminalTabs();
+      }, delayMs);
+    };
 
     const syncTerminalTabs = async () => {
-      if (terminalTabsSavePendingRef.current) return;
+      if (cancelled) return;
+      if (terminalTabsSavePendingRef.current) {
+        scheduleSync(TERMINAL_TABS_POLL_INTERVAL_MS);
+        return;
+      }
       try {
         const nextTabs = normalizeTerminalTabs(await fetchTerminalTabs(projectId, worktreeId));
         if (cancelled) return;
@@ -3188,15 +3202,17 @@ export function SessionView({
         setActiveTerminalId((current) =>
           nextTabs.some((tab) => tab.id === current) ? current : nextTabs[0].id
         );
+        scheduleSync(TERMINAL_TABS_POLL_INTERVAL_MS);
       } catch {
         // Polling is best-effort; terminal tabs still work locally if this fails.
+        if (!cancelled) scheduleSync(TERMINAL_TABS_POLL_ERROR_BACKOFF_MS);
       }
     };
 
-    const interval = window.setInterval(syncTerminalTabs, 2000);
+    scheduleSync(TERMINAL_TABS_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
     };
   }, [projectId, worktreeId]);
 
