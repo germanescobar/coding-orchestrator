@@ -344,3 +344,302 @@ test("Controller tmux sessions use emacs copy-mode keys", async (t) => {
     await fs.rm(cwd, { recursive: true, force: true });
   }
 });
+
+/*
+ * Issue #317: pagers don't paginate inside the controller because tmux's
+ * pane is sized from the attaching client (80x24 in our case) instead of
+ * from a real measurement, and stale LINES / COLUMNS env vars let pagers
+ * trust the env over the pty. The unit-level tests below pin the three
+ * things that fix it: the tmux `window-size latest` option, an explicit
+ * initial pane size, and the LINES / COLUMNS scrub. A separate end-to-end
+ * test runs `git log` in a tall-enough git history to confirm the
+ * pager actually engages.
+ */
+
+test("Controller tmux sessions set window-size latest (issue #317)", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-winsize-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = "p1:w1:winsize-" + suffix;
+  const sessionName = tmuxSessionNames(sessionId)[0];
+
+  try {
+    const created = ptyManager.getOrCreate(sessionId, cwd);
+    if (created.error) {
+      t.skip("could not spawn a PTY: " + created.error);
+      return;
+    }
+
+    const windowSize = execFileSync(
+      "tmux",
+      ["show-window-options", "-t", `=${sessionName}`, "-v", "window-size"],
+      { encoding: "utf8" }
+    ).trim();
+    assert.equal(
+      windowSize,
+      "latest",
+      "expected window-size latest so the pane tracks the latest client-reported size"
+    );
+  } finally {
+    ptyManager.kill(sessionId);
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Newly created tmux panes start at a reasonable size (issue #317)", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-panesize-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = "p1:w1:panesize-" + suffix;
+  const sessionName = tmuxSessionNames(sessionId)[0];
+
+  try {
+    const created = ptyManager.getOrCreate(sessionId, cwd);
+    if (created.error) {
+      t.skip("could not spawn a PTY: " + created.error);
+      return;
+    }
+
+    // `#{pane_width}` / `#{pane_height}` reflect the pane's *server-side*
+    // size, not the attaching client's. They should match the 200x50 we
+    // pass to `new-session -x/-y` so the user's first command sees a
+    // tall-enough pane.
+    const size = execFileSync(
+      "tmux",
+      [
+        "display-message",
+        "-p",
+        "-t",
+        `${sessionName}:0.0`,
+        "#{pane_width}x#{pane_height}",
+      ],
+      { encoding: "utf8" }
+    ).trim();
+    assert.equal(size, "200x50", "expected pane to be created at 200x50");
+  } finally {
+    ptyManager.kill(sessionId);
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Controller tmux sessions strip LINES and COLUMNS from the shell env (issue #317)", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-pagerenv-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = "p1:w1:pagerenv-" + suffix;
+  const sentinel = "PAGERENV_SENTINEL_" + suffix;
+
+  try {
+    const created = ptyManager.getOrCreate(sessionId, cwd);
+    if (created.error) {
+      t.skip("could not spawn a PTY: " + created.error);
+      return;
+    }
+
+    const controller = new AbortController();
+    const iterable = ptyManager.tail(sessionId, controller.signal);
+    assert.ok(iterable, "expected a tail iterable for the live session");
+
+    const collected: string[] = [];
+    const reader = (async () => {
+      for await (const chunk of iterable as AsyncIterable<string>) {
+        collected.push(chunk);
+        if (collected.join("").includes(sentinel)) break;
+      }
+    })();
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Probe for both vars in a single command. `env` exits 1 if any of the
+    // listed names is missing — that's fine, `set +e` keeps the shell alive
+    // and prints the rest.
+    ptyManager.runCommand(
+      sessionId,
+      cwd,
+      `set +e; env -0 | tr '\\0' '\\n' | grep -E '^(LINES|COLUMNS)=|${sentinel}
+ ; printf '${sentinel}\\n'`
+    );
+
+    const timeout = new Promise((resolve) => setTimeout(resolve, PTY_OUTPUT_TIMEOUT_MS));
+    await Promise.race([reader, timeout]);
+    controller.abort();
+
+    const combined = collected.join("");
+    assert.ok(
+      combined.includes(sentinel),
+      "expected the probe command to run to completion; got: " + combined
+    );
+    assert.ok(
+      !/(^|\n)LINES=/.test(combined),
+      "expected LINES to be stripped from the shell env; got: " + combined
+    );
+    assert.ok(
+      !/(^|\n)COLUMNS=/.test(combined),
+      "expected COLUMNS to be stripped from the shell env; got: " + combined
+    );
+  } finally {
+    ptyManager.kill(sessionId);
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("PtyManager.resize updates the tmux server-side window (issue #317)", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-resize-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = "p1:w1:resize-" + suffix;
+  const sessionName = tmuxSessionNames(sessionId)[0];
+
+  try {
+    const created = ptyManager.getOrCreate(sessionId, cwd);
+    if (created.error) {
+      t.skip("could not spawn a PTY: " + created.error);
+      return;
+    }
+
+    ptyManager.resize(sessionId, 120, 40);
+
+    const size = execFileSync(
+      "tmux",
+      [
+        "display-message",
+        "-p",
+        "-t",
+        `${sessionName}:0.0`,
+        "#{pane_width}x#{pane_height}",
+      ],
+      { encoding: "utf8" }
+    ).trim();
+    assert.equal(
+      size,
+      "120x40",
+      "expected resize() to propagate to the tmux pane in the same tick"
+    );
+  } finally {
+    ptyManager.kill(sessionId);
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+function gitAvailable(): boolean {
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("git log paginates in a controller terminal (issue #317)", async (t) => {
+  if (!tmuxAvailable()) {
+    t.skip("tmux is not available");
+    return;
+  }
+  if (!gitAvailable()) {
+    t.skip("git is not available");
+    return;
+  }
+
+  // Build a temporary git repo with enough commits that `git log` is
+  // taller than the pane. 200 commits produces ~600+ lines of output —
+  // well beyond the 50-row pane we create.
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pty-manager-pager-"));
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const sessionId = "p1:w1:pager-" + suffix;
+  const sentinel = "PAGER_PROMPT_" + suffix;
+
+  const run = (args: string[], opts: { cwd?: string; input?: string } = {}) =>
+    execFileSync(args[0], args.slice(1), {
+      cwd: opts.cwd ?? cwd,
+      input: opts.input,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+    });
+
+  try {
+    run(["git", "init", "-q", "-b", "main"]);
+    run(["git", "config", "user.email", "test@example.com"]);
+    run(["git", "config", "user.name", "Test"]);
+    run(["git", "config", "commit.gpgsign", "false"]);
+    // Create an initial commit so we can chain from it.
+    await fs.writeFile(path.join(cwd, "README.md"), "test\n");
+    run(["git", "add", "README.md"]);
+    run(["git", "commit", "-q", "-m", "init"]);
+    for (let i = 0; i < 200; i += 1) {
+      await fs.writeFile(path.join(cwd, "f.txt"), String(i) + "\n");
+      run(["git", "add", "f.txt"]);
+      run(["git", "commit", "-q", "-m", "commit " + i]);
+    }
+
+    const created = ptyManager.getOrCreate(sessionId, cwd);
+    if (created.error) {
+      t.skip("could not spawn a PTY: " + created.error);
+      return;
+    }
+
+    // Force a small pane so paging is inevitable. With a 50-row pane and
+    // ~600 lines of `git log`, `less` (git's default pager) must page.
+    ptyManager.resize(sessionId, 80, 24);
+
+    const controller = new AbortController();
+    const iterable = ptyManager.tail(sessionId, controller.signal);
+    assert.ok(iterable, "expected a tail iterable for the live session");
+
+    const collected: string[] = [];
+    let sawPagerPrompt = false;
+    const reader = (async () => {
+      for await (const chunk of iterable as AsyncIterable<string>) {
+        collected.push(chunk);
+        // `less` enters the alternate screen on launch (`\x1b[?1049h`) and
+        // either shows `--More--`, `(END)`, or its `(PAGER PROMPT)` line
+        // when the output is taller than the pane. The original bug was
+        // that *none* of these appeared and the entire log dumped in one
+        // go, so any of the above counts as the pager being engaged.
+        if (/\x1b\[\?1049h/.test(collected.join(""))) {
+          sawPagerPrompt = true;
+          break;
+        }
+        if (/(?:--More--|MORE|PAUSE|\(END\))/.test(collected.join(""))) {
+          sawPagerPrompt = true;
+          break;
+        }
+        if (collected.join("").includes(sentinel)) break;
+      }
+    })();
+
+    // Use the real pager: clear any inherited PAGER / GIT_PAGER and run
+    // `git log` against the tall history.
+    ptyManager.runCommand(sessionId, cwd, "unset PAGER GIT_PAGER; git log");
+
+    const timeout = new Promise((resolve) => setTimeout(resolve, PTY_OUTPUT_TIMEOUT_MS));
+    await Promise.race([reader, timeout]);
+    controller.abort();
+
+    // Cancel the pager so the tmux session can exit cleanly.
+    ptyManager.runCommand(sessionId, cwd, "q");
+    ptyManager.runCommand(sessionId, cwd, `printf '${sentinel}\\n'`);
+
+    assert.ok(
+      sawPagerPrompt,
+      "expected `git log` to page; got: " + collected.slice(0, 3).join("").slice(0, 500)
+    );
+  } finally {
+    ptyManager.kill(sessionId);
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
