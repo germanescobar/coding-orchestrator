@@ -76,6 +76,10 @@ and run it; no install required.
 
 ## [Unreleased]
 
+### Added
+
+- **Codex: GPT-5.6 model family (Sol, Terra, Luna)**. The Codex model picker now lists `gpt-5.6-sol` (new flagship, default for new Code sessions), `gpt-5.6-terra` (balanced), and `gpt-5.6-luna` (cost-efficient), alongside the existing 5.5 / 5.4 / 5.4-mini / 5.3 Codex Spark entries. Mirrors the [OpenAI GPT-5.6 announcement](https://openai.com/index/gpt-5-6/): Sol is the new flagship, Terra is positioned for everyday work, Luna is the fastest and most affordable tier. The fallback list in `server/lib/models.ts` is only used when the live `codexAppServerManager.listModels()` call is unavailable — when Codex CLI is reachable, the live list wins.
+
 ## [0.3.2] - 2026-07-18
 
 ### Fixed
