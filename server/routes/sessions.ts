@@ -2280,6 +2280,21 @@ function parseQueuedMessageInput(body: unknown): QueuedMessageInput | null {
     typeof raw.reasoningEffort === "string"
       ? (raw.reasoningEffort as QueuedMessageInput["reasoningEffort"])
       : undefined;
+  // Validate `mentions` (issue #312). The client sends the chip stack
+  // at enqueue time so the queue-replay path (`advanceSessionQueue`)
+  // can re-send it on the next turn. Bad rows are dropped silently —
+  // the orchestrator is the source of truth, and a malformed entry
+  // shouldn't fail the whole enqueue. Empty / missing is also valid
+  // (a message with no mentions).
+  const mentions = Array.isArray(raw.mentions)
+    ? raw.mentions.filter(
+        (entry): entry is { path: string; type: "file" | "directory" } =>
+          Boolean(entry) &&
+          typeof (entry as { path?: unknown }).path === "string" &&
+          ((entry as { type?: unknown }).type === "file" ||
+            (entry as { type?: unknown }).type === "directory"),
+      )
+    : undefined;
 
   return {
     text,
@@ -2291,6 +2306,7 @@ function parseQueuedMessageInput(body: unknown): QueuedMessageInput | null {
     mode,
     attachmentIds,
     skillName: typeof raw.skillName === "string" ? raw.skillName : undefined,
+    mentions: mentions && mentions.length > 0 ? mentions : undefined,
   };
 }
 

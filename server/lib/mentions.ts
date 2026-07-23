@@ -69,7 +69,25 @@ export async function resolveMentions(
   for (const mention of mentions) {
     const cleaned = mention.path.replace(/^\.\/+/, "").replace(/\/+$/, "");
     if (!cleaned) continue;
-    if (!/^[A-Za-z0-9._\-/]+$/.test(cleaned)) {
+    // Path-safety check. The original implementation rejected any
+    // character outside `[A-Za-z0-9._/-]`, which is over-restrictive:
+    // real repo paths can contain spaces, `+`, `()`, `,`, `:`, or
+    // non-ASCII characters (`docs/API guide.md`,
+    // `テスト/ファイル.md`, `package@1.0/README.md`). The actual
+    // safety guarantee comes from `realpath` + the worktree-root
+    // boundary check below; the regex here only exists to reject
+    // input that would obviously break the resolver's own logic
+    // (null bytes, embedded NULs, control characters, backslashes
+    // that hint at Windows-style paths on a POSIX system). Length
+    // is also bounded so a pathological input can't blow the
+    // annotation line buffer.
+    if (cleaned.length > 4096) {
+      annotationLines.push(
+        `- ${mention.type}: ${mention.path} (skipped: path too long)`,
+      );
+      continue;
+    }
+    if (/[\0\u0000-\u001f\\]/.test(cleaned)) {
       annotationLines.push(
         `- ${mention.type}: ${mention.path} (skipped: invalid path)`,
       );

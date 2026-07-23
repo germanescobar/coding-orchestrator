@@ -7,7 +7,9 @@ import {
   scoreMentionCandidate,
   normalizeMentionPath,
   inferMentionType,
+  parseMentionBlock,
 } from "./file-picker.ts";
+import { parseSkillMarkers } from "./skill-picker.ts";
 
 // --- parseMentionTokenAtCaret ---------------------------------------------
 
@@ -234,4 +236,76 @@ test("inferMentionType reads trailing slash as a directory hint", () => {
   assert.equal(inferMentionType("src/components/", true), "directory");
   assert.equal(inferMentionType("src/components", false), "file");
   assert.equal(inferMentionType("", false), "file");
+});
+
+// --- parseMentionBlock ---------------------------------------------------
+
+test("parseMentionBlock returns no mentions for plain text", () => {
+  assert.deepEqual(parseMentionBlock("just a message"), {
+    mentions: [],
+    text: "just a message",
+  });
+});
+
+test("parseMentionBlock extracts mentions and strips the block", () => {
+  const block = [
+    "<mentions>",
+    "The user referenced the following paths in the active worktree.",
+    "- file: server/lib/sessions.ts",
+    "- directory: client/src",
+    "</mentions>",
+    "",
+  ].join("\n");
+  assert.deepEqual(parseMentionBlock(`${block}hello world`), {
+    mentions: [
+      { type: "file", path: "server/lib/sessions.ts" },
+      { type: "directory", path: "client/src" },
+    ],
+    text: "hello world",
+  });
+});
+
+test("parseMentionBlock parses the block when followed by a skill marker", () => {
+  // This is the order the server persists: mention block, then the
+  // skill markers, then the user text. The renderer must strip the
+  // mention block first (so the skill marker isn't visible as prose)
+  // and then the skill markers (so the skill chip can render).
+  const payload = [
+    "<mentions>",
+    "- file: server/lib/sessions.ts",
+    "</mentions>",
+    "",
+    "[/skill: a] [/skill: b] hello",
+  ].join("\n");
+  const { mentions, text: afterMentions } = parseMentionBlock(payload);
+  assert.equal(mentions.length, 1);
+  assert.equal(mentions[0].path, "server/lib/sessions.ts");
+  // After stripping the block, the remaining text is exactly the
+  // shape `parseSkillMarkers` expects (a leading skill marker
+  // chain). Compose with the existing skill-picker helper to assert
+  // the round-trip — the skill chips must render and the visible
+  // text must be just the user text.
+  const { skillNames, text: visibleText } = parseSkillMarkers(afterMentions);
+  assert.deepEqual(skillNames, ["a", "b"]);
+  assert.equal(visibleText, "hello");
+});
+
+test("parseMentionBlock tolerates a trailing newline in the closing tag", () => {
+  // Round-trips with the server output, which trims a trailing
+  // newline when emitting the closing tag.
+  const payload = "<mentions>\n- file: a.ts\n</mentions>\nbody";
+  const { mentions, text } = parseMentionBlock(payload);
+  assert.equal(mentions.length, 1);
+  assert.equal(text, "body");
+});
+
+test("parseMentionBlock returns no mentions for malformed blocks", () => {
+  // Unclosed block: the regex is non-greedy with a closing-tag
+  // requirement, so this is treated as "no block" and the text is
+  // left untouched. A hand-edited transcript shouldn't crash the
+  // renderer.
+  assert.deepEqual(
+    parseMentionBlock("<mentions>\n- file: a.ts\nbody"),
+    { mentions: [], text: "<mentions>\n- file: a.ts\nbody" }
+  );
 });

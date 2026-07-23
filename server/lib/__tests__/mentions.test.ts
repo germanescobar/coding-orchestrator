@@ -224,3 +224,101 @@ test("parseMentionsQuery parses the wire format", () => {
     { path: "client/src/api.ts", type: "file" },
   ]);
 });
+
+// --- path character allowlist (review feedback) ------------------------
+
+/*
+ * The original path-safety regex was `/^[A-Za-z0-9._\-/]+$/`, which
+ * rejected any path containing a space, a `+`, a `(`, a `:`, a `,`, or
+ * a non-ASCII character — even when the file existed on disk. The
+ * picker happily returned such paths from `fetchSourceDirectory`, so
+ * the user could select `docs/API guide.md` in the composer and the
+ * resolver would silently drop it as "invalid path". The actual
+ * safety guarantee is the `realpath` + worktree boundary check, so
+ * the regex is over-restrictive. These tests pin the relaxation.
+ */
+
+test("resolveMentions accepts paths with spaces, punctuation, and non-ASCII characters", async () => {
+  await withWorktree(async (worktreePath) => {
+    // A file path that's perfectly legal on every filesystem on
+    // earth, but the old regex would have rejected it.
+    await fs.mkdir(path.join(worktreePath, "docs"), { recursive: true });
+    await fs.writeFile(
+      path.join(worktreePath, "docs", "API guide.md"),
+      "# API\n"
+    );
+    await fs.mkdir(path.join(worktreePath, "テスト"), { recursive: true });
+    await fs.writeFile(
+      path.join(worktreePath, "テスト", "ファイル.md"),
+      "jp\n"
+    );
+
+    const result = await resolveMentions(worktreePath, [
+      { path: "docs/API guide.md", type: "file" },
+      { path: "テスト/ファイル.md", type: "file" },
+    ]);
+    assert.equal(result.mentions.length, 2);
+    assert.equal(result.mentions[0].path, "docs/API guide.md");
+    assert.equal(result.mentions[1].path, "テスト/ファイル.md");
+  });
+});
+
+test("resolveMentions still rejects paths with control characters or backslashes", async () => {
+  // The relaxation must not introduce a new attack surface: NUL
+  // bytes, control characters, and Windows-style path separators
+  // (`\`) are still rejected so a hand-crafted URL cannot smuggle
+  // a path that escapes the realpath/boundary check. `\0` is the
+  // most obvious one; the resolver's own join with `path.join` is
+  // undefined for embedded NULs.
+  await withWorktree(async (worktreePath) => {
+    const result = await resolveWorktreeResult(
+      worktreePath,
+      "src/bad\u0000name.ts"
+    );
+    assert.equal(result.mentions.length, 0);
+    assert.ok(
+      result.contextBlock.includes("(skipped: invalid path)"),
+      "control characters must be rejected"
+    );
+  });
+  await withWorktree(async (worktreePath) => {
+    const result = await resolveWorktreeResult(
+      worktreePath,
+      "src\\bad\\name.ts"
+    );
+    assert.equal(result.mentions.length, 0);
+    assert.ok(
+      result.contextBlock.includes("(skipped: invalid path)"),
+      "backslashes must be rejected"
+    );
+  });
+});
+
+test("resolveMentions rejects paths above the length cap", async () => {
+  await withWorktree(async (worktreePath) => {
+    // 5000 'a's in a single component — way above the 4096 limit.
+    // This guards against a pathological input that would otherwise
+    // blow the annotation line buffer.
+    const long = "a".repeat(5000);
+    const result = await resolveWorktreeResult(worktreePath, long);
+    assert.equal(result.mentions.length, 0);
+    assert.ok(
+      result.contextBlock.includes("(skipped: path too long)"),
+      "over-long paths must be rejected"
+    );
+  });
+});
+
+/**
+ * Tiny helper to keep the path-character tests readable: build a
+ * `resolveMentions` call for a single path. Reused by the
+ * control-character and length-cap tests above.
+ */
+async function resolveWorktreeResult(
+  worktreePath: string,
+  mentionPath: string
+) {
+  return resolveMentions(worktreePath, [
+    { path: mentionPath, type: "file" },
+  ]);
+}
