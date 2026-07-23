@@ -5074,9 +5074,12 @@ export function SessionView({
   //   - Toggle: open the right panel on the `files` tab if it isn't
   //     already showing the file explorer; otherwise close the right
   //     panel entirely (mirrors VS Code / Cursor semantics).
-  //   - Search: open the fuzzy file finder overlay. We close the
-  //     panel first so the dialog is the only surface, and re-open
-  //     it from `openSourcePath` once the user picks a file.
+  //   - Search: open the fuzzy file finder overlay. We intentionally
+  //     do NOT close the right panel — the dialog is a modal that
+  //     floats above the rest of the UI (matches VS Code / Cursor,
+  //     where Cmd+P leaves the explorer in place). When the user
+  //     picks a file, `openSourcePath` re-opens / focuses the panel
+  //     on the `files` tab.
   const handleFilesPanelToggle = useCallback(() => {
     if (terminalOpen && rightTab === "files" && mobilePanel === "files") {
       setTerminalOpen(false);
@@ -5090,11 +5093,11 @@ export function SessionView({
   }, [terminalOpen, rightTab, mobilePanel]);
 
   const handleFilesPanelSearch = useCallback(() => {
-    // Close the right panel so the dialog has the focus; the file
-    // pick path will re-open it through `openSourcePath`.
-    setTerminalOpen(false);
-    setRightTab("terminal");
-    setMobilePanel("agent");
+    // Open the file finder as a modal overlay; leave the right
+    // panel alone so the user doesn't lose the explorer's context
+    // (matches the VS Code / Cursor behaviour where Cmd+P leaves
+    // the explorer in place). Picking a result routes through
+    // `openSourcePath`, which then focuses the panel on `files`.
     setFileFinderOpen(true);
   }, []);
 
