@@ -34,6 +34,14 @@ import {
 } from "../lib/project-scripts.js";
 import { childProcessEnv } from "../lib/shell-env.js";
 import {
+  buildFileIndex,
+  clampInt,
+  MENTION_WALK_DEFAULT_DEPTH,
+  MENTION_WALK_DEFAULT_LIMIT,
+  MENTION_WALK_MAX_DEPTH,
+  MENTION_WALK_MAX_LIMIT,
+} from "../lib/file-index.js";
+import {
   emitSessionRemoved,
   emitWorktreeAdded,
   emitWorktreeRemoved,
@@ -406,6 +414,51 @@ worktreesRouter.get("/:projectId/files", async (req, res) => {
     console.error("GET /projects/:projectId/files error:", err);
     res.status(500).json({ error: (err as Error).message });
   }
+});
+
+/*
+ * Recursive file/directory walk for the `@`-mention picker (issue #312).
+ * The actual walk lives in `server/lib/file-index.ts` so its bounds
+ * and denylist are unit-testable in isolation; this route is a thin
+ * adapter that resolves the worktree root and clamps the query
+ * parameters.
+ */
+worktreesRouter.get("/:projectId/file-index", async (req, res) => {
+  const project = await getProject(req.params.projectId);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+  const worktree = await resolveWorktree(
+    project.id,
+    getQueryString(req.query.worktreeId),
+  );
+  if (!worktree) {
+    res.status(404).json({ error: "Worktree not found" });
+    return;
+  }
+  const depth = clampInt(
+    getQueryString(req.query.depth),
+    MENTION_WALK_DEFAULT_DEPTH,
+    1,
+    MENTION_WALK_MAX_DEPTH,
+  );
+  const limit = clampInt(
+    getQueryString(req.query.limit),
+    MENTION_WALK_DEFAULT_LIMIT,
+    1,
+    MENTION_WALK_MAX_LIMIT,
+  );
+
+  let rootRealPath: string;
+  try {
+    rootRealPath = await fs.realpath(worktree.path);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+    return;
+  }
+  const result = await buildFileIndex(rootRealPath, depth, limit);
+  res.json(result);
 });
 
 worktreesRouter.put("/:projectId/terminal-tabs", async (req, res) => {

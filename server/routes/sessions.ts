@@ -57,6 +57,7 @@ import {
   extractSkillInvocation,
   getSkillProvider,
 } from "../lib/skills.js";
+import { resolveMentions, parseMentionsQuery } from "../lib/mentions.js";
 import {
   consumePendingApproval,
   getSessionRuntime,
@@ -596,6 +597,7 @@ sessionsRouter.post("/:projectId/sessions", async (req, res) => {
     mode?: "default" | "plan";
     skillName?: string;
     attachmentIds?: string[];
+    mentions?: { path?: unknown; type?: unknown }[];
     reasoningEffort?: string;
     serviceTier?: "fast" | "flex";
     resumeSessionId?: string;
@@ -634,6 +636,15 @@ sessionsRouter.post("/:projectId/sessions", async (req, res) => {
         mode,
         skillName: body.skillName,
         attachmentIds,
+        mentions: Array.isArray(body.mentions)
+          ? body.mentions.filter(
+              (entry): entry is { path: string; type: "file" | "directory" } =>
+                Boolean(entry) &&
+                typeof (entry as { path?: unknown }).path === "string" &&
+                ((entry as { type?: unknown }).type === "file" ||
+                  (entry as { type?: unknown }).type === "directory"),
+            )
+          : undefined,
         reasoningEffort: body.reasoningEffort,
         serviceTier: body.serviceTier,
         resumeSessionId: body.resumeSessionId,
@@ -664,6 +675,7 @@ export function makeHeadlessSessionStartRequest(
     mode: "default" | "plan";
     skillName?: string;
     attachmentIds: string[];
+    mentions?: { path: string; type: "file" | "directory" }[];
     reasoningEffort?: string;
     serviceTier?: "fast" | "flex";
     resumeSessionId?: string;
@@ -678,6 +690,14 @@ export function makeHeadlessSessionStartRequest(
   if (body.model) query.model = body.model;
   if (body.skillName) query.skillName = body.skillName;
   if (body.attachmentIds.length) query.attachmentIds = body.attachmentIds.join(",");
+  if (body.mentions?.length) {
+    // Same wire format the SSE client uses (issue #312). Keeping the
+    // shim's encoding aligned means the headless POST endpoint and the
+    // composer's picker converge on a single parser.
+    query.mentions = body.mentions
+      .map((mention) => `${mention.path}|${mention.type}`)
+      .join(",");
+  }
   if (body.reasoningEffort) query.reasoningEffort = body.reasoningEffort;
   if (body.serviceTier) query.serviceTier = body.serviceTier;
   // Optional so the headless POST endpoint can drive the resume / queue-
@@ -943,6 +963,13 @@ export async function handleSessionStream(
     ?.split(",")
     .map((id) => id.trim())
     .filter(Boolean) ?? [];
+  // `mentions` is the file/directory picker payload from the client
+  // (issue #312). The format is `path|type,path|type,…`; the type
+  // defaults to `file` when missing so a hand-crafted URL still parses.
+  // `parseMentionsQuery` drops bad rows silently — the orchestrator is
+  // the source of truth, and a malformed entry shouldn't fail the
+  // whole turn.
+  const mentionRequests = parseMentionsQuery(req.query.mentions as string | undefined);
   const skillName = (req.query.skillName as string | undefined)?.trim() || undefined;
 
   const provider = getAgentProvider(providerId);
@@ -966,22 +993,7 @@ export async function handleSessionStream(
     return;
   }
 
-  // Resolve the requested skill (if any). The orchestrator is the only
-  // source of truth for `/<skill-name>` invocations across providers;
-  // we read the body server-side at send time so the wire payload gets
-  // the freshest `SKILL.md` and the message we hand to the provider
-  // already has the skill block prepended (see issue #98).
-  const skillResolution = await resolveSkillActivation(
-    skillName,
-    providerId,
-    worktree.path,
-    message
-  );
-  if ("error" in skillResolution) {
-    res.status(400).json({ error: skillResolution.error });
-    return;
-  }
-// Always tell the agent it's running inside Controller. Browser tooling is
+  // Always tell the agent it's running inside Controller. Browser tooling is
   // covered by the managed `browser` skill installed on startup.
   //
   // Delivery channel depends on the provider:
@@ -994,10 +1006,39 @@ export async function handleSessionStream(
   //     The skill prefix, if any, stays after the preamble.
   const controllerPreamble = await buildControllerPreamble();
   const usesSystemPrompt = providerId === "anita";
+  // Resolve the `@`-mentions (issue #312) before composing the prompt so
+  // the mention block lands in both the agent message and the persisted
+  // history — that round-trip is what makes session replays
+  // deterministic. The prefix carries the inlined preview; the context
+  // block is the deterministic listing the bubble re-renders on reload.
+  const mentionResolution = await resolveMentions(
+    worktree.path,
+    mentionRequests,
+  );
+  const skillResolution = await resolveSkillActivation(
+    skillName,
+    providerId,
+    worktree.path,
+    message
+  );
+  if ("error" in skillResolution) {
+    res.status(400).json({ error: skillResolution.error });
+    return;
+  }
+  const baseAgentMessage = mentionResolution.prefix
+    ? `${mentionResolution.prefix}${skillResolution.agentMessage}`
+    : skillResolution.agentMessage;
   const agentMessage = usesSystemPrompt
-    ? skillResolution.agentMessage
-    : framePreambleForPrompt(controllerPreamble) + skillResolution.agentMessage;
-  const historyText = skillResolution.historyText;
+    ? baseAgentMessage
+    : framePreambleForPrompt(controllerPreamble) + baseAgentMessage;
+  // The persisted history carries the deterministic mention block (no
+  // inline preview) so reload is cheap and the transcript is
+  // byte-identical across runs of the same prompt. The skill markers
+  // already ride on the history text; the mention block is a separate
+  // prefix.
+  const historyText = mentionResolution.contextBlock
+    ? `${mentionResolution.contextBlock}\n\n${skillResolution.historyText}`
+    : skillResolution.historyText;
 
   const runStartTree = await createWorktreeSnapshot(worktree.path);
 
@@ -1627,6 +1668,14 @@ function makeHeadlessStreamRequest(
     query.attachmentIds = message.attachmentIds.join(",");
   }
   if (message.skillName) query.skillName = message.skillName;
+  // The queue snapshot stores the user's `@` mention chip stack; replaying
+  // it on the next turn keeps the resolved mention block in the prompt
+  // aligned with what the user originally typed (issue #312).
+  if (message.mentions?.length) {
+    query.mentions = message.mentions
+      .map((mention) => `${mention.path}|${mention.type}`)
+      .join(",");
+  }
   return {
     params: { projectId },
     query,
@@ -2231,6 +2280,21 @@ function parseQueuedMessageInput(body: unknown): QueuedMessageInput | null {
     typeof raw.reasoningEffort === "string"
       ? (raw.reasoningEffort as QueuedMessageInput["reasoningEffort"])
       : undefined;
+  // Validate `mentions` (issue #312). The client sends the chip stack
+  // at enqueue time so the queue-replay path (`advanceSessionQueue`)
+  // can re-send it on the next turn. Bad rows are dropped silently —
+  // the orchestrator is the source of truth, and a malformed entry
+  // shouldn't fail the whole enqueue. Empty / missing is also valid
+  // (a message with no mentions).
+  const mentions = Array.isArray(raw.mentions)
+    ? raw.mentions.filter(
+        (entry): entry is { path: string; type: "file" | "directory" } =>
+          Boolean(entry) &&
+          typeof (entry as { path?: unknown }).path === "string" &&
+          ((entry as { type?: unknown }).type === "file" ||
+            (entry as { type?: unknown }).type === "directory"),
+      )
+    : undefined;
 
   return {
     text,
@@ -2242,6 +2306,7 @@ function parseQueuedMessageInput(body: unknown): QueuedMessageInput | null {
     mode,
     attachmentIds,
     skillName: typeof raw.skillName === "string" ? raw.skillName : undefined,
+    mentions: mentions && mentions.length > 0 ? mentions : undefined,
   };
 }
 

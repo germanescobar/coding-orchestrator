@@ -536,7 +536,16 @@ export interface QueuedMessage {
   createdAt: string;
 }
 
-export type QueuedMessageInput = Omit<QueuedMessage, "id" | "createdAt">;
+export interface QueuedMessageInput extends Omit<QueuedMessage, "id" | "createdAt"> {
+  /**
+   * File/directory mentions from the composer's `@` picker (issue #312).
+   * The orchestrator snapshots the chip stack at enqueue time and the
+   * queue-replay effect re-sends it on the next turn so the resolved
+   * mention block in the prompt matches what the user typed. Mirrors
+   * the `mentions` query param on `startSession`.
+   */
+  mentions?: { path: string; type: "file" | "directory" }[];
+}
 
 export async function fetchSessionQueue(
   projectId: string,
@@ -1185,6 +1194,14 @@ export function startSession(
     mode?: "default" | "plan";
     worktreeId?: string;
     attachmentIds?: string[];
+    /**
+     * Repo-relative paths the user referenced with `@` in the composer
+     * (issue #312). The backend resolves each path against the active
+     * worktree, reads a preview, and prepends a deterministic
+     * `<mentions>...</mentions>` block to the agent prompt so two runs
+     * that mention the same files produce identical prompts.
+     */
+    mentions?: { path: string; type: "file" | "directory" }[];
     skillName?: string;
   }
 ): EventSource {
@@ -1198,6 +1215,19 @@ export function startSession(
   if (options?.worktreeId) params.set("worktreeId", options.worktreeId);
   if (options?.attachmentIds?.length) {
     params.set("attachmentIds", options.attachmentIds.join(","));
+  }
+  if (options?.mentions?.length) {
+    // The backend re-checks every path against the worktree root before
+    // reading it, so this list is a hint, not an authorization. The
+    // serialised form is `path|type,path|type,…` so a single comma-
+    // separated query param carries both fields without a second round
+    // trip. Reorder-preserving: the backend sorts by request order so
+    // the mention block in the prompt matches the chip order in the
+    // composer.
+    const encoded = options.mentions
+      .map((mention) => `${mention.path}|${mention.type}`)
+      .join(",");
+    params.set("mentions", encoded);
   }
   if (options?.skillName) params.set("skillName", options.skillName);
   return new EventSource(
@@ -1352,6 +1382,39 @@ export async function fetchSourceDirectory(
   await throwIfNotOk(res, "Failed to list files");
   const body = (await res.json()) as { entries?: unknown };
   return Array.isArray(body.entries) ? (body.entries as SourceDirectoryEntry[]) : [];
+}
+
+/**
+ * Recursive file/directory walk for the `@`-mention picker (issue #312).
+ * Returns a flat list of every path under the active worktree (subject
+ * to the server's depth/limit caps and its denylist of directories
+ * that should never be mentioned — `node_modules`, `.git`, build
+ * artifacts, …). The list is then fuzzy-matched client-side so the
+ * picker can rank candidates as the user types.
+ *
+ * The walk is bounded: the server caps depth (default 8, max 32) and
+ * node count (default 2000, max 20000), and returns a `truncated`
+ * flag when the cap is hit. Callers should surface the truncation as
+ * a hint in the picker rather than a hard error.
+ */
+export async function fetchSourceIndex(
+  projectId: string,
+  worktreeId?: string,
+  options?: { depth?: number; limit?: number }
+): Promise<{ entries: SourceDirectoryEntry[]; truncated: boolean }> {
+  const params = new URLSearchParams();
+  if (options?.depth) params.set("depth", String(options.depth));
+  if (options?.limit) params.set("limit", String(options.limit));
+  const query = withWorktree(worktreeId, params);
+  const res = await fetch(`${BASE}/projects/${projectId}/file-index${query}`);
+  await throwIfNotOk(res, "Failed to index files");
+  const body = (await res.json()) as { entries?: unknown; truncated?: unknown };
+  return {
+    entries: Array.isArray(body.entries)
+      ? (body.entries as SourceDirectoryEntry[])
+      : [],
+    truncated: body.truncated === true,
+  };
 }
 
 export async function deleteWorktree(

@@ -62,6 +62,7 @@ import {
   fetchModels,
   fetchSourceDirectory,
   fetchSourceFile,
+  fetchSourceIndex,
   fetchTerminalTabs,
   fetchAgentProviders,
   fetchSession,
@@ -110,6 +111,16 @@ import {
   buildSkillAgentText,
   parseSkillMarkers,
 } from "../lib/skill-picker.ts";
+import {
+  parseMentionTokenAtCaret,
+  removeMentionToken,
+  buildMentionContextBlock,
+  scoreMentionCandidate,
+  normalizeMentionPath,
+  inferMentionType,
+  parseMentionBlock,
+  type FileMention,
+} from "../lib/file-picker.ts";
 import { modelProviderLabel } from "../lib/model-labels.ts";
 import {
   buildComposerDraftKey,
@@ -1397,10 +1408,24 @@ const EventBlock = memo(function EventBlock({
   // user_message: show as chat bubble. If one or more skills were active,
   // render a `Skill: <name>` badge per marker (in declaration order) and
   // strip the leading `[/skill: name]` chain from the visible text.
+  // Mention chips are restored from the deterministic
+  // `<mentions>...</mentions>` block the backend prepends to the
+  // persisted history (issue #312): the same block re-parses on reload
+  // so the bubble mirrors the chips the user saw in the composer.
   if (event.type === "user_message" && data.text) {
     const attachments = (data.attachments as SessionAttachment[] | undefined) ?? [];
     const rawText = normalizeMarkdownText(data.text);
-    const { skillNames, text: visibleText } = parseSkillMarkers(rawText);
+    // The server persists the `<mentions>...</mentions>` block BEFORE
+    // the skill markers, so the raw text starts with `<mentions>` for
+    // any turn that combined both. The marker parsers are
+    // position-agnostic only within their own leading pattern: a
+    // `<mentions>...[/skill: x]` payload would never match
+    // `parseSkillMarkers` (no leading `[/skill:`), and after
+    // stripping the mention block the skill marker would leak into
+    // the visible text. Parse the mention block first, then the
+    // skill markers.
+    const { mentions, text: withoutMentions } = parseMentionBlock(rawText);
+    const { skillNames, text: visibleText } = parseSkillMarkers(withoutMentions);
     return (
       <div className="flex justify-end">
         <div className="max-w-[85%]">
@@ -1415,6 +1440,24 @@ const EventBlock = memo(function EventBlock({
                   >
                     <Sparkles className="h-3 w-3 text-primary" />
                     <span>Skill: {skillName}</span>
+                  </span>
+                ))}
+              </div>
+            )}
+            {mentions.length > 0 && (
+              <div className="mb-1.5 flex flex-wrap justify-end gap-1">
+                {mentions.map((mention, index) => (
+                  <span
+                    key={`${mention.path}-${index}`}
+                    className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/70 px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+                    title={`${mention.type}: ${mention.path}`}
+                  >
+                    {mention.type === "directory" ? (
+                      <Folder className="h-3 w-3 text-primary" />
+                    ) : (
+                      <FileCode className="h-3 w-3 text-primary" />
+                    )}
+                    <span className="font-mono">@{mention.path}</span>
                   </span>
                 ))}
               </div>
@@ -3019,6 +3062,19 @@ export function SessionView({
   // Caret position in the composer, used to scan the token under the caret so
   // the `/` picker opens from any position (not only the start of the input).
   const [caretPos, setCaretPos] = useState(0);
+  // File/directory mentions. The `@` picker is the data-source side of the
+  // composer (issue #312): the chips render above the textarea, the
+  // resolved paths ride through to the backend on send, and the
+  // deterministic `<mentions>` block the backend builds is persisted to
+  // history so session replays are reproducible.
+  const [activeMentions, setActiveMentions] = useState<FileMention[]>([]);
+  const [mentionPopoverOpen, setMentionPopoverOpen] = useState(false);
+  const [mentionHighlightIndex, setMentionHighlightIndex] = useState(0);
+  const [mentionCandidates, setMentionCandidates] = useState<
+    { relativePath: string; type: "file" | "directory" }[]
+  >([]);
+  const [mentionCandidatesLoading, setMentionCandidatesLoading] = useState(false);
+  const highlightedMentionRef = useRef<HTMLButtonElement | null>(null);
   // Caret to restore after a chip is applied and the textarea value changes.
   const pendingCaretRef = useRef<number | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -3870,7 +3926,15 @@ export function SessionView({
               sessionId,
               undefined,
               undefined,
-              { skillName: undefined }
+              { skillName: undefined },
+              // Snapshot the composer's mention stack at the moment
+              // of the emulated steer so the resumed run still
+              // includes the chips the user added before pressing
+              // Enter to steer (issue #312 P2). Without this, the
+              // mention chips would silently drop on the resumed
+              // turn and the agent prompt would be missing the
+              // file context the user already saw in the composer.
+              activeMentions.slice()
             );
             return;
           }
@@ -4167,6 +4231,178 @@ export function SessionView({
     textareaRef.current?.focus();
   }, []);
 
+  // File-mention picker. The popover opens whenever the token under the
+  // caret looks like an `@<path>` invocation (any position, not only the
+  // start of the input). The candidate list is a flat file index of
+  // the active worktree (fetched via `fetchSourceIndex` — bounded by
+  // the server's depth/limit caps and a denylist of directories that
+  // should never be mentioned: `node_modules`, `.git`, build outputs,
+  // …) and fuzzy-matched against the typed needle. Fetching a single
+  // flat list lets a user type `@lib` and see `client/src/lib/...`
+  // without the picker having to first descend into `client/src/`.
+  // The index is scoped to the active worktree by the server, which is
+  // the same boundary check the file-tree pane uses (issue #312
+  // acceptance criteria: "scoped to the active worktree").
+  const mentionQuery = useMemo(
+    () => parseMentionTokenAtCaret(message, caretPos),
+    [message, caretPos]
+  );
+  const isMentionActive = useCallback(
+    (mention: { relativePath: string }) =>
+      activeMentions.some((entry) => entry.path === mention.relativePath),
+    [activeMentions]
+  );
+  // Index cache keyed by project+worktree. The walk is bounded but
+  // still a few hundred entries on a real repo, so re-fetching on
+  // every keystroke would be wasteful. The cache is invalidated on
+  // project/worktree change (the effect below).
+  const mentionIndexKeyRef = useRef<string | null>(null);
+  const mentionIndexAbortRef = useRef<AbortController | null>(null);
+  // `truncated` flags an index that hit the server's node cap. The
+  // picker surfaces this as a hint so the user knows the list is
+  // not exhaustive (issue #312 follow-up: "nested files and folders
+  // are not listed" — the truncation flag is the picker-side signal
+  // for when the recursion was cut short).
+  const [mentionIndexTruncated, setMentionIndexTruncated] = useState(false);
+  useEffect(() => {
+    // Reset the candidate list whenever the active worktree changes so
+    // a stale entry from the previous project can't leak into the
+    // picker. The open popover also closes (the user is now in a
+    // different worktree).
+    const key = `${projectId}:${worktreeId ?? ""}`;
+    if (mentionIndexKeyRef.current === key) return;
+    mentionIndexKeyRef.current = key;
+    setMentionCandidates([]);
+    setMentionIndexTruncated(false);
+    setMentionPopoverOpen(false);
+    setMentionHighlightIndex(0);
+    if (mentionIndexAbortRef.current) {
+      mentionIndexAbortRef.current.abort();
+    }
+  }, [projectId, worktreeId]);
+  useEffect(() => {
+    if (mentionQuery === null) {
+      setMentionPopoverOpen(false);
+      return;
+    }
+    // The picker opens as soon as `@` is typed. The candidate list
+    // starts from whatever the index has produced so far; the index
+    // fetch effect below kicks off a (cached) load the first time
+    // the picker opens for a given worktree, and reuses the cache on
+    // subsequent opens. A fast typist never triggers multiple
+    // fetches because the index effect is keyed by project+worktree.
+    setMentionPopoverOpen(true);
+    setMentionHighlightIndex(0);
+  }, [mentionQuery, projectId, worktreeId]);
+  // Index fetch. Runs once per (project, worktree) — re-runs on
+  // project/worktree change, debounced implicitly by React's effect
+  // ordering. A fast typist never triggers multiple fetches because
+  // the worktree key is stable across keystrokes.
+  useEffect(() => {
+    if (mentionIndexAbortRef.current) {
+      mentionIndexAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    mentionIndexAbortRef.current = controller;
+    setMentionCandidatesLoading(true);
+    fetchSourceIndex(projectId, worktreeId)
+      .then(({ entries, truncated }) => {
+        if (controller.signal.aborted) return;
+        setMentionCandidates(
+          entries.map((entry) => ({
+            relativePath: entry.relativePath,
+            type: entry.type,
+          }))
+        );
+        setMentionIndexTruncated(truncated);
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        // A failed index fetch (e.g. the worktree is being created)
+        // clears the list and leaves the popover open — the user can
+        // close it with Esc. The error is silently swallowed; the
+        // picker is an exploratory tool and a transient 500 is a
+        // recoverable state.
+        if (err instanceof Error) {
+          setMentionCandidates([]);
+        } else {
+          setMentionCandidates([]);
+        }
+        setMentionIndexTruncated(false);
+      })
+      .finally(() => {
+        if (controller.signal.aborted) return;
+        setMentionCandidatesLoading(false);
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [projectId, worktreeId]);
+  const filteredMentions = useMemo(() => {
+    if (mentionQuery === null) return [];
+    const needle = normalizeMentionPath(mentionQuery.token);
+    const ranked = mentionCandidates
+      .map((candidate) => ({
+        candidate,
+        score: scoreMentionCandidate(needle, candidate),
+      }))
+      .filter(
+        (entry): entry is { candidate: typeof entry.candidate; score: number } =>
+          entry.score !== null,
+      )
+      .sort((a, b) => b.score - a.score);
+    return ranked.slice(0, 50).map((entry) => entry.candidate);
+  }, [mentionCandidates, mentionQuery]);
+  // Keep the highlight index in range whenever the candidate list
+  // changes (matches the slash-command picker's behavior).
+  useEffect(() => {
+    if (mentionPopoverOpen) {
+      setMentionHighlightIndex((current) =>
+        Math.min(current, Math.max(filteredMentions.length - 1, 0))
+      );
+    }
+  }, [filteredMentions.length, mentionPopoverOpen]);
+  // Scroll the highlighted option into view as the user navigates.
+  useEffect(() => {
+    if (!mentionPopoverOpen) return;
+    highlightedMentionRef.current?.scrollIntoView({ block: "nearest" });
+  }, [mentionHighlightIndex, mentionPopoverOpen]);
+  /**
+   * Add the chosen path to the mention stack and strip the in-progress
+   * `@<token>` from the textarea. Adding the same path twice is a
+   * no-op (the same chip is already on the stack). The candidate
+   * carries the picker-discovered `type` (file or directory) so the
+   * backend can resolve the right path kind.
+   */
+  const addMention = useCallback(
+    (candidate: {
+      relativePath: string;
+      type: "file" | "directory";
+    }): string | null => {
+      if (mentionQuery === null) return null;
+      const { message: newMessage, caret } = removeMentionToken(message, mentionQuery);
+      setMessage(newMessage);
+      pendingCaretRef.current = caret;
+      setActiveMentions((prev) =>
+        prev.some((entry) => entry.path === candidate.relativePath)
+          ? prev
+          : [...prev, { path: candidate.relativePath, type: candidate.type }]
+      );
+      setMentionPopoverOpen(false);
+      textareaRef.current?.focus();
+      return newMessage;
+    },
+    [mentionQuery, message]
+  );
+  const removeMention = useCallback((index: number) => {
+    setActiveMentions((prev) => prev.filter((_, i) => i !== index));
+    textareaRef.current?.focus();
+  }, []);
+  const clearAllMentions = useCallback(() => {
+    setActiveMentions([]);
+    textareaRef.current?.focus();
+  }, []);
+
   // Restore the caret after a chip is applied: `addSkillToStack` updates the
   // textarea value, so the cursor must be repositioned once React re-renders.
   useEffect(() => {
@@ -4240,7 +4476,13 @@ export function SessionView({
       reasoningEffort?: ReasoningEffort;
       serviceTier?: ServiceTier;
       skillName?: string;
-    }
+    },
+    // File/directory mentions from the `@` picker. Forwarded to the
+    // backend on the `mentions` query param (issue #312). The backend
+    // is the source of truth for the resolved preview, so what reaches
+    // the agent is the deterministic `<mentions>...</mentions>` block
+    // — not the original chip list.
+    mentions?: FileMention[],
   ) => {
     if (!sentMessage.trim() || streamingRef.current) return false;
     if (!providerReady) {
@@ -4310,6 +4552,13 @@ export function SessionView({
       mode: supportsPlanMode(runProvider) ? modeOverride ?? selectedMode : "default",
       worktreeId,
       attachmentIds,
+      // Continuations (queue replay, emulated steer) accept mentions
+      // via the explicit `mentions` argument — the caller snapshots
+      // the right state at the point of the action. Fresh sends
+      // default to the composer's current mention stack. The
+      // backend re-checks every path against the worktree root
+      // before reading, so this is a hint, not an authorization.
+      mentions: runOverrides ? mentions : mentions ?? activeMentions,
       skillName: runSkillName,
     });
     eventSourceRef.current = es;
@@ -4576,7 +4825,12 @@ export function SessionView({
             completedSessionId,
             undefined,
             undefined,
-            { skillName: undefined }
+            { skillName: undefined },
+            // Snapshot the composer's mention stack at the moment
+            // of the emulated steer (issue #312 P2). See the
+            // matching comment on the other emulated-steer call
+            // site for the rationale.
+            activeMentions.slice()
           );
           return;
         }
@@ -4748,7 +5002,9 @@ export function SessionView({
     setComposerAttachments([]);
     setMessage("");
     setActiveSkills([]);
+    setActiveMentions([]);
     setSkillPopoverOpen(false);
+    setMentionPopoverOpen(false);
     clearComposerDraft(composerDraftKey);
   };
 
@@ -4769,6 +5025,10 @@ export function SessionView({
     // the local transcript, matching what the server persists.
     const agentMessage = buildSkillAgentText(skillNames, rawText);
     const visibleMessage = buildSkillHistoryText(skillNames, rawText);
+    // Snapshot the mention stack at send time: `activeMentions` is reset by
+    // `clearComposer` on the success path, so the snapshot has to be taken
+    // before the async `uploadSessionAttachments` call resolves.
+    const mentions = activeMentions.slice();
     setAttachmentError(null);
     try {
       const uploadedAttachments = await uploadComposerAttachments();
@@ -4779,7 +5039,9 @@ export function SessionView({
           undefined,
           undefined,
           uploadedAttachments.map((attachment) => attachment.id),
-          uploadedAttachments
+          uploadedAttachments,
+          undefined,
+          mentions,
         )
       ) {
         clearComposer();
@@ -4813,6 +5075,7 @@ export function SessionView({
     const visibleMessage = buildSkillHistoryText(skillNames, rawText);
     try {
       const uploadedAttachments = await uploadComposerAttachments();
+      const mentions = activeMentions.slice();
       const input: QueuedMessageInput = {
         text: agentMessage,
         visibleText: visibleMessage,
@@ -4828,6 +5091,7 @@ export function SessionView({
         mode: providerSupportsPlanMode ? selectedMode : "default",
         attachmentIds: uploadedAttachments.map((attachment) => attachment.id),
         skillName: activeSkills[0]?.name,
+        mentions,
       };
       const queued = await enqueueSessionMessage(projectId, targetSessionId, input);
       setQueue((prev) => [...prev, queued]);
@@ -4985,6 +5249,43 @@ export function SessionView({
       if (e.key === "Escape") {
         e.preventDefault();
         setSkillPopoverOpen(false);
+        return;
+      }
+      return;
+    }
+    if (mentionPopoverOpen && filteredMentions.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMentionHighlightIndex((current) =>
+          (current + 1) % filteredMentions.length
+        );
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMentionHighlightIndex((current) =>
+          (current - 1 + filteredMentions.length) % filteredMentions.length
+        );
+        return;
+      }
+      if (e.key === "Tab" || e.key === "Enter") {
+        e.preventDefault();
+        const choice = filteredMentions[mentionHighlightIndex];
+        if (!choice || isMentionActive(choice)) return;
+        // Tab always adds and keeps typing; Enter only submits when the
+        // typed token is an exact path match (mirrors the skill picker
+        // behavior). Shift+Enter / Shift+Tab add and submit. The
+        // submit-after-chip effect is shared with the skill picker so a
+        // mention+submit keystroke goes through the same path.
+        const newMessage = addMention(choice);
+        if (newMessage !== null && (e.shiftKey || e.key === "Enter")) {
+          setPendingSkillSubmit({ text: newMessage });
+        }
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMentionPopoverOpen(false);
         return;
       }
       return;
@@ -5701,12 +6002,54 @@ export function SessionView({
                     const item = render.item;
 
                     if (item.type === "user_message") {
+                      const rawText = normalizeMarkdownText(item.text);
+                      // Match the persisted-history path: the server
+                      // emits the `<mentions>` block before the
+                      // skill markers, so parse the mention block
+                      // first. Doing it the other way round leaves
+                      // the skill marker visible as prose and the
+                      // skill chip unrendered.
+                      const { mentions, text: withoutMentions } =
+                        parseMentionBlock(rawText);
+                      const { skillNames, text: visibleText } =
+                        parseSkillMarkers(withoutMentions);
                       return (
                         <div key={render.key} className="flex justify-end">
                           <div className="max-w-[85%]">
                             <AttachmentStrip attachments={item.attachments} />
                             <div className="rounded-2xl bg-secondary px-4 py-3 text-sm">
-                              <CollapsibleUserMessage text={normalizeMarkdownText(item.text)} />
+                              {skillNames.length > 0 && (
+                                <div className="mb-1.5 flex flex-wrap justify-end gap-1">
+                                  {skillNames.map((skillName, index) => (
+                                    <span
+                                      key={`${skillName}-${index}`}
+                                      className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/70 px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+                                    >
+                                      <Sparkles className="h-3 w-3 text-primary" />
+                                      <span>Skill: {skillName}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {mentions.length > 0 && (
+                                <div className="mb-1.5 flex flex-wrap justify-end gap-1">
+                                  {mentions.map((mention, index) => (
+                                    <span
+                                      key={`${mention.path}-${index}`}
+                                      className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/70 px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+                                      title={`${mention.type}: ${mention.path}`}
+                                    >
+                                      {mention.type === "directory" ? (
+                                        <Folder className="h-3 w-3 text-primary" />
+                                      ) : (
+                                        <FileCode className="h-3 w-3 text-primary" />
+                                      )}
+                                      <span className="font-mono">@{mention.path}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              <CollapsibleUserMessage text={visibleText} />
                             </div>
                           </div>
                         </div>
@@ -5945,6 +6288,42 @@ export function SessionView({
                       )}
                     </div>
                   )}
+                  {activeMentions.length > 0 && !mentionPopoverOpen && (
+                    <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                      {activeMentions.map((mention, index) => (
+                        <span
+                          key={`${mention.path}-${index}`}
+                          data-testid="active-mention-chip"
+                          className="inline-flex items-center gap-1 rounded-full border border-border bg-background px-2 py-1 text-xs font-medium text-foreground"
+                          title={`${mention.type}: ${mention.path}`}
+                        >
+                          {mention.type === "directory" ? (
+                            <Folder className="h-3 w-3 text-primary" />
+                          ) : (
+                            <FileCode className="h-3 w-3 text-primary" />
+                          )}
+                          <span className="font-mono">@{mention.path}</span>
+                          <button
+                            type="button"
+                            onClick={() => removeMention(index)}
+                            className="ml-1 flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                            aria-label={`Remove mention ${mention.path}`}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                      {activeMentions.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={clearAllMentions}
+                          className="text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+                        >
+                          Clear all
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <div className="relative">
                     <textarea
                       ref={textareaRef}
@@ -5982,10 +6361,10 @@ export function SessionView({
                             ? "Send to queue"
                             : `Enter to queue · ${STEER_KEY_LABEL} to steer`
                           : availableSkills.length > 0
-                          ? "Describe what you want to build… type / to use a skill"
+                          ? "Describe what you want to build… type / for a skill, @ to mention a file"
                           : sessionId
-                          ? "Ask for follow-up changes"
-                          : "Describe what you want to build..."
+                          ? "Ask for follow-up changes — type @ to mention a file"
+                          : "Describe what you want to build… type @ to mention a file"
                       }
                       rows={1}
                       disabled={steerInProgress}
@@ -6057,6 +6436,94 @@ export function SessionView({
                           </span>
                           <span>
                             <Kbd>Tab</Kbd> to add · <Kbd>⇧Enter</Kbd> to add &amp; send · <Kbd>Esc</Kbd> to dismiss
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    {mentionPopoverOpen && (
+                      <div
+                        role="listbox"
+                        aria-label="Files"
+                        className="absolute bottom-full left-0 z-20 mb-1 w-[min(28rem,calc(100vw-2rem))] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+                        onMouseDown={(e) => e.preventDefault()}
+                      >
+                        <div className="flex items-center justify-between px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                          <span>Files in worktree</span>
+                          {mentionIndexTruncated && (
+                            <span
+                              className="font-normal normal-case text-muted-foreground/80"
+                              title="Index reached the server's node cap; some paths may be missing."
+                            >
+                              truncated
+                            </span>
+                          )}
+                        </div>
+                        <div className="max-h-64 overflow-y-auto">
+                          {filteredMentions.length === 0 ? (
+                            <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                              {mentionCandidatesLoading
+                                ? "Indexing worktree…"
+                                : mentionCandidates.length === 0
+                                ? "No files indexed."
+                                : "No matches."}
+                            </div>
+                          ) : (
+                            filteredMentions.map((entry, index) => {
+                              const active = isMentionActive(entry);
+                              return (
+                                <button
+                                  key={entry.relativePath}
+                                  ref={
+                                    index === mentionHighlightIndex
+                                      ? highlightedMentionRef
+                                      : undefined
+                                  }
+                                  type="button"
+                                  role="option"
+                                  aria-selected={index === mentionHighlightIndex}
+                                  aria-disabled={active}
+                                  disabled={active}
+                                  onClick={() => addMention(entry)}
+                                  onMouseEnter={() => setMentionHighlightIndex(index)}
+                                  className={`flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+                                    active
+                                      ? "cursor-not-allowed opacity-50"
+                                      : index === mentionHighlightIndex
+                                      ? "bg-accent text-accent-foreground"
+                                      : "text-popover-foreground hover:bg-accent/60"
+                                  }`}
+                                >
+                                  {entry.type === "directory" ? (
+                                    <Folder className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                                  ) : (
+                                    <FileCode className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                                  )}
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-center gap-1.5 text-sm font-medium">
+                                      <span className="truncate font-mono">
+                                        @{entry.relativePath}
+                                      </span>
+                                      <Badge variant="outline" className="text-[10px]">
+                                        {entry.type}
+                                      </Badge>
+                                      {active && (
+                                        <span className="text-[10px] font-normal text-muted-foreground">
+                                          added
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                </button>
+                              );
+                            })
+                          )}
+                        </div>
+                        <div className="mt-1 flex items-center justify-between border-t border-border/60 px-2 py-1 text-[10px] text-muted-foreground">
+                          <span>
+                            <Kbd>↑</Kbd> <Kbd>↓</Kbd> to navigate
+                          </span>
+                          <span>
+                            <Kbd>Tab</Kbd> to add · <Kbd>Enter</Kbd> to add &amp; send · <Kbd>Esc</Kbd> to dismiss
                           </span>
                         </div>
                       </div>

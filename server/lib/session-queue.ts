@@ -27,6 +27,13 @@ export interface QueuedMessage {
   mode: "default" | "plan";
   attachmentIds: string[];
   skillName?: string;
+  /**
+   * File/directory mentions from the composer's `@` picker (issue #312).
+   * The orchestrator snapshots the chip stack at enqueue time and the
+   * queue-replay effect re-sends it on the next turn so the resolved
+   * mention block in the prompt matches what the user typed.
+   */
+  mentions?: { path: string; type: "file" | "directory" }[];
   createdAt: string;
 }
 
