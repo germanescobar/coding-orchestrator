@@ -225,10 +225,15 @@ export const __test__fetchCloudflareModels = fetchCloudflareModels;
 
 const STALE_CODEX_MODEL_IDS = new Set(["gpt-5.3-codex"]);
 
+/**
+ * Sort key for the Codex model picker. The single `default` model sorts to
+ * the top; everything else preserves the caller's ordering via the stable
+ * sort in `normalizeCodexModels` — we want the picker to read in the order
+ * we list the models in `getCodexModels` (newest generation first, then
+ * tier from flagship → balanced → fast → real-time).
+ */
 function getCodexModelPriority(model: Model): number {
-  if (model.size === "default") return 0;
-  if (model.id === "gpt-5.5") return 1;
-  return 2;
+  return model.size === "default" ? 0 : 1;
 }
 
 function normalizeCodexModels(models: Model[]): Model[] {
@@ -240,7 +245,10 @@ function normalizeCodexModels(models: Model[]): Model[] {
 /** Well-known models available through Codex CLI (user authenticates separately). */
 function getCodexModels(): Model[] {
   return normalizeCodexModels([
-    { id: "gpt-5.5", name: "GPT-5.5", provider: "codex", size: "default" },
+    { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", provider: "codex", size: "default" },
+    { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", provider: "codex", size: "balanced" },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "codex", size: "fast" },
+    { id: "gpt-5.5", name: "GPT-5.5", provider: "codex", size: "flagship" },
     { id: "gpt-5.4", name: "GPT-5.4", provider: "codex", size: "flagship" },
     { id: "gpt-5.4-mini", name: "GPT-5.4 Mini", provider: "codex", size: "fast" },
     { id: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark", provider: "codex", size: "real-time" },
