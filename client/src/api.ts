@@ -536,7 +536,16 @@ export interface QueuedMessage {
   createdAt: string;
 }
 
-export type QueuedMessageInput = Omit<QueuedMessage, "id" | "createdAt">;
+export interface QueuedMessageInput extends Omit<QueuedMessage, "id" | "createdAt"> {
+  /**
+   * File/directory mentions from the composer's `@` picker (issue #312).
+   * The orchestrator snapshots the chip stack at enqueue time and the
+   * queue-replay effect re-sends it on the next turn so the resolved
+   * mention block in the prompt matches what the user typed. Mirrors
+   * the `mentions` query param on `startSession`.
+   */
+  mentions?: { path: string; type: "file" | "directory" }[];
+}
 
 export async function fetchSessionQueue(
   projectId: string,
@@ -1185,6 +1194,14 @@ export function startSession(
     mode?: "default" | "plan";
     worktreeId?: string;
     attachmentIds?: string[];
+    /**
+     * Repo-relative paths the user referenced with `@` in the composer
+     * (issue #312). The backend resolves each path against the active
+     * worktree, reads a preview, and prepends a deterministic
+     * `<mentions>...</mentions>` block to the agent prompt so two runs
+     * that mention the same files produce identical prompts.
+     */
+    mentions?: { path: string; type: "file" | "directory" }[];
     skillName?: string;
   }
 ): EventSource {
@@ -1198,6 +1215,19 @@ export function startSession(
   if (options?.worktreeId) params.set("worktreeId", options.worktreeId);
   if (options?.attachmentIds?.length) {
     params.set("attachmentIds", options.attachmentIds.join(","));
+  }
+  if (options?.mentions?.length) {
+    // The backend re-checks every path against the worktree root before
+    // reading it, so this list is a hint, not an authorization. The
+    // serialised form is `path|type,path|type,…` so a single comma-
+    // separated query param carries both fields without a second round
+    // trip. Reorder-preserving: the backend sorts by request order so
+    // the mention block in the prompt matches the chip order in the
+    // composer.
+    const encoded = options.mentions
+      .map((mention) => `${mention.path}|${mention.type}`)
+      .join(",");
+    params.set("mentions", encoded);
   }
   if (options?.skillName) params.set("skillName", options.skillName);
   return new EventSource(
