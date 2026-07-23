@@ -1384,6 +1384,39 @@ export async function fetchSourceDirectory(
   return Array.isArray(body.entries) ? (body.entries as SourceDirectoryEntry[]) : [];
 }
 
+/**
+ * Recursive file/directory walk for the `@`-mention picker (issue #312).
+ * Returns a flat list of every path under the active worktree (subject
+ * to the server's depth/limit caps and its denylist of directories
+ * that should never be mentioned — `node_modules`, `.git`, build
+ * artifacts, …). The list is then fuzzy-matched client-side so the
+ * picker can rank candidates as the user types.
+ *
+ * The walk is bounded: the server caps depth (default 8, max 32) and
+ * node count (default 2000, max 20000), and returns a `truncated`
+ * flag when the cap is hit. Callers should surface the truncation as
+ * a hint in the picker rather than a hard error.
+ */
+export async function fetchSourceIndex(
+  projectId: string,
+  worktreeId?: string,
+  options?: { depth?: number; limit?: number }
+): Promise<{ entries: SourceDirectoryEntry[]; truncated: boolean }> {
+  const params = new URLSearchParams();
+  if (options?.depth) params.set("depth", String(options.depth));
+  if (options?.limit) params.set("limit", String(options.limit));
+  const query = withWorktree(worktreeId, params);
+  const res = await fetch(`${BASE}/projects/${projectId}/file-index${query}`);
+  await throwIfNotOk(res, "Failed to index files");
+  const body = (await res.json()) as { entries?: unknown; truncated?: unknown };
+  return {
+    entries: Array.isArray(body.entries)
+      ? (body.entries as SourceDirectoryEntry[])
+      : [],
+    truncated: body.truncated === true,
+  };
+}
+
 export async function deleteWorktree(
   projectId: string,
   worktreeId: string

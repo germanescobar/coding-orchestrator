@@ -62,6 +62,7 @@ import {
   fetchModels,
   fetchSourceDirectory,
   fetchSourceFile,
+  fetchSourceIndex,
   fetchTerminalTabs,
   fetchAgentProviders,
   fetchSession,
@@ -4241,13 +4242,16 @@ export function SessionView({
 
   // File-mention picker. The popover opens whenever the token under the
   // caret looks like an `@<path>` invocation (any position, not only the
-  // start of the input). The candidate list is built by walking the
-  // current directory listing (one level deep, with a second pass for
-  // directory subtrees the user has navigated into) and fuzzy-matching
-  // the needle against each entry's `relativePath`. The backend's
-  // `fetchSourceDirectory` is the same data source the file-tree pane
-  // uses, so the picker is naturally scoped to the active worktree
-  // (issue #312 acceptance criteria: "scoped to the active worktree").
+  // start of the input). The candidate list is a flat file index of
+  // the active worktree (fetched via `fetchSourceIndex` — bounded by
+  // the server's depth/limit caps and a denylist of directories that
+  // should never be mentioned: `node_modules`, `.git`, build outputs,
+  // …) and fuzzy-matched against the typed needle. Fetching a single
+  // flat list lets a user type `@lib` and see `client/src/lib/...`
+  // without the picker having to first descend into `client/src/`.
+  // The index is scoped to the active worktree by the server, which is
+  // the same boundary check the file-tree pane uses (issue #312
+  // acceptance criteria: "scoped to the active worktree").
   const mentionQuery = useMemo(
     () => parseMentionTokenAtCaret(message, caretPos),
     [message, caretPos]
@@ -4257,28 +4261,32 @@ export function SessionView({
       activeMentions.some((entry) => entry.path === mention.relativePath),
     [activeMentions]
   );
-  // Debounced directory walk. The picker fetches the root listing on
-  // first open and on every change of project/worktree; deeper levels
-  // are fetched lazily as the user types a path that descends into a
-  // directory. `inFlightRef` cancels stale requests when the user
-  // keeps typing.
-  const mentionDirectoryRef = useRef<string | null>(null);
-  const mentionDirectoryAbortRef = useRef<AbortController | null>(null);
-  const mentionSubtreeAbortRef = useRef<AbortController | null>(null);
+  // Index cache keyed by project+worktree. The walk is bounded but
+  // still a few hundred entries on a real repo, so re-fetching on
+  // every keystroke would be wasteful. The cache is invalidated on
+  // project/worktree change (the effect below).
+  const mentionIndexKeyRef = useRef<string | null>(null);
+  const mentionIndexAbortRef = useRef<AbortController | null>(null);
+  // `truncated` flags an index that hit the server's node cap. The
+  // picker surfaces this as a hint so the user knows the list is
+  // not exhaustive (issue #312 follow-up: "nested files and folders
+  // are not listed" — the truncation flag is the picker-side signal
+  // for when the recursion was cut short).
+  const [mentionIndexTruncated, setMentionIndexTruncated] = useState(false);
   useEffect(() => {
     // Reset the candidate list whenever the active worktree changes so
     // a stale entry from the previous project can't leak into the
-    // picker. The directory the picker walks also resets, and the
-    // open popover closes (the user is now in a different worktree).
+    // picker. The open popover also closes (the user is now in a
+    // different worktree).
+    const key = `${projectId}:${worktreeId ?? ""}`;
+    if (mentionIndexKeyRef.current === key) return;
+    mentionIndexKeyRef.current = key;
     setMentionCandidates([]);
+    setMentionIndexTruncated(false);
     setMentionPopoverOpen(false);
     setMentionHighlightIndex(0);
-    mentionDirectoryRef.current = null;
-    if (mentionDirectoryAbortRef.current) {
-      mentionDirectoryAbortRef.current.abort();
-    }
-    if (mentionSubtreeAbortRef.current) {
-      mentionSubtreeAbortRef.current.abort();
+    if (mentionIndexAbortRef.current) {
+      mentionIndexAbortRef.current.abort();
     }
   }, [projectId, worktreeId]);
   useEffect(() => {
@@ -4287,48 +4295,49 @@ export function SessionView({
       return;
     }
     // The picker opens as soon as `@` is typed. The candidate list
-    // starts empty; the effect below fetches the current directory
-    // listing (or the parent of the typed path) and populates it.
+    // starts from whatever the index has produced so far; the index
+    // fetch effect below kicks off a (cached) load the first time
+    // the picker opens for a given worktree, and reuses the cache on
+    // subsequent opens. A fast typist never triggers multiple
+    // fetches because the index effect is keyed by project+worktree.
     setMentionPopoverOpen(true);
     setMentionHighlightIndex(0);
-    setMentionCandidatesLoading(true);
-    // Cancel any in-flight request before issuing a new one so a fast
-    // typist doesn't race stale responses into the popover.
-    if (mentionDirectoryAbortRef.current) {
-      mentionDirectoryAbortRef.current.abort();
+  }, [mentionQuery, projectId, worktreeId]);
+  // Index fetch. Runs once per (project, worktree) — re-runs on
+  // project/worktree change, debounced implicitly by React's effect
+  // ordering. A fast typist never triggers multiple fetches because
+  // the worktree key is stable across keystrokes.
+  useEffect(() => {
+    if (mentionIndexAbortRef.current) {
+      mentionIndexAbortRef.current.abort();
     }
     const controller = new AbortController();
-    mentionDirectoryAbortRef.current = controller;
-    // If the typed token contains a slash, walk into that directory so
-    // the picker shows entries under the current path; otherwise list
-    // the worktree root. The backend's `fetchSourceDirectory` returns
-    // an empty array (not an error) when the path doesn't exist, which
-    // keeps the picker graceful while the user is mid-typing.
-    const lastSlash = mentionQuery.token.lastIndexOf("/");
-    const dirPath =
-      lastSlash === -1 ? "" : mentionQuery.token.slice(0, lastSlash) || "";
-    mentionDirectoryRef.current = dirPath;
-    fetchSourceDirectory(projectId, dirPath || undefined, worktreeId)
-      .then((entries) => {
+    mentionIndexAbortRef.current = controller;
+    setMentionCandidatesLoading(true);
+    fetchSourceIndex(projectId, worktreeId)
+      .then(({ entries, truncated }) => {
         if (controller.signal.aborted) return;
-        const projected = entries.map((entry) => ({
-          relativePath: entry.relativePath,
-          type: entry.type,
-        }));
-        setMentionCandidates(projected);
+        setMentionCandidates(
+          entries.map((entry) => ({
+            relativePath: entry.relativePath,
+            type: entry.type,
+          }))
+        );
+        setMentionIndexTruncated(truncated);
       })
       .catch((err) => {
         if (controller.signal.aborted) return;
-        // A failed directory walk (e.g. the typed path doesn't exist
-        // yet) clears the list and leaves the popover open — the user
-        // can keep typing or backspace to recover. The error is
-        // silently swallowed; the picker is an exploratory tool and a
-        // missing directory is an expected mid-typing state.
+        // A failed index fetch (e.g. the worktree is being created)
+        // clears the list and leaves the popover open — the user can
+        // close it with Esc. The error is silently swallowed; the
+        // picker is an exploratory tool and a transient 500 is a
+        // recoverable state.
         if (err instanceof Error) {
           setMentionCandidates([]);
         } else {
           setMentionCandidates([]);
         }
+        setMentionIndexTruncated(false);
       })
       .finally(() => {
         if (controller.signal.aborted) return;
@@ -4337,7 +4346,7 @@ export function SessionView({
     return () => {
       controller.abort();
     };
-  }, [mentionQuery, projectId, worktreeId]);
+  }, [projectId, worktreeId]);
   const filteredMentions = useMemo(() => {
     if (mentionQuery === null) return [];
     const needle = normalizeMentionPath(mentionQuery.token);
@@ -6434,15 +6443,25 @@ export function SessionView({
                         className="absolute bottom-full left-0 z-20 mb-1 w-[min(28rem,calc(100vw-2rem))] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
                         onMouseDown={(e) => e.preventDefault()}
                       >
-                        <div className="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                          Files in worktree
+                        <div className="flex items-center justify-between px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                          <span>Files in worktree</span>
+                          {mentionIndexTruncated && (
+                            <span
+                              className="font-normal normal-case text-muted-foreground/80"
+                              title="Index reached the server's node cap; some paths may be missing."
+                            >
+                              truncated
+                            </span>
+                          )}
                         </div>
                         <div className="max-h-64 overflow-y-auto">
                           {filteredMentions.length === 0 ? (
                             <div className="px-2 py-1.5 text-xs text-muted-foreground">
                               {mentionCandidatesLoading
-                                ? "Searching…"
-                                : "No matches in this directory."}
+                                ? "Indexing worktree…"
+                                : mentionCandidates.length === 0
+                                ? "No files indexed."
+                                : "No matches."}
                             </div>
                           ) : (
                             filteredMentions.map((entry, index) => {
