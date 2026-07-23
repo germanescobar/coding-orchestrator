@@ -47,20 +47,36 @@ export const NATIVE_SCRIPT_DIR = ".controller";
 export const LEGACY_NATIVE_SCRIPT_DIR = ".coding-orchestrator";
 
 /*
- * Resolves which native-script directory a project uses. Prefers the current
- * `.controller/` directory; falls back to the legacy `.coding-orchestrator/`
- * directory only when that is the one present on disk. A project with neither
- * (a brand-new project) resolves to `.controller/`, so all fresh writes land
- * in the new location while an already-onboarded `.coding-orchestrator/` repo
- * keeps reading and writing its existing directory. Mirrors the read-both /
- * no-auto-move shape of the macOS-home migration in #223.
+ * Resolves which native-script directory a project uses. Prefers the
+ * current `.controller/` directory, but only if it actually contains
+ * the project scripts; otherwise falls back to the legacy
+ * `.coding-orchestrator/` directory. A project with neither resolves
+ * to `.controller/`, so all fresh writes land in the new location
+ * while an already-onboarded `.coding-orchestrator/` repo keeps
+ * reading and writing its existing directory.
+ *
+ * The presence check looks at the *scripts* (`run.sh` / `setup.sh`),
+ * not the directory: an empty `.controller/` directory left over from
+ * onboarding must not win over a populated legacy directory, or the
+ * resolved `run` command is empty and the UI shows "No run script
+ * configured" for projects that obviously have one. Mirrors the
+ * read-both / no-auto-move shape of the macOS-home migration in #223.
  */
 export function resolveNativeScriptDir(projectPath: string): string {
   const current = path.join(projectPath, NATIVE_SCRIPT_DIR);
-  if (existsSync(current)) return current;
+  if (hasNativeScripts(current)) return current;
   const legacy = path.join(projectPath, LEGACY_NATIVE_SCRIPT_DIR);
-  if (existsSync(legacy)) return legacy;
+  if (hasNativeScripts(legacy)) return legacy;
   return current;
+}
+
+function hasNativeScripts(dir: string): boolean {
+  if (!existsSync(dir)) return false;
+  return (
+    existsSync(path.join(dir, "run.sh")) ||
+    existsSync(path.join(dir, "setup.sh")) ||
+    existsSync(path.join(dir, "archive.sh"))
+  );
 }
 
 export async function resolveProjectScripts(projectPath: string): Promise<ProjectScripts> {
