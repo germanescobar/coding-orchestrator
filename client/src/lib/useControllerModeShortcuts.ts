@@ -272,6 +272,8 @@ export function labelForAction(
     controllerModeNext: "ctrl-n",
     controllerModeDone: "ctrl-d",
     controllerModeStay: "ctrl-s",
+    filesPanelToggle: "cmd-b",
+    filesPanelSearch: "cmd-p",
   }[action];
   return formatChord(bindings?.[action] ?? fallback, isMacPlatform());
 }

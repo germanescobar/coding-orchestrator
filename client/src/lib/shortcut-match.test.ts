@@ -285,7 +285,16 @@ test("DEFAULT_SHORTCUT_BINDINGS use ctrl-* (Cmd collides with too many macOS cho
   // Guard against an accidental revert: a Cmd-default on macOS would
   // collide with Cmd+W / Cmd+Q / Cmd+R / Cmd+T (the last one is the
   // browser's "new tab" shortcut). See issue #235.
+  //
+  // Exception: the Files-panel actions (issue #313) deliberately
+  // default to `cmd-b` / `cmd-p` so the chord matches the editor
+  // convention users already know. Neither chord collides with a
+  // macOS system shortcut, so we carve them out here rather than
+  // give up the editor-default feel. Update this allowlist when a
+  // new chord is added.
+  const cmdAllowed = new Set(["filesPanelToggle", "filesPanelSearch"]);
   for (const [action, chord] of Object.entries(DEFAULT_SHORTCUT_BINDINGS)) {
+    if (cmdAllowed.has(action)) continue;
     assert.ok(
       chord.startsWith("ctrl-"),
       `default for ${action} should be ctrl-* but was ${chord}`,

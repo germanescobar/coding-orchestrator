@@ -11,7 +11,9 @@ type ShortcutActionId =
   | "controllerModeToggle"
   | "controllerModeNext"
   | "controllerModeDone"
-  | "controllerModeStay";
+  | "controllerModeStay"
+  | "filesPanelToggle"
+  | "filesPanelSearch";
 
 type ShortcutBindings = Record<ShortcutActionId, string>;
 
@@ -20,6 +22,8 @@ const ACTION_IDS: ReadonlySet<ShortcutActionId> = new Set([
   "controllerModeNext",
   "controllerModeDone",
   "controllerModeStay",
+  "filesPanelToggle",
+  "filesPanelSearch",
 ]);
 
 const DEFAULT_BINDINGS: Readonly<Record<ShortcutActionId, string>> = {
@@ -27,6 +31,8 @@ const DEFAULT_BINDINGS: Readonly<Record<ShortcutActionId, string>> = {
   controllerModeNext: "ctrl-n",
   controllerModeDone: "ctrl-d",
   controllerModeStay: "ctrl-s",
+  filesPanelToggle: "cmd-b",
+  filesPanelSearch: "cmd-p",
 };
 
 /**

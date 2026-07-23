@@ -24,7 +24,9 @@ export type ShortcutActionId =
   | "controllerModeToggle"
   | "controllerModeNext"
   | "controllerModeDone"
-  | "controllerModeStay";
+  | "controllerModeStay"
+  | "filesPanelToggle"
+  | "filesPanelSearch";
 
 export interface ShortcutActionSpec {
   id: ShortcutActionId;
@@ -57,6 +59,18 @@ export const SHORTCUT_ACTIONS: ShortcutActionSpec[] = [
     label: "Stay on session",
     description: "Cancel a pending focus-queue advance countdown.",
   },
+  {
+    id: "filesPanelToggle",
+    label: "Toggle Files panel",
+    description:
+      "Open the right-side Files panel on the file explorer, or close it when it's already showing the file explorer. Mirrors the editor convention.",
+  },
+  {
+    id: "filesPanelSearch",
+    label: "Find file",
+    description:
+      "Open a fuzzy file finder scoped to the active worktree. Type to filter by path; Enter jumps to the selected file in the Files panel.",
+  },
 ];
 
 /**
@@ -66,12 +80,22 @@ export const SHORTCUT_ACTIONS: ShortcutActionSpec[] = [
  * to override one of those. The matcher is strict per-platform
  * (see `client/src/lib/shortcut-match.ts`), so a stored `ctrl-n`
  * matches ⌃N on macOS and Ctrl+N everywhere else — never both.
+ *
+ * Files-panel chords are the exception: `cmd-b` and `cmd-p` mirror
+ * the VS Code / Cursor / Sublime / Atom defaults for "toggle
+ * explorer" and "open file". Neither is in `RESERVED_SHORTCUTS` and
+ * neither collides with a macOS system chord, so accepting Cmd here
+ * matches the editor convention users already know. The matcher
+ * still applies the strict per-platform rule, so on Linux/Windows
+ * the same `cmd-b` chord fires on Ctrl+B.
  */
 export const DEFAULT_SHORTCUT_BINDINGS: Record<ShortcutActionId, string> = {
   controllerModeToggle: "ctrl-t",
   controllerModeNext: "ctrl-n",
   controllerModeDone: "ctrl-d",
   controllerModeStay: "ctrl-s",
+  filesPanelToggle: "cmd-b",
+  filesPanelSearch: "cmd-p",
 };
 
 /** Reserved OS / browser chords we warn about (but don't block). */
