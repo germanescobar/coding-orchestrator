@@ -47,6 +47,8 @@ import { TerminalMobileControls } from "@/components/terminal-mobile-controls";
 import { useResizablePanel } from "@/lib/useResizablePanel";
 import { isControllerAvailable } from "@/lib/controller";
 import { formatChord, matchesEvent, parseChord } from "@/lib/shortcut-match";
+import { useFilePanelShortcuts } from "@/lib/useFilePanelShortcuts";
+import { FileFinderDialog } from "@/components/FileFinderDialog";
 import {
   usePreviewPane,
   useActivePreviewPane,
@@ -2987,6 +2989,13 @@ export function SessionView({
   const [runScriptPending, setRunScriptPending] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("agent");
   const [rightTab, setRightTab] = useState<RightPanelTab>("terminal");
+  // Tracks the file path(s) the user has opened in the Files panel,
+  // most recent first. Used to rank recently-opened files at the top
+  // of the fuzzy file finder before the user types anything (issue
+  // #313). Capped so the list doesn't grow unbounded.
+  const [recentFilePaths, setRecentFilePaths] = useState<string[]>([]);
+  const [fileFinderOpen, setFileFinderOpen] = useState(false);
+  const MAX_RECENT_FILES = 8;
   const [gitDiffFiles, setGitDiffFiles] = useState<DiffFile[]>([]);
   const [gitDiffLoaded, setGitDiffLoaded] = useState(false);
   const [branchDiffFiles, setBranchDiffFiles] = useState<DiffFile[]>([]);
@@ -5344,6 +5353,14 @@ export function SessionView({
         setTerminalOpen(true);
         setRightTab("files");
         setMobilePanel("files");
+        // Promote `path` to the head of the recent list so the fuzzy
+        // file finder can surface it before the user types anything
+        // (issue #313). We dedupe against the existing list and cap
+        // at MAX_RECENT_FILES so the list doesn't grow unbounded.
+        setRecentFilePaths((current) => {
+          const filtered = current.filter((entry) => entry !== path);
+          return [path, ...filtered].slice(0, MAX_RECENT_FILES);
+        });
       })
       .catch((err) => {
         toast.error(err instanceof Error ? err.message : `Could not open ${errorLabel}`);
@@ -5353,6 +5370,56 @@ export function SessionView({
   const openSourceReference = useCallback((reference: OpenSourceReferenceOptions) => {
     openSourcePath(reference.path, reference.line, reference.label);
   }, [openSourcePath]);
+
+  // Files-panel keyboard shortcuts (issue #313):
+  //   - Toggle: open the right panel on the `files` tab if it isn't
+  //     already showing the file explorer; otherwise close the right
+  //     panel entirely (mirrors VS Code / Cursor semantics).
+  //   - Search: open the fuzzy file finder overlay. We intentionally
+  //     do NOT close the right panel — the dialog is a modal that
+  //     floats above the rest of the UI (matches VS Code / Cursor,
+  //     where Cmd+P leaves the explorer in place). When the user
+  //     picks a file, `openSourcePath` re-opens / focuses the panel
+  //     on the `files` tab.
+  //
+  // The close-branch condition mirrors the JSX that decides whether
+  // the files panel is actually on screen: it's visible whenever
+  // `rightTab === "files"` AND the right panel itself is rendered
+  // (either `terminalOpen` on desktop, or any non-`"agent"` value
+  // of `mobilePanel` on mobile). The previous check demanded
+  // `mobilePanel === "files"` literally, which never held on
+  // desktop because desktop's `mobilePanel` stays at its default
+  // `"agent"` — so Cmd+B while the explorer was already visible
+  // would silently *re-open* it instead of closing (issue #313
+  // review feedback).
+  const filesPanelVisible =
+    rightTab === "files" && (terminalOpen || mobilePanel !== "agent");
+  const handleFilesPanelToggle = useCallback(() => {
+    if (filesPanelVisible) {
+      setTerminalOpen(false);
+      setRightTab("terminal");
+      setMobilePanel("agent");
+      return;
+    }
+    setTerminalOpen(true);
+    setRightTab("files");
+    setMobilePanel("files");
+  }, [filesPanelVisible]);
+
+  const handleFilesPanelSearch = useCallback(() => {
+    // Open the file finder as a modal overlay; leave the right
+    // panel alone so the user doesn't lose the explorer's context
+    // (matches the VS Code / Cursor behaviour where Cmd+P leaves
+    // the explorer in place). Picking a result routes through
+    // `openSourcePath`, which then focuses the panel on `files`.
+    setFileFinderOpen(true);
+  }, []);
+
+  useFilePanelShortcuts({
+    bindings: shortcutBindings ?? null,
+    onToggle: handleFilesPanelToggle,
+    onSearch: handleFilesPanelSearch,
+  });
 
   // The live preview pane (state + `<webview>` + bridge socket) is owned by the
   // app-level pool, keyed by `projectId:worktreeId` to match the worktree the
@@ -5859,6 +5926,21 @@ export function SessionView({
           </form>
         </DialogContent>
       </Dialog>
+
+      {/* Fuzzy file finder — invoked by `filesPanelSearch` (default
+          `cmd-p`, issue #313). Selecting a result runs the same
+          `openSourcePath` path the Files tab uses, so the chosen
+          file expands in the tree and the right panel snaps to the
+          `files` tab. */}
+      <FileFinderDialog
+        open={fileFinderOpen}
+        onOpenChange={setFileFinderOpen}
+        projectId={projectId}
+        worktreeId={worktreeId}
+        recent={recentFilePaths}
+        onSelect={openSourcePath}
+        bindings={shortcutBindings ?? null}
+      />
 
       {/* Main content area: chat + terminal side by side on desktop, tabbed on mobile */}
       <div className="flex flex-1 min-h-0">
