@@ -36,6 +36,7 @@ import {
   ShortcutBindingsProvider,
   useShortcutBindingsContext,
 } from "./lib/useShortcutBindings.tsx";
+import { FileIndexProvider } from "./lib/useFileIndex.tsx";
 import { FocusAdvanceToast } from "./components/focus-advance-toast.tsx";
 import { pickNextFocusItem } from "./lib/focus-advance.ts";
 
@@ -116,7 +117,9 @@ function loadSavedView(): View {
 export function App() {
   return (
     <ShortcutBindingsProvider>
-      <AppBody />
+      <FileIndexProvider>
+        <AppBody />
+      </FileIndexProvider>
     </ShortcutBindingsProvider>
   );
 }

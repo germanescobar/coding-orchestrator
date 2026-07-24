@@ -1,6 +1,7 @@
 const BASE = "/api";
 
 import type { ShortcutBindings } from "../../shared/shortcuts.ts";
+import { shouldExcludeDirectory } from "./lib/file-excludes.ts";
 
 export interface Project {
   id: string;
@@ -1351,7 +1352,16 @@ export async function fetchSourceDirectory(
   const res = await fetch(`${BASE}/projects/${projectId}/files${query}`);
   await throwIfNotOk(res, "Failed to list files");
   const body = (await res.json()) as { entries?: unknown };
-  return Array.isArray(body.entries) ? (body.entries as SourceDirectoryEntry[]) : [];
+  const raw = Array.isArray(body.entries) ? (body.entries as SourceDirectoryEntry[]) : [];
+  // Apply the client-side skip list (issue #313). See
+  // `client/src/lib/file-excludes.ts` for the rationale. The server
+  // still returns every entry — filtering here keeps the
+  // `SourceDirectoryEntry` shape unchanged and makes it trivial to
+  // swap in a server-side filter later without touching consumers.
+  return raw.filter((entry) => {
+    if (entry.type !== "directory") return true;
+    return !shouldExcludeDirectory(entry.name);
+  });
 }
 
 export async function deleteWorktree(

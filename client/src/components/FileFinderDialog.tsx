@@ -6,7 +6,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Kbd } from "@/components/ui/kbd";
-import { fetchSourceDirectory } from "../api.ts";
 import {
   fuzzyMatchFiles,
   type FileFinderEntry,
@@ -17,43 +16,36 @@ import {
   DEFAULT_SHORTCUT_BINDINGS,
   type ShortcutBindings,
 } from "../../../shared/shortcuts.ts";
+import {
+  useFileIndex,
+  useFileIndexContext,
+} from "../lib/useFileIndex.tsx";
 
 /*
  * Fuzzy file finder dialog (issue #313).
  *
- * Mounts as a top-level `<Dialog>` so the user can summon it from
- * anywhere with `cmd-p` (or whatever they've rebound `filesPanelSearch`
- * to). The dialog:
+ * Mounts as a `Dialog` so the user can summon it from anywhere with
+ * `cmd-p` (or whatever they've rebound `filesPanelSearch` to).
  *
- *   1. Lazily walks the active worktree via the existing
- *      `fetchSourceDirectory` route, building an in-memory index of
- *      every file path. The walk is bounded by hard caps on the
- *      number of visited directories and indexed files, and each
- *      directory fetch is wrapped in a per-call timeout so a hung
- *      request can't pin the spinner forever. The dialog also
- *      surfaces results as they arrive (no need to wait for the
- *      whole walk) so typing feels instant even for huge repos.
- *   2. Re-renders the index whenever `projectId` / `worktreeId`
- *      change so the dialog stays scoped to the active worktree.
- *   3. Ranks recently-opened files first (via the `recent` prop) and
- *      falls back to fuzzy matching on the path otherwise.
- *   4. Supports keyboard navigation: `↑` / `↓` move the highlight,
- *      `Enter` opens the highlighted file, `Esc` dismisses.
+ * The index itself lives in the app-level `FileIndexProvider`
+ * (`client/src/lib/useFileIndex.tsx`) — a cache keyed by
+ * `${projectId}:${worktreeId}` that owns the file walk. The dialog
+ * is a pure consumer: it reads the current snapshot, fuzzy-matches
+ * the user's query, and re-renders as the walk streams in partial
+ * results. Re-opening the dialog is therefore instant — the
+ * previous walk's results are still in the cache.
  *
- * Selecting a result calls `onSelect(path)` and then closes the
- * dialog. The host (`SessionView`) wires `onSelect` to the existing
- * `openSourcePath` so the file expands in the tree and shows up in
- * the preview.
+ * Ranking:
+ *   - Empty query: recently-opened files first (preserving order),
+ *     then the alphabetical list, deduplicated by path.
+ *   - Non-empty query: fuzzy match by relative path, capped at
+ *     `RESULTS_LIMIT` to keep the list scrollable.
+ *
+ * Keyboard: `↑` / `↓` move the highlight, `Enter` opens the
+ * highlighted file, `Esc` dismisses.
  */
 
-const MAX_INDEXED_DIRECTORIES = 5_000;
-const MAX_INDEXED_FILES = 50_000;
 const RESULTS_LIMIT = 200;
-// Per-directory fetch timeout. A single hung request used to leave
-// the dialog stuck on "Indexing files…" forever; 6 s is long enough
-// to absorb a slow disk, short enough that a real outage fails
-// fast.
-const DIRECTORY_FETCH_TIMEOUT_MS = 6_000;
 
 export interface FileFinderDialogProps {
   open: boolean;
@@ -79,8 +71,6 @@ export interface FileFinderDialogProps {
   bindings: ShortcutBindings | null;
 }
 
-type IndexStatus = "idle" | "indexing" | "ready" | "error";
-
 export function FileFinderDialog({
   open,
   onOpenChange,
@@ -91,165 +81,39 @@ export function FileFinderDialog({
   bindings,
 }: FileFinderDialogProps) {
   const [query, setQuery] = useState("");
-  const [entries, setEntries] = useState<FileFinderEntry[]>([]);
-  // The indexer reports one of four states. `indexing` shows the
-  // spinner, `error` shows a clear message + Retry button, `ready`
-  // shows the results, and `idle` is the initial pre-fetch state.
-  const [status, setStatus] = useState<IndexStatus>("idle");
-  const [indexError, setIndexError] = useState<string | null>(null);
   const [highlightIndex, setHighlightIndex] = useState(0);
-  // Bumped every time the user retries; the indexer's effect picks
-  // it up to re-run from scratch.
-  const [retryNonce, setRetryNonce] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  // Latest props are kept in refs so the index builder (which kicks
-  // off async fetches and resolves later) always sees the active
-  // `projectId` / `worktreeId` / `recent` list without re-running on
-  // every render.
-  const projectIdRef = useRef(projectId);
-  const worktreeIdRef = useRef(worktreeId);
-  const requestSeqRef = useRef(0);
+  // Latest `onSelect` is kept in a ref so the result buttons don't
+  // have to re-bind on every render.
   const onSelectRef = useRef(onSelect);
-
   useEffect(() => {
-    projectIdRef.current = projectId;
-    worktreeIdRef.current = worktreeId;
     onSelectRef.current = onSelect;
-  }, [projectId, worktreeId, onSelect]);
+  }, [onSelect]);
 
-  // Build / rebuild the in-memory index whenever the dialog opens,
-  // the active worktree changes, or the user hits Retry. We reset
-  // to an empty list and resequence requests so an in-flight stale
-  // fetch can't overwrite a fresher one. Results are streamed into
-  // `entries` as each directory returns, so the user can type and
-  // see matches against whatever's been indexed so far instead of
-  // waiting for the whole walk to finish.
+  // Subscribe to the file index for the active worktree. The walk
+  // starts the first time the provider sees a subscriber, so the
+  // dialog doesn't need to do anything to kick it off.
+  const index = useFileIndex(projectId, worktreeId);
+  const { retry } = useFileIndexContext();
+
+  // Reset the query and highlight when the dialog closes, so
+  // re-opening starts from a clean state.
   useEffect(() => {
-    if (!open) {
-      setQuery("");
-      setHighlightIndex(0);
-      return;
-    }
-    let cancelled = false;
-    const seq = ++requestSeqRef.current;
-    setStatus("indexing");
-    setIndexError(null);
-    setEntries([]);
+    if (open) return;
+    setQuery("");
+    setHighlightIndex(0);
+  }, [open]);
 
-    const projectIdCurrent = projectId;
-    const worktreeIdCurrent = worktreeId;
-    const next: FileFinderEntry[] = [];
-    const seenPaths = new Set<string>();
-    const queue: string[] = [""];
-    let visited = 0;
-    let stopped = false;
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const flushEntries = () => {
-      if (cancelled || seq !== requestSeqRef.current) return;
-      // Snapshot a copy so React's setState can compare by reference
-      // and we don't keep re-rendering on every individual entry.
-      setEntries(next.slice());
-    };
-
-    const scheduleFlush = () => {
-      if (flushTimer !== null) return;
-      // Throttle UI updates to one render per animation frame so a
-      // big tree doesn't drown the input field in renders.
-      flushTimer = setTimeout(() => {
-        flushTimer = null;
-        flushEntries();
-      }, 50);
-    };
-
-    const process = async () => {
-      while (queue.length > 0) {
-        if (cancelled) return;
-        if (seq !== requestSeqRef.current) return;
-        if (visited >= MAX_INDEXED_DIRECTORIES || next.length >= MAX_INDEXED_FILES) {
-          stopped = true;
-          break;
-        }
-        const dirPath = queue.shift()!;
-        visited++;
-        let dirEntries;
-        try {
-          dirEntries = await fetchSourceDirectoryWithTimeout(
-            projectIdCurrent,
-            dirPath || undefined,
-            worktreeIdCurrent,
-            DIRECTORY_FETCH_TIMEOUT_MS,
-          );
-        } catch (err) {
-          // A single bad directory shouldn't poison the whole walk,
-          // but a wrong worktree / missing server usually means every
-          // fetch will fail with the same error. Surface the first
-          // error verbatim, stop the walk, and show a Retry button.
-          // The user can then fix the underlying cause (e.g. select
-          // a valid worktree) and re-run.
-          if (cancelled || seq !== requestSeqRef.current) return;
-          setStatus("error");
-          setIndexError(
-            err instanceof Error ? err.message : "Failed to list files",
-          );
-          return;
-        }
-        if (cancelled || seq !== requestSeqRef.current) return;
-        for (const entry of dirEntries) {
-          if (seenPaths.has(entry.path)) continue;
-          seenPaths.add(entry.path);
-          if (entry.type === "file") {
-            next.push({
-              path: entry.path,
-              relativePath: entry.relativePath,
-              name: entry.name,
-            });
-            if (next.length >= MAX_INDEXED_FILES) {
-              stopped = true;
-              break;
-            }
-          } else {
-            queue.push(entry.path);
-          }
-        }
-        scheduleFlush();
-        // Yield to the event loop between batches so a large repo
-        // doesn't starve the input field's typing.
-        if (queue.length > 0 && visited % 8 === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        }
-      }
-      if (cancelled || seq !== requestSeqRef.current) return;
-      if (flushTimer !== null) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      next.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
-      setEntries(next);
-      setStatus("ready");
-      if (stopped) {
-        setIndexError(
-          `Indexed ${next.length} files (capped at ${MAX_INDEXED_FILES}). Refine the query to narrow the result.`,
-        );
-      }
-    };
-
-    void process();
-    return () => {
-      cancelled = true;
-      if (flushTimer !== null) clearTimeout(flushTimer);
-    };
-  }, [open, projectId, worktreeId, retryNonce]);
-
-  // Reset highlight whenever the result list shape changes so the
-  // keyboard selection always lands on a visible row.
+  // Reset highlight whenever the result list shape changes (new
+  // query, new entries arrived) so the keyboard selection always
+  // lands on a visible row.
   useEffect(() => {
     setHighlightIndex(0);
-  }, [query, entries.length, open]);
+  }, [query, index.entries.length, open]);
 
   const matches = useMemo<FileFinderMatch[]>(() => {
-    if (entries.length === 0) return [];
-    const fuzzy = fuzzyMatchFiles(entries, query);
+    if (index.entries.length === 0) return [];
+    const fuzzy = fuzzyMatchFiles(index.entries, query);
     if (fuzzy.length === 0) return [];
     if (!query.trim()) {
       // Empty query: surface `recent` first (preserving order) then
@@ -267,7 +131,7 @@ export function FileFinderDialog({
       return ordered.slice(0, RESULTS_LIMIT);
     }
     return fuzzy.slice(0, RESULTS_LIMIT);
-  }, [entries, query, recent]);
+  }, [index.entries, query, recent]);
 
   // Keep the highlighted row in view when the user navigates with
   // arrow keys.
@@ -316,23 +180,26 @@ export function FileFinderDialog({
   );
 
   const handleRetry = useCallback(() => {
-    setRetryNonce((current) => current + 1);
-  }, []);
+    retry(projectId, worktreeId);
+  }, [retry, projectId, worktreeId]);
 
   const hintChord = bindings?.filesPanelSearch ?? DEFAULT_SHORTCUT_BINDINGS.filesPanelSearch;
   const hintLabel = formatChord(hintChord, isMacPlatform());
-  const indexing = status === "indexing";
-  const showResults = status === "ready" || status === "indexing" || (status === "error" && entries.length > 0);
-  const showEmptyError = status === "error" && entries.length === 0;
-  const showEmpty = !indexing && !showEmptyError && matches.length === 0 && entries.length > 0;
-  const showNoFiles = !indexing && !showEmptyError && entries.length === 0;
+
+  const showEmptyError = index.status === "error" && index.entries.length === 0;
+  const showNoFiles =
+    index.status !== "indexing" && index.status !== "error" && index.entries.length === 0;
+  const showEmpty =
+    index.status === "ready" && matches.length === 0 && index.entries.length > 0;
+  const showResults = matches.length > 0;
+
   const footerHint = showEmptyError
     ? "Index failed"
-    : indexing
-    ? entries.length > 0
-      ? `Indexing… ${entries.length} files so far`
+    : index.status === "indexing"
+    ? index.entries.length > 0
+      ? `Indexing… ${index.entries.length} files so far`
       : "Indexing…"
-    : matches.length > 0
+    : showResults
     ? `${matches.length}${matches.length === RESULTS_LIMIT ? "+" : ""} results`
     : "Type to search";
 
@@ -364,7 +231,7 @@ export function FileFinderDialog({
                 <AlertCircle className="h-3.5 w-3.5 shrink-0" />
                 <span className="font-medium">Couldn&apos;t index files</span>
               </div>
-              <p className="text-amber-200/80">{indexError ?? "Unknown error."}</p>
+              <p className="text-amber-200/80">{index.error ?? "Unknown error."}</p>
               <button
                 type="button"
                 onClick={handleRetry}
@@ -383,16 +250,16 @@ export function FileFinderDialog({
               {`No matches for “${query}”.`}
             </div>
           ) : showResults ? (
-            matches.map((match, index) => {
-              const active = index === highlightIndex;
+            matches.map((match, indexInList) => {
+              const active = indexInList === highlightIndex;
               return (
                 <button
                   key={match.entry.path}
                   ref={(node) => {
-                    itemRefs.current[index] = node;
+                    itemRefs.current[indexInList] = node;
                   }}
                   type="button"
-                  onMouseEnter={() => setHighlightIndex(index)}
+                  onMouseEnter={() => setHighlightIndex(indexInList)}
                   onClick={() => handleSelect(match.entry.path)}
                   className={`flex w-full min-w-0 items-center gap-2 px-3 py-1.5 text-left text-xs ${
                     active
@@ -412,9 +279,9 @@ export function FileFinderDialog({
             })
           ) : null}
         </div>
-        {indexError && status === "ready" ? (
+        {index.error && index.status === "ready" ? (
           <div className="border-t border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-[10px] text-amber-200/80">
-            {indexError}
+            {index.error}
           </div>
         ) : null}
         <div className="flex items-center justify-between border-t border-border bg-muted/30 px-3 py-1.5 text-[10px] text-muted-foreground">
@@ -434,45 +301,15 @@ export function FileFinderDialog({
             </span>
           </div>
           <span className="flex items-center gap-1.5 font-mono">
-            {indexing ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            {index.status === "indexing" ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : null}
             {footerHint}
           </span>
         </div>
       </DialogContent>
     </Dialog>
   );
-}
-
-/**
- * Wraps `fetchSourceDirectory` with a per-call timeout. A hung
- * request used to leave the dialog stuck on "Indexing files…"
- * forever; this races the fetch against a timer and rejects if
- * either side wins, so the dialog's error path can run.
- */
-function fetchSourceDirectoryWithTimeout(
-  projectId: string,
-  dirPath: string | undefined,
-  worktreeId: string | undefined,
-  timeoutMs: number,
-): Promise<Awaited<ReturnType<typeof fetchSourceDirectory>>> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(
-        new Error(
-          `Timed out after ${timeoutMs / 1000}s while listing ${dirPath || "root"}`,
-        ),
-      );
-    }, timeoutMs);
-    fetchSourceDirectory(projectId, dirPath, worktreeId)
-      .then((value) => {
-        clearTimeout(timer);
-        resolve(value);
-      })
-      .catch((err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-  });
 }
 
 function renderHighlighted(match: FileFinderMatch): React.ReactNode {
