@@ -60,7 +60,19 @@ const MAX_INDEXED_DIRECTORIES = 5_000;
 const MAX_INDEXED_FILES = 50_000;
 const DIRECTORY_FETCH_TIMEOUT_MS = 6_000;
 
-export type IndexStatus = "idle" | "indexing" | "ready" | "error";
+export type IndexStatus =
+  | "idle"
+  | "indexing"
+  | "ready"
+  | "error"
+  /**
+   * Set by the `subscribe` cleanup when the last subscriber leaves
+   * while a walk is still in progress. The walk bails and the
+   * partial entries are kept in the cache; the next subscribe
+   * triggers a fresh walk so the user isn't left with a half-built
+   * index when they come back.
+   */
+  | "cancelled";
 
 export interface WorktreeIndex {
   /** All files discovered so far, in alphabetical `relativePath` order. */
@@ -92,6 +104,18 @@ interface IndexStateInternal {
    */
   seq: number;
   /**
+   * Cancellation flag, **owned by the state object** so the
+   * subscribe-cleanup path (which doesn't share a closure with the
+   * walk) can flip it when the last subscriber leaves. The walk
+   * reads it on every iteration; when set, the loop bails and the
+   * partial entries are kept in the cache so a future subscriber
+   * sees the work that was already done. Without this, navigating
+   * away from the worktree during a walk would keep the recursive
+   * fetch loop running in the background, making thousands of
+   * directory requests after the user has already moved on.
+   */
+  cancelled: boolean;
+  /**
    * Subscribers to `useSyncExternalStore`. Notified after every
    * committed change so React re-renders the dialog while the
    * walk streams in.
@@ -114,6 +138,7 @@ function emptyState(): IndexStateInternal {
     visited: 0,
     stopped: false,
     seq: 0,
+    cancelled: false,
     listeners: new Set(),
     refCount: 0,
   };
@@ -146,6 +171,15 @@ export interface FileIndexContextValue {
    * Used by the dialog's Retry button.
    */
   retry: (projectId: string, worktreeId: string | undefined) => void;
+  /**
+   * Drop the cached entries for the given worktree and start a
+   * fresh walk on the next subscription. Used by the dialog's
+   * Refresh button (issue #313 follow-up) when the user wants to
+   * see files created, renamed, or deleted after the initial
+   * walk. Unlike `retry` this *clears* the visible entries first
+   * so the user doesn't see a stale list flash for a frame.
+   */
+  invalidate: (projectId: string, worktreeId: string | undefined) => void;
 }
 
 const FileIndexContext = createContext<FileIndexContextValue | null>(null);
@@ -234,8 +268,11 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
   const startWalk = useCallback(
     (state: IndexStateInternal, projectId: string, worktreeId: string | undefined) => {
       // Bump the seq so any in-flight walk from a previous mount
-      // bails out. Also reset the visible state.
+      // bails out. Also reset the visible state. We clear the
+      // cancellation flag here too so a fresh walk isn't poisoned
+      // by a previous one being torn down.
       state.seq += 1;
+      state.cancelled = false;
       state.entries = [];
       state.status = "indexing";
       state.error = null;
@@ -251,11 +288,10 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
       const queue: string[] = [""];
       let visited = 0;
       let stopped = false;
-      let cancelled = false;
       let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
       const flushEntries = () => {
-        if (cancelled || state.seq !== seq) return;
+        if (state.cancelled || state.seq !== seq) return;
         state.entries = next.slice();
         state.visited = visited;
         invalidateSnapshot(state);
@@ -266,14 +302,14 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
         if (flushTimer !== null) return;
         flushTimer = setTimeout(() => {
           flushTimer = null;
-          if (cancelled || state.seq !== seq) return;
+          if (state.cancelled || state.seq !== seq) return;
           flushEntries();
         }, 50);
       };
 
       const process = async () => {
         while (queue.length > 0) {
-          if (cancelled || state.seq !== seq) return;
+          if (state.cancelled || state.seq !== seq) return;
           if (
             visited >= MAX_INDEXED_DIRECTORIES ||
             next.length >= MAX_INDEXED_FILES
@@ -292,7 +328,7 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
               DIRECTORY_FETCH_TIMEOUT_MS,
             );
           } catch (err) {
-            if (cancelled || state.seq !== seq) return;
+            if (state.cancelled || state.seq !== seq) return;
             state.status = "error";
             state.error =
               err instanceof Error ? err.message : "Failed to list files";
@@ -301,7 +337,7 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
             notify();
             return;
           }
-          if (cancelled || state.seq !== seq) return;
+          if (state.cancelled || state.seq !== seq) return;
           for (const entry of dirEntries) {
             if (seenPaths.has(entry.path)) continue;
             seenPaths.add(entry.path);
@@ -324,7 +360,7 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
             await new Promise((resolve) => setTimeout(resolve, 0));
           }
         }
-        if (cancelled || state.seq !== seq) return;
+        if (state.cancelled || state.seq !== seq) return;
         if (flushTimer !== null) {
           clearTimeout(flushTimer);
           flushTimer = null;
@@ -359,16 +395,41 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
       const state = ensureState(key);
       state.listeners.add(onChange);
       state.refCount += 1;
-      if (state.status === "idle") {
+      // Start a walk for fresh entries (`idle`) and for entries
+      // left in a partial state by a previous walk that was torn
+      // down via cleanup. The latter matters when the user
+      // navigates away during indexing and comes back later: the
+      // walk we started the first time around is already done, but
+      // it didn't reach `ready`, so we kick off a fresh one rather
+      // than leaving the user with a permanently partial index.
+      if (state.status === "idle" || state.status === "cancelled") {
         startWalk(state, projectId, worktreeId);
       }
       return () => {
         state.listeners.delete(onChange);
         state.refCount = Math.max(0, state.refCount - 1);
-        // We don't tear down the index when the last subscriber
-        // leaves — the cache is meant to survive dialog open/close
-        // cycles. If we wanted to free memory in a future v3 we
-        // could schedule a delayed teardown here.
+        if (state.refCount === 0) {
+          // Last subscriber left (e.g. the dialog closed and no
+          // other surface is using this index). Tear down the
+          // in-flight walk so the recursive fetch loop doesn't
+          // keep making directory requests after the user has
+          // moved on. The partial entries stay in the cache so a
+          // future subscriber sees the work already done; the
+          // status is flipped to `cancelled` so that next
+          // subscribe will re-walk instead of leaving the user
+          // stuck on a half-built index.
+          //
+          // The walk loop is driven by closure-local `cancelled`
+          // copies; we also keep a `state.cancelled` flag so this
+          // path can reach the loop without sharing the closure.
+          if (state.status === "indexing") {
+            state.cancelled = true;
+            state.seq += 1;
+            state.status = "cancelled";
+            invalidateSnapshot(state);
+            for (const listener of state.listeners) listener();
+          }
+        }
       };
     },
     [ensureState, startWalk],
@@ -392,9 +453,32 @@ export function FileIndexProvider({ children }: { children: ReactNode }) {
     [ensureState, startWalk],
   );
 
+  const invalidate = useCallback(
+    (projectId: string, worktreeId: string | undefined) => {
+      const key = indexKey(projectId, worktreeId);
+      const state = ensureState(key);
+      // Clear visible state up-front so the user doesn't see a
+      // flash of the previous (stale) list between this call and
+      // the new walk's first flush commit. The walk still has to
+      // run, so we keep the `cancelled` / seq / status semantics
+      // identical to `startWalk`'s prelude.
+      state.cancelled = true;
+      state.seq += 1;
+      state.entries = [];
+      state.status = "indexing";
+      state.error = null;
+      state.visited = 0;
+      state.stopped = false;
+      invalidateSnapshot(state);
+      for (const listener of state.listeners) listener();
+      startWalk(state, projectId, worktreeId);
+    },
+    [startWalk],
+  );
+
   const value = useMemo<FileIndexContextValue>(
-    () => ({ subscribe, getSnapshot, retry }),
-    [subscribe, getSnapshot, retry],
+    () => ({ subscribe, getSnapshot, retry, invalidate }),
+    [subscribe, getSnapshot, retry, invalidate],
   );
 
   return (

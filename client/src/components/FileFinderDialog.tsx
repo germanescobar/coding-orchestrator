@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, ChevronRight, FileText, Loader2, Search } from "lucide-react";
+import { AlertCircle, ChevronRight, FileText, Loader2, RefreshCw, Search } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -94,7 +94,7 @@ export function FileFinderDialog({
   // starts the first time the provider sees a subscriber, so the
   // dialog doesn't need to do anything to kick it off.
   const index = useFileIndex(projectId, worktreeId);
-  const { retry } = useFileIndexContext();
+  const { retry, invalidate } = useFileIndexContext();
 
   // Reset the query and highlight when the dialog closes, so
   // re-opening starts from a clean state.
@@ -182,6 +182,19 @@ export function FileFinderDialog({
   const handleRetry = useCallback(() => {
     retry(projectId, worktreeId);
   }, [retry, projectId, worktreeId]);
+
+  // Manual refresh for the cached index. The cache survives
+  // open/close cycles of the dialog, which is great for the
+  // "Cmd+P is instant" UX — but it means files created, renamed,
+  // or deleted after the initial walk don't show up until the
+  // walk re-runs. We expose a Refresh button (next to the
+  // existing keyboard hints) so the user can force a rebuild
+  // without switching worktrees or reloading the app. Differs
+  // from `retry` in that it also clears the cached entries
+  // up-front so the user doesn't see a flash of the stale list.
+  const handleRefresh = useCallback(() => {
+    invalidate(projectId, worktreeId);
+  }, [invalidate, projectId, worktreeId]);
 
   const hintChord = bindings?.filesPanelSearch ?? DEFAULT_SHORTCUT_BINDINGS.filesPanelSearch;
   const hintLabel = formatChord(hintChord, isMacPlatform());
@@ -300,12 +313,30 @@ export function FileFinderDialog({
               close
             </span>
           </div>
-          <span className="flex items-center gap-1.5 font-mono">
-            {index.status === "indexing" ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : null}
-            {footerHint}
-          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRefresh}
+              disabled={index.status === "indexing"}
+              className="flex items-center gap-1 rounded text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              title="Re-index the worktree (picks up new, renamed, or deleted files)"
+              aria-label="Re-index worktree"
+              data-testid="file-finder-refresh"
+            >
+              <RefreshCw
+                className={`h-3 w-3 ${
+                  index.status === "indexing" ? "animate-spin" : ""
+                }`}
+              />
+              Refresh
+            </button>
+            <span className="flex items-center gap-1.5 font-mono">
+              {index.status === "indexing" ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : null}
+              {footerHint}
+            </span>
+          </div>
         </div>
       </DialogContent>
     </Dialog>

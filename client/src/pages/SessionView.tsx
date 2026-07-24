@@ -5080,8 +5080,21 @@ export function SessionView({
   //     where Cmd+P leaves the explorer in place). When the user
   //     picks a file, `openSourcePath` re-opens / focuses the panel
   //     on the `files` tab.
+  //
+  // The close-branch condition mirrors the JSX that decides whether
+  // the files panel is actually on screen: it's visible whenever
+  // `rightTab === "files"` AND the right panel itself is rendered
+  // (either `terminalOpen` on desktop, or any non-`"agent"` value
+  // of `mobilePanel` on mobile). The previous check demanded
+  // `mobilePanel === "files"` literally, which never held on
+  // desktop because desktop's `mobilePanel` stays at its default
+  // `"agent"` — so Cmd+B while the explorer was already visible
+  // would silently *re-open* it instead of closing (issue #313
+  // review feedback).
+  const filesPanelVisible =
+    rightTab === "files" && (terminalOpen || mobilePanel !== "agent");
   const handleFilesPanelToggle = useCallback(() => {
-    if (terminalOpen && rightTab === "files" && mobilePanel === "files") {
+    if (filesPanelVisible) {
       setTerminalOpen(false);
       setRightTab("terminal");
       setMobilePanel("agent");
@@ -5090,7 +5103,7 @@ export function SessionView({
     setTerminalOpen(true);
     setRightTab("files");
     setMobilePanel("files");
-  }, [terminalOpen, rightTab, mobilePanel]);
+  }, [filesPanelVisible]);
 
   const handleFilesPanelSearch = useCallback(() => {
     // Open the file finder as a modal overlay; leave the right
