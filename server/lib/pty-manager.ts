@@ -153,13 +153,41 @@ function captureTmuxPane(sessionId: string, lines: number): string | null {
   return null;
 }
 
-function buildTmuxShellCommand(env?: Record<string, string>): string {
+/* Env vars we always strip from the user's interactive shell inside a tmux
+ * session. The user's shell and anything it launches — pagers (`less`,
+ * `git log`), `tput`, `stty`, `vim` — read the terminal size from
+ * `ioctl(TIOCGWINSZ)` on the controlling pty. If a stale `LINES` / `COLUMNS`
+ * is inherited from the parent (Electron's main process sets them in
+ * packaged builds, and tmux's own env may carry them through), tools trust
+ * the env value and skip the pager entirely on a tall pane. Removing them
+ * from the launch `env -u ...` chain forces every child to read the actual
+ * pty size, which the controller's tmux pane reports correctly once
+ * `window-size latest` is set (issue #317). */
+const PAGER_ENV_TO_UNSET = ["LINES", "COLUMNS"] as const;
+
+/**
+ * Build the command that `tmux new-session` runs in the pane. The
+ * `env -u …` chain strips Controller's own runtime vars *and* `LINES` /
+ * `COLUMNS` so pagers fall back to `ioctl(TIOCGWINSZ)` on the actual tmux
+ * pane size instead of trusting a stale value (issue #317). Exported so
+ * tests can assert the `env -u …` chain directly without spinning up a
+ * live tmux session.
+ */
+export function buildTmuxShellCommand(env?: Record<string, string>): string {
   const shell = process.env.SHELL || "/bin/sh";
   // Strip Controller's own runtime vars (e.g. NODE_ENV=production, our PORT) so
   // the user's interactive shell — and anything launched from it — never
   // inherits them. `-u` removes them even if the tmux server's environment
   // passed them in, and runs before any per-worktree assignments in `env`.
-  const parts = ["exec", "env", ...CONTROLLER_INTERNAL_ENV.map((key) => `-u ${key}`)];
+  // Also strip `LINES` / `COLUMNS` so pagers fall back to `ioctl` and read
+  // the actual tmux pane size instead of a stale value from the parent env
+  // (issue #317).
+  const parts = [
+    "exec",
+    "env",
+    ...CONTROLLER_INTERNAL_ENV.map((key) => `-u ${key}`),
+    ...PAGER_ENV_TO_UNSET.map((key) => `-u ${key}`),
+  ];
   if (env) parts.push(formatEnvAssignments(env));
   parts.push(shellQuote(shell), "-i");
   return parts.join(" ");
@@ -197,6 +225,23 @@ function setTmuxEnvironment(sessionName: string, env: Record<string, string>): v
   }
 }
 
+/* Initial size for newly created tmux panes. Without an explicit -x/-y, tmux
+ * uses the *attaching* client's size at attach time, which for the controller
+ * is 80x24 (hard-coded in `pty.spawn` until the first client resize arrives)
+ * — that means the pane is 24 rows tall and pagers like `less` / `git log`
+ * page immediately even when the user has a 50-row terminal visible
+ * (issue #317). We give the pane a reasonable starting size so the user's
+ * first `git log` after opening the terminal sees a tall-enough pane and
+ * doesn't page. Once the client fit → WS resize pipeline reports the real
+ * size, `window-size latest` (set in `configureTmuxSession`) takes over.
+ *
+ * The values are not advertised to the user; they're a "best guess until
+ * the real size arrives" that matches the typical controller terminal
+ * (≈200 cols × 50 rows) and the default 80x24 fallback when no
+ * client-reported size is available. */
+const DEFAULT_TMUX_PANE_COLS = 200;
+const DEFAULT_TMUX_PANE_ROWS = 50;
+
 function ensureTmuxSession(sessionName: string, cwd: string, env?: Record<string, string>): void {
   const exists = (() => {
     try {
@@ -212,7 +257,22 @@ function ensureTmuxSession(sessionName: string, cwd: string, env?: Record<string
   if (!exists) {
     // Always launch through the shell wrapper, even without per-worktree env,
     // so Controller's internal vars are stripped from every tmux session.
-    const args = ["new-session", "-d", "-s", sessionName, "-c", cwd, buildTmuxShellCommand(env)];
+    // `-x` / `-y` set the *pane* size at creation; without them tmux uses
+    // the attaching client's size (issue #317), which for us is 80x24 and
+    // makes pagers trigger on every first command.
+    const args = [
+      "new-session",
+      "-d",
+      "-s",
+      sessionName,
+      "-c",
+      cwd,
+      "-x",
+      String(DEFAULT_TMUX_PANE_COLS),
+      "-y",
+      String(DEFAULT_TMUX_PANE_ROWS),
+      buildTmuxShellCommand(env),
+    ];
     execTmuxSync(args, { stdio: "ignore" });
   }
 
@@ -237,6 +297,19 @@ function configureTmuxSession(sessionName: string): void {
   });
 
   execTmuxSync(["set-window-option", "-t", sessionName, "mode-keys", "emacs"], {
+    stdio: "ignore",
+  });
+
+  // Issue #317: tmux's default `window-size smallest` pins the pane to the
+  // smallest size any attaching client has ever reported. Our attaching
+  // client initially spawns at 80x24 (see `pty.spawn` in getOrCreate), so
+  // the pane would stay tiny forever and the only way for the user to grow
+  // it would be to first attach a *smaller* client. `latest` makes the
+  // pane track the most recent client-reported size, which is what users
+  // expect when they resize the controller UI — and what the resize
+  // pipeline (client fit → WS resize → PtyManager.resize → pty.resize →
+  // SIGWINCH) is trying to deliver.
+  execTmuxSync(["set-window-option", "-t", sessionName, "window-size", "latest"], {
     stdio: "ignore",
   });
 }
@@ -328,10 +401,28 @@ class PtyManager {
   /** Resize the PTY. */
   resize(sessionId: string, cols: number, rows: number): void {
     const session = this.sessions.get(sessionId);
-    if (session) {
-      const c = Math.max(1, Math.min(cols, 500));
-      const r = Math.max(1, Math.min(rows, 200));
-      session.pty.resize(c, r);
+    if (!session) return;
+    const c = Math.max(1, Math.min(cols, 500));
+    const r = Math.max(1, Math.min(rows, 200));
+    session.pty.resize(c, r);
+
+    // Issue #317: belt-and-suspenders resize of the tmux *server's* window.
+    // `pty.resize` on the attaching `tmux attach-session` child sends SIGWINCH
+    // to tmux, which usually updates the pane, but tmux's window/pane-size
+    // bookkeeping is asynchronous and can race the user's next `git log`. A
+    // direct `tmux resize-window` makes the pane match the client size in
+    // the same tick, so pagers see the real size immediately. Silently
+    // ignored when the session is gone (e.g. just killed) or tmux fails;
+    // the primary path through `pty.resize` still works.
+    for (const name of tmuxSessionNames(sessionId)) {
+      try {
+        execTmuxSync(
+          ["resize-window", "-t", `=${name}`, "-x", String(c), "-y", String(r)],
+          { stdio: "ignore" }
+        );
+      } catch {
+        // Try the next candidate (legacy prefix) before giving up.
+      }
     }
   }
 
