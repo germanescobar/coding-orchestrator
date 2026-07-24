@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { execFileSync } from "node:child_process";
-import { ptyManager, lastLines, tmuxSessionNames } from "../pty-manager.js";
+import { execFileSync, spawnSync } from "node:child_process";
+import { ptyManager, lastLines, tmuxSessionNames, buildTmuxShellCommand } from "../pty-manager.js";
 
 /*
  * Issue #261: unit coverage for the terminal surface's `ptyManager` additions.
@@ -42,6 +42,52 @@ function tmuxAvailable(): boolean {
 }
 
 const PTY_OUTPUT_TIMEOUT_MS = 8000;
+
+test("buildTmuxShellCommand strips LINES and COLUMNS from the shell env (issue #317)", () => {
+  // Direct, deterministic check that the `env -u …` chain issued to
+  // `tmux new-session` scrubs LINES / COLUMNS. The string must contain
+  // the flags and the scrub must come BEFORE any per-worktree env
+  // assignments, so it actually takes effect for the user's shell.
+  // Earlier test coverage only exercised this through a live tmux
+  // session whose env didn't always contain LINES / COLUMNS, which let
+  // regressions slip through (PR #318 review feedback).
+  const command = buildTmuxShellCommand();
+  assert.match(command, /-u LINES\b/, "expected `-u LINES` in buildTmuxShellCommand output");
+  assert.match(command, /-u COLUMNS\b/, "expected `-u COLUMNS` in buildTmuxShellCommand output");
+
+  // The scrub must be inside the `env -u …` argument list that comes
+  // before the shell. A naive impl that puts `LINES=` *after* the scrub
+  // would still strip the parent's value but re-introduce the var via
+  // the assignment; the order in the resulting string is what
+  // `tmux new-session … <command>` actually sees.
+  const scrubIndex = command.indexOf("-u LINES");
+  const shellIndex = command.lastIndexOf(" -i");
+  assert.ok(scrubIndex >= 0 && shellIndex > scrubIndex, "expected `-u LINES` to appear before the shell is launched");
+
+  // Run the command for real in a subshell with LINES=999 / COLUMNS=999
+  // in the env, swapping the interactive `-i` for a one-shot `-c` that
+  // prints any surviving LINES= / COLUMNS= entries. The scrub must
+  // prevent them from reaching the inner shell.
+  const probe = command.replace(
+    / -i$/,
+    ' -c "env -0 | tr \'\\\\0\' \'\\n\' | grep -E \'^(LINES|COLUMNS)=\' ; true"'
+  );
+  const result = spawnSync(probe, {
+    env: { ...process.env, LINES: "999", COLUMNS: "999" },
+    shell: true,
+    encoding: "utf8",
+  });
+  assert.equal(
+    result.status,
+    0,
+    `expected probe to succeed; got status=${result.status}, stdout=${result.stdout}, stderr=${result.stderr}`
+  );
+  assert.equal(
+    result.stdout.trim(),
+    "",
+    `expected LINES / COLUMNS to be stripped from the shell env; got: ${result.stdout}`
+  );
+});
 
 test("listByPrefix, snapshot and tail observe a live terminal", async (t) => {
   if (!tmuxAvailable()) {
@@ -461,14 +507,18 @@ test("Controller tmux sessions strip LINES and COLUMNS from the shell env (issue
     })();
 
     await new Promise((resolve) => setTimeout(resolve, 200));
-    // Probe for both vars in a single command. `env` exits 1 if any of the
-    // listed names is missing — that's fine, `set +e` keeps the shell alive
-    // and prints the rest.
+    // Probe for both vars in a single, well-formed line so the shell
+    // actually executes it. The grep pattern closes on this line; the
+    // sentinel is emitted by `printf` and does NOT appear in the command
+    // text itself, so the test's `combined.includes(sentinel)` check below
+    // is satisfied by the *output* of the command, not by the echo of the
+    // input. Otherwise a syntactically broken command would let this test
+    // pass even if LINES / COLUMNS were still exported (issue #317 PR
+    // review feedback).
     ptyManager.runCommand(
       sessionId,
       cwd,
-      `set +e; env -0 | tr '\\0' '\\n' | grep -E '^(LINES|COLUMNS)=|${sentinel}
- ; printf '${sentinel}\\n'`
+      `set +e; env -0 | tr '\\0' '\\n' | grep -E '^(LINES|COLUMNS)='; printf '${sentinel}\\n'`
     );
 
     const timeout = new Promise((resolve) => setTimeout(resolve, PTY_OUTPUT_TIMEOUT_MS));

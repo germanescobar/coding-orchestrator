@@ -165,7 +165,15 @@ function captureTmuxPane(sessionId: string, lines: number): string | null {
  * `window-size latest` is set (issue #317). */
 const PAGER_ENV_TO_UNSET = ["LINES", "COLUMNS"] as const;
 
-function buildTmuxShellCommand(env?: Record<string, string>): string {
+/**
+ * Build the command that `tmux new-session` runs in the pane. The
+ * `env -u …` chain strips Controller's own runtime vars *and* `LINES` /
+ * `COLUMNS` so pagers fall back to `ioctl(TIOCGWINSZ)` on the actual tmux
+ * pane size instead of trusting a stale value (issue #317). Exported so
+ * tests can assert the `env -u …` chain directly without spinning up a
+ * live tmux session.
+ */
+export function buildTmuxShellCommand(env?: Record<string, string>): string {
   const shell = process.env.SHELL || "/bin/sh";
   // Strip Controller's own runtime vars (e.g. NODE_ENV=production, our PORT) so
   // the user's interactive shell — and anything launched from it — never
