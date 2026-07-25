@@ -518,9 +518,42 @@ export function useFileIndex(
   worktreeId: string | undefined,
 ): WorktreeIndex {
   const ctx = useFileIndexContext();
-  return useSyncExternalStore(
-    (onChange) => ctx.subscribe(projectId, worktreeId, onChange),
-    () => ctx.getSnapshot(projectId, worktreeId),
-    () => ctx.getSnapshot(projectId, worktreeId),
+  /*
+   * `useSyncExternalStore` re-runs its subscribe effect every time
+   * the `subscribe` function reference changes. If we passed a
+   * fresh closure on every render (the naive form below), each
+   * re-render of the consumer would:
+   *
+   *   1. Fire the previous subscribe's cleanup. Our cleanup flips
+   *      the index status to `cancelled` and bumps the seq counter
+   *      to tear down any in-flight walk.
+   *   2. Run the new subscribe. The new subscribe sees status
+   *      `cancelled` and kicks off a brand-new walk, which
+   *      synchronously calls `notify()` to push `status: indexing`
+   *      to consumers.
+   *
+   * Step 2's `notify()` schedules another re-render → GOTO 1.
+   * That's a tight "cancel → restart → cancel → restart" loop that
+   * crashes the view with React error #185
+   * ("Maximum update depth exceeded") on first mount. It was
+   * masked in the original report because the walk often completes
+   * before React's update-depth cap (small repos, warm caches),
+   * but on a cold first load against a large worktree the loop runs
+   * far longer than the cap and trips the boundary.
+   *
+   * Wrapping both callbacks in `useCallback` keyed on the stable
+   * context value plus the key pair pins the references across
+   * renders, so the subscribe effect runs once on mount and again
+   * only when the (project, worktree) pair actually changes.
+   */
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      ctx.subscribe(projectId, worktreeId, onChange),
+    [ctx, projectId, worktreeId],
   );
+  const getSnapshot = useCallback(
+    () => ctx.getSnapshot(projectId, worktreeId),
+    [ctx, projectId, worktreeId],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
