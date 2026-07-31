@@ -1789,3 +1789,47 @@ test("runIntegrations list --all GETs the registry endpoint and prints full reco
   // Secret values must not appear (and the server never returns them anyway).
   assert.ok(!out.includes("secret"));
 });
+
+// ---------------------------------------------------------------------------
+// `controller browser` parser (issue #323)
+// ---------------------------------------------------------------------------
+
+test("parseBrowser builds an open command without --insecure by default", async () => {
+  const cli = await loadCli();
+  assert.deepEqual(
+    cli.parseBrowser(["open", "https://localhost:5050"]),
+    { action: "open", params: { url: "https://localhost:5050", insecure: false } }
+  );
+});
+
+test("parseBrowser extracts --insecure on open", async () => {
+  const cli = await loadCli();
+  assert.deepEqual(
+    cli.parseBrowser(["open", "--insecure", "https://localhost:5050"]),
+    { action: "open", params: { url: "https://localhost:5050", insecure: true } }
+  );
+});
+
+test("parseBrowser accepts --insecure after the URL", async () => {
+  const cli = await loadCli();
+  assert.deepEqual(
+    cli.parseBrowser(["open", "https://localhost:5050", "--insecure"]),
+    { action: "open", params: { url: "https://localhost:5050", insecure: true } }
+  );
+});
+
+test("parseBrowser snapshot / click / type still work", async () => {
+  const cli = await loadCli();
+  assert.deepEqual(
+    cli.parseBrowser(["snapshot", "--a11y", "text=Cancel"]),
+    { action: "snapshot", params: { selector: "text=Cancel", a11y: true } }
+  );
+  assert.deepEqual(
+    cli.parseBrowser(["click", "ref=e3"]),
+    { action: "click", params: { selector: "ref=e3" } }
+  );
+  assert.deepEqual(
+    cli.parseBrowser(["type", "input[name=q]", "hello", "--submit"]),
+    { action: "type", params: { selector: "input[name=q]", text: "hello", submit: true } }
+  );
+});

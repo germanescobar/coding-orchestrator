@@ -232,15 +232,23 @@ export function PreviewBrowserProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const openUrl = useCallback(
-    (key: string, url: string) => {
+    (key: string, url: string, options: { insecure?: boolean } = {}) => {
       if (!available) {
         toast.error("Preview is only available in the Electron app");
         return;
       }
       surface(key);
       store.update(key, { input: url, loading: true, error: null });
-      getController()
-        .validatePreviewUrl(url, store.getRoot(key))
+      // Toggle the cert-verify bypass *before* validation so a self-signed
+      // localhost cert doesn't get re-checked at navigation time. We always
+      // resolve the previous policy first; the bypass is per-call, not sticky.
+      Promise.resolve()
+        .then(() =>
+          getController().setPreviewCertPolicy({ insecure: options.insecure === true })
+        )
+        .then(() =>
+          getController().validatePreviewUrl(url, store.getRoot(key))
+        )
         .then((result) => {
           if (!result.allowed || !result.url) {
             const error = result.error ?? "Preview URL is not allowed";
@@ -345,7 +353,7 @@ function PaneFrames({
   registerWebview,
 }: {
   store: PreviewBrowserStore;
-  openUrl: (key: string, url: string) => void;
+  openUrl: (key: string, url: string, options?: { insecure?: boolean }) => void;
   available: boolean;
   registerWebview: (key: string, el: PreviewWebview | null) => void;
 }) {
@@ -387,7 +395,7 @@ function PaneFrame({
   paneKey: string;
   url: string | null;
   store: PreviewBrowserStore;
-  openUrl: (key: string, url: string) => void;
+  openUrl: (key: string, url: string, options?: { insecure?: boolean }) => void;
   available: boolean;
   registerWebview: (key: string, el: PreviewWebview | null) => void;
 }) {
@@ -397,7 +405,11 @@ function PaneFrame({
     enabled: available,
     browserKey: paneKey,
     getWebview: useCallback(() => webviewRef.current, []),
-    openUrl: useCallback((next: string) => openUrl(paneKey, next), [openUrl, paneKey]),
+    openUrl: useCallback(
+      (next: string, options?: { insecure?: boolean }) =>
+        openUrl(paneKey, next, options),
+      [openUrl, paneKey]
+    ),
   });
 
   // Mirror the live page's load lifecycle into pane state. Intercept in-page
@@ -548,7 +560,7 @@ class PreviewBrowserStore {
 interface PreviewBrowserContextValue {
   available: boolean;
   store: PreviewBrowserStore;
-  openUrl: (key: string, url: string) => void;
+  openUrl: (key: string, url: string, options?: { insecure?: boolean }) => void;
   clear: (key: string) => void;
   reload: (key: string) => void;
   setInput: (key: string, input: string) => void;

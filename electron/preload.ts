@@ -59,6 +59,11 @@ const bridge: ControllerBridge = {
       url,
       projectRoot
     ) as Promise<PreviewUrlCheckResult>,
+  setPreviewCertPolicy: (opts) =>
+    ipcRenderer.invoke(
+      "controller:set-preview-cert-policy",
+      opts
+    ) as Promise<{ ok: boolean; error?: string }>,
   pickDirectory: () =>
     ipcRenderer.invoke(
       "controller:pick-directory"

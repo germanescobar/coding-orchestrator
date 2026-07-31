@@ -19,7 +19,7 @@
  */
 
 const USAGE = `Usage:
-  controller browser open <url>
+  controller browser open <url> [--insecure]  # --insecure: bypass TLS cert checks for localhost
   controller browser snapshot [--a11y] [selector]
   controller browser click <selector>
   controller browser type <selector> <text> [--submit]
@@ -886,12 +886,21 @@ export async function runSchedules(argv, serverUrl) {
 
 // --- browser surface (issue #109) ---
 
-function parseBrowser(argv) {
+export function parseBrowser(argv) {
   const [command, ...rest] = argv;
   switch (command) {
     case "open": {
       if (!rest[0]) fail("browser open requires a <url>");
-      return { action: "open", params: { url: rest[0] } };
+      // `--insecure` opts into bypassing TLS-cert validation on the preview
+      // session for this navigation (issue #323). Scoped to localhost URLs
+      // by the server-side policy and the Electron cert-verify bypass; an
+      // external URL with `--insecure` is rejected with a clear error.
+      const insecure = rest.includes("--insecure");
+      const positional = rest.filter((a) => a !== "--insecure");
+      return {
+        action: "open",
+        params: { url: positional[0], insecure },
+      };
     }
     case "snapshot": {
       // --a11y switches the response shape to a structured accessibility
