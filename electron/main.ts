@@ -467,6 +467,12 @@ function setPreviewCertPolicy(opts: unknown): { ok: boolean; error?: string } {
   // Loopback hosts only. The server-side policy in `browser-policy.ts` has
   // already rejected non-loopback targets by the time the renderer asks for
   // the bypass, so this is a defense-in-depth filter, not the primary gate.
+  //
+  // For non-loopback requests we return `-3` (Electron's "use Chromium's
+  // default verification result" sentinel) rather than `-2` ("fail"), so a
+  // legitimate HTTPS subresource loaded by an insecure-localhost page — a
+  // CDN script, font, or external API over a valid cert — is still checked
+  // and accepted. Returning `-2` would actively break those loads.
   session.setCertificateVerifyProc((request, callback) => {
     const host = (request.hostname ?? "").toLowerCase();
     const isLoopback =
@@ -474,7 +480,7 @@ function setPreviewCertPolicy(opts: unknown): { ok: boolean; error?: string } {
       host === "127.0.0.1" ||
       host === "[::1]" ||
       host === "::1";
-    callback(isLoopback ? 0 : -2);
+    callback(isLoopback ? 0 : -3);
   });
   return { ok: true };
 }
