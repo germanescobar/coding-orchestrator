@@ -26,6 +26,25 @@ Through the preview browser the agent can:
 Ask the agent to "open the app and check the new settings panel" and it drives
 the preview browser to do exactly that.
 
+## Local HTTPS dev servers
+
+If your local dev server is served over `https` with a self-signed certificate
+(mkcert not used, ad-hoc OpenSSL cert, embedded TLS terminator, etc.), Chromium
+will block the navigation with `NET::ERR_CERT_AUTHORITY_INVALID` and the agent
+can't click through the interstitial. Pass `--insecure` to `controller browser
+open` to opt into a TLS-cert bypass for that single navigation:
+
+```sh
+controller browser open https://localhost:5050 --insecure
+```
+
+The bypass is scoped to loopback hosts (`localhost`, `127.0.0.1`, `[::1]`) in
+both the server-side policy and the Electron `setCertificateVerifyProc` handler
+— so an external URL with `--insecure` is rejected before navigation, and the
+bypass can never be used to talk to an arbitrary external host without cert
+validation. Human users running the same flow in a normal browser can keep
+clicking through the "Advanced → Proceed" interstitial.
+
 ## When to use the system browser instead
 
 The preview browser is for verifying your own running app. Prefer the **system

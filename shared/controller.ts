@@ -30,6 +30,13 @@ export interface ControllerBridge {
     projectRoot?: string
   ) => Promise<PreviewUrlCheckResult>;
   /**
+   * Toggle the TLS-cert verification bypass on the preview pane's session.
+   * Used by the agent-controlled browser when the user passes `--insecure`
+   * to `controller browser open`. The bypass is scoped to loopback hosts in
+   * the main process, so external URLs are unaffected.
+   */
+  setPreviewCertPolicy: (opts: { insecure: boolean }) => Promise<{ ok: boolean; error?: string }>;
+  /**
    * Open a native folder picker. Returns the absolute path the user
    * selected, or null if they cancelled. The picker is window-modal
    * to the renderer that initiated the call.

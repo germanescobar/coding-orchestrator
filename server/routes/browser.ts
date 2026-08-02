@@ -54,12 +54,16 @@ browserRouter.post("/command", async (req: Request, res: Response) => {
   // renderer. The Electron main process re-checks on actual navigation.
   if (action === "open") {
     const url = typeof params.url === "string" ? params.url : "";
-    const check = validateBrowserUrl(url, worktree.path);
+    const insecure = params.insecure === true;
+    const check = validateBrowserUrl(url, worktree.path, { insecure });
     if (!check.allowed || !check.url) {
       res.status(400).json({ ok: false, error: check.error ?? "URL not allowed" });
       return;
     }
     params.url = check.url;
+    // Keep the flag on the wire so the renderer can flip the cert-verify
+    // bypass on the preview session before navigating.
+    params.insecure = insecure;
   }
 
   const key = `${worktree.projectId}:${worktree.id}`;

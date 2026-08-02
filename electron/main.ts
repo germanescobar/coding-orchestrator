@@ -438,6 +438,53 @@ function attachPreviewWebviewGuards(contents: WebContents): void {
   });
 }
 
+/**
+ * Install (or clear) a TLS-cert verification bypass on the preview pane's
+ * session. Called from the renderer through the
+ * `controller:set-preview-cert-policy` IPC handler when the agent passes
+ * `--insecure` to `controller browser open`.
+ *
+ * The bypass is intentionally scoped to localhost-shaped hosts so the agent
+ * can reach a local dev server with a self-signed cert without gaining the
+ * ability to talk to an arbitrary external host without cert validation.
+ * External-host calls fall through to Chromium's default verifier and
+ * continue to be rejected on TLS errors.
+ */
+function setPreviewCertPolicy(opts: unknown): { ok: boolean; error?: string } {
+  if (opts === null) {
+    electronSession.fromPartition(PREVIEW_PARTITION).setCertificateVerifyProc(null);
+    return { ok: true };
+  }
+  if (!opts || typeof opts !== "object") {
+    return { ok: false, error: "Cert-policy opts must be an object or null" };
+  }
+  const insecure = (opts as { insecure?: unknown }).insecure === true;
+  const session = electronSession.fromPartition(PREVIEW_PARTITION);
+  if (!insecure) {
+    session.setCertificateVerifyProc(null);
+    return { ok: true };
+  }
+  // Loopback hosts only. The server-side policy in `browser-policy.ts` has
+  // already rejected non-loopback targets by the time the renderer asks for
+  // the bypass, so this is a defense-in-depth filter, not the primary gate.
+  //
+  // For non-loopback requests we return `-3` (Electron's "use Chromium's
+  // default verification result" sentinel) rather than `-2` ("fail"), so a
+  // legitimate HTTPS subresource loaded by an insecure-localhost page — a
+  // CDN script, font, or external API over a valid cert — is still checked
+  // and accepted. Returning `-2` would actively break those loads.
+  session.setCertificateVerifyProc((request, callback) => {
+    const host = (request.hostname ?? "").toLowerCase();
+    const isLoopback =
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "[::1]" ||
+      host === "::1";
+    callback(isLoopback ? 0 : -3);
+  });
+  return { ok: true };
+}
+
 function attachErrorReporting(win: BrowserWindow): void {
   win.webContents.on("did-finish-load", () => {
     // Re-send the current status to this window, since the original
@@ -551,6 +598,11 @@ function registerIpcHandlers(): void {
         typeof projectRoot === "string" && projectRoot.trim() ? projectRoot : undefined
       );
     }
+  );
+
+  ipcMain.handle(
+    "controller:set-preview-cert-policy",
+    (_event, opts: unknown) => setPreviewCertPolicy(opts)
   );
 
   ipcMain.handle("controller:pick-directory", async (event) => {

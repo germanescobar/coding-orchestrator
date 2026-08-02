@@ -42,3 +42,36 @@ test("rejects unsupported schemes", () => {
   const result = validateBrowserUrl("ftp://example.com", PROJECT_ROOT);
   assert.equal(result.allowed, false);
 });
+
+test("--insecure allows https URLs on localhost", () => {
+  const result = validateBrowserUrl("https://localhost:5050", PROJECT_ROOT, {
+    insecure: true,
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.url, "https://localhost:5050/");
+});
+
+test("--insecure allows http on 127.0.0.1", () => {
+  const result = validateBrowserUrl("http://127.0.0.1:3000", PROJECT_ROOT, {
+    insecure: true,
+  });
+  assert.equal(result.allowed, true);
+});
+
+test("--insecure rejects https to external hosts", () => {
+  const result = validateBrowserUrl("https://example.com", PROJECT_ROOT, {
+    insecure: true,
+  });
+  assert.equal(result.allowed, false);
+  assert.match(result.error ?? "", /only applies to localhost/);
+});
+
+test("--insecure rejects file://", () => {
+  // --insecure is a TLS-cert bypass, not a path-policy bypass.
+  const result = validateBrowserUrl("./dist/index.html", PROJECT_ROOT, {
+    insecure: true,
+  });
+  // file:// is still governed by the project-root check; this test mainly
+  // documents that adding `insecure` doesn't widen file-access.
+  assert.equal(result.allowed, true);
+});

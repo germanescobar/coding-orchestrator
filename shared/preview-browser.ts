@@ -67,4 +67,19 @@ export interface BrowserCommandMessage {
   params: Record<string, unknown>;
 }
 
+/**
+ * Subset of `params` recognized by the renderer. Defined here so both ends
+ * agree on the shape without a separate types module.
+ *
+ * `insecure` is only meaningful on `open`: when true, the renderer asks the
+ * Electron main process to install a cert-verify bypass scoped to localhost
+ * before navigating, so a local dev server with a self-signed cert can be
+ * reached. The server-side policy has already constrained the target to a
+ * localhost hostname by the time this flag is acted on.
+ */
+export interface BrowserOpenParams {
+  url: string;
+  insecure?: boolean;
+}
+
 export type BrowserServerMessage = BrowserCommandMessage;

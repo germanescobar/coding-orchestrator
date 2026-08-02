@@ -76,6 +76,10 @@ and run it; no install required.
 
 ## [Unreleased]
 
+### Added
+
+- **Agent browser: `--insecure` flag on `controller browser open`** (#323). The agent can now opt into bypassing TLS-cert validation for the duration of a single navigation, scoped to localhost-shaped hosts (`localhost`, `127.0.0.1`, `[::1]`). Useful when a local dev server serves `https` with a self-signed certificate (mkcert not used, ad-hoc OpenSSL cert, embedded TLS terminator). The flag is rejected on external URLs by the server-side policy, so an agent cannot use it to talk to an arbitrary external host without cert validation. Implementation: new `controller:set-preview-cert-policy` IPC handler that calls `setCertificateVerifyProc` on the `controller-preview` Electron session. Addressed review feedback from PR #324: non-loopback requests now return `-3` (Electron's "use Chromium's default verification result" sentinel) instead of `-2`, so a legitimate HTTPS subresource loaded by an insecure-localhost page — a CDN script, font, or external API — is still checked and accepted.
+
 ## [0.3.3] - 2026-07-27
 
 ### Added

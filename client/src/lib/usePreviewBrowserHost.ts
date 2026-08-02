@@ -41,7 +41,7 @@ export interface PreviewBrowserHostOptions {
   /** Returns the live `<webview>` element, or null when no page is open. */
   getWebview: () => PreviewWebview | null;
   /** Trigger the visible navigation flow (validates + switches to Preview). */
-  openUrl: (url: string) => void;
+  openUrl: (url: string, options?: { insecure?: boolean }) => void;
 }
 
 const RECONNECT_DELAY_MS = 1500;
@@ -85,6 +85,7 @@ export function usePreviewBrowserHost(options: PreviewBrowserHostOptions): void 
           case "open":
             return await handleOpen(
               String(message.params.url ?? ""),
+              message.params.insecure === true,
               getWebviewRef.current,
               openUrlRef.current
             );
@@ -185,15 +186,16 @@ export function usePreviewBrowserHost(options: PreviewBrowserHostOptions): void 
 
 async function handleOpen(
   url: string,
+  insecure: boolean,
   getWebview: () => PreviewWebview | null,
-  openUrl: (url: string) => void
+  openUrl: (url: string, options?: { insecure?: boolean }) => void
 ): Promise<BrowserCommandResult> {
   if (!url) return { ok: false, error: "Missing url" };
   // Capture the current URL before navigating so we can tell when the *new*
   // page has actually loaded — otherwise an already-open idle pane would report
   // success against the old page and a follow-up snapshot would read it.
   const beforeUrl = safeCall(() => getWebview()?.getURL()) ?? null;
-  openUrl(url);
+  openUrl(url, insecure ? { insecure: true } : undefined);
   const webview = await waitForOpenComplete(getWebview, beforeUrl);
   if (!webview) {
     return { ok: true, url, summary: `Opened ${url}` };

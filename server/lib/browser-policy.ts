@@ -65,13 +65,27 @@ export interface PreviewUrlCheck {
   error?: string;
 }
 
+export interface ValidateBrowserUrlOptions {
+  /**
+   * The agent has opted in to bypassing TLS validation for this navigation
+   * (via `controller browser open --insecure`). When true, `https` URLs are
+   * only allowed for localhost-shaped hosts — the same `isLocalhostUrl`
+   * shape used to gate non-`https` previews. This is a deliberate trust
+   * bound: the bypass exists so dev servers with self-signed certs can be
+   * reached, not so an agent can talk to an arbitrary external host without
+   * cert validation.
+   */
+  insecure?: boolean;
+}
+
 /**
  * Validate and normalize a URL the agent wants to open. Returns the canonical
  * URL to forward to the renderer, or a reason it was rejected.
  */
 export function validateBrowserUrl(
   input: string,
-  projectRoot?: string
+  projectRoot?: string,
+  options: ValidateBrowserUrlOptions = {}
 ): PreviewUrlCheck {
   let url: URL;
   try {
@@ -81,6 +95,12 @@ export function validateBrowserUrl(
   }
 
   if (url.protocol === "http:" || url.protocol === "https:") {
+    if (options.insecure && !isLocalhostHost(url.hostname)) {
+      return {
+        allowed: false,
+        error: "--insecure only applies to localhost URLs (got " + url.hostname + ")",
+      };
+    }
     return { allowed: true, url: url.toString() };
   }
 
@@ -110,4 +130,20 @@ export function validateBrowserUrl(
     allowed: false,
     error: "Only web URLs and project file previews are allowed",
   };
+}
+
+/**
+ * Returns true when `hostname` is a loopback address that the agent can
+ * plausibly be running a local dev server on. Mirrors the `isLocalhostUrl`
+ * matcher above so the policy and the Electron cert-verify bypass agree on
+ * what counts as a localhost target.
+ */
+function isLocalhostHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return (
+    lower === "localhost" ||
+    lower === "127.0.0.1" ||
+    lower === "[::1]" ||
+    lower === "::1"
+  );
 }
