@@ -90,18 +90,59 @@ shipped `.zip`/`.dmg` fail to launch). Artifacts land in `release/`:
 
 ## 7. Publish the GitHub release
 
+Create the release as a draft with notes but no assets first (fast, won't
+time out), upload each binary serially, then publish. `gh`'s asset upload
+is not resumable — if the process is killed mid-stream the partial upload
+is discarded — so upload from a detached `nohup` job and poll until each
+asset reports `state=uploaded` before starting the next.
+
 ```sh
+# Stage the notes from CHANGELOG.md, plus the macOS Gatekeeper warning.
+sed -n "/^## \[X.Y.Z\]/,/^## \[/p" CHANGELOG.md | sed '$d' > /tmp/release-X.Y.Z-notes.md
+cat <<'EOF' >> /tmp/release-X.Y.Z-notes.md
+
+> **macOS Gatekeeper:** the build is ad-hoc-signed and not notarized. On
+> first launch, open **System Settings → Privacy & Security → Security**
+> and click **Open Anyway** for Controller. After this first approval,
+> Controller opens normally.
+EOF
+
+# Create the draft release (no assets).
 gh release create vX.Y.Z \
   --title "Controller X.Y.Z" \
-  --notes-file <(sed -n '/## \[X.Y.Z\]/,/## \[/p' CHANGELOG.md) \
-  release/Controller-X.Y.Z-arm64-mac.zip \
-  release/Controller-X.Y.Z-arm64.dmg \
-  release/Controller-X.Y.Z-arm64.AppImage
+  --notes-file /tmp/release-X.Y.Z-notes.md \
+  --draft
+
+# Upload each asset, one at a time, fully detached. Poll each until it
+# shows up with state=uploaded before starting the next — running them
+# in parallel against the same release will contend and silently fail.
+for f in release/Controller-X.Y.Z-arm64-mac.zip \
+         release/Controller-X.Y.Z-arm64.dmg \
+         release/Controller-X.Y.Z-arm64.AppImage; do
+  base=$(basename "$f")
+  nohup bash -c "gh release upload vX.Y.Z '$f' --clobber >'/tmp/uplog.out' 2>&1; echo \$? >'/tmp/uplog.exit'" \
+    </dev/null >/dev/null 2>&1 &
+  disown
+  while kill -0 $! 2>/dev/null; do sleep 5; done
+  if [ "$(cat /tmp/uplog.exit)" != "0" ]; then
+    echo "Upload failed for $f:"; cat /tmp/uplog.out; exit 1
+  fi
+  # Confirm the asset is actually committed to the release, not just
+  # that gh exited cleanly. A flaky network or a kill mid-upload can
+  # return success without persisting anything.
+  if ! gh release view vX.Y.Z --json assets --jq '.assets[].name' \
+      | grep -qx "$base"; then
+    echo "Asset $base missing from release after upload."; exit 1
+  fi
+done
+
+# Publish.
+gh release edit vX.Y.Z --draft=false
 ```
 
 Review the rendered notes and the attached binaries on the release page.
-Always include the macOS Gatekeeper "Open Anyway" instructions in the
-release body, since the build is un-notarized.
+The macOS Gatekeeper "Open Anyway" instruction is already in the notes
+file above, since the build is un-notarized.
 
 ## Post-release
 
