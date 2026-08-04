@@ -40,9 +40,10 @@ Edit `CHANGELOG.md`:
   git log vPREV..HEAD --no-merges --pretty='%s'
   ```
 
-- Keep the macOS Gatekeeper note (ad-hoc-signed, not notarized → **Open
-  Anyway**) and call out any breaking changes / required manual migration
-  steps prominently at the top of the section.
+- Call out any breaking changes / required manual migration steps
+  prominently at the top of the section. The macOS Gatekeeper note
+  (ad-hoc-signed, not notarized → **Open Anyway**) is **not** a
+  changelog entry and is added to the GitHub release body in step 7.
 
 ## 4. Validate
 
