@@ -76,6 +76,10 @@ and run it; no install required.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent browser: `--insecure` cert bypass now works on subsequent navigations** (#323 follow-up). The Electron `setCertificateVerifyProc` proc is only honored if it's installed on the `controller-preview` session before any webview has navigated through it; once a webview has used the session, swapping the proc is a silent no-op and Chromium keeps using the default verifier. The old `controller:set-preview-cert-policy` IPC handler called `setCertificateVerifyProc` on every `--insecure` open, so the *first* `https://localhost:*` / `https://127.0.0.1:*` navigation after a fresh app start would bypass the cert, but a *subsequent* navigation (e.g. `https://localhost:5050/` after `https://127.0.0.1:5050/`) still hit `NET::ERR_CERT_AUTHORITY_INVALID` because the new proc was never installed. The fix installs the cert-verify proc exactly once — eagerly, in `attachPreviewPartitionGuards` at app startup, before any webview exists — and reads a module-level `previewCertBypassEnabled` flag inside the closure. The IPC handler is now a one-line flag flip, so the bypass is reliably in effect for every navigation (including the first one) and the previous "127.0.0.1 works, localhost doesn't" asymmetry is gone. The flag is off by default and reset between non-`--insecure` opens, so the bypass remains per-call and loopback-scoped.
+
 ## [0.3.4] - 2026-08-03
 
 ### Added
