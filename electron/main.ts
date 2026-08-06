@@ -34,6 +34,16 @@ const PREVIEW_PARTITION = "controller-preview";
 // self-signed loopback certs. Installing the proc eagerly at startup
 // and reading this flag from inside the closure avoids that race
 // entirely; the IPC handler is now a one-line flag flip.
+//
+// Known limitation: every preview pane shares the same
+// `controller-preview` partition (see `PreviewBrowserPool.tsx`), so this
+// flag is effectively process-wide. When two panes issue `open` calls
+// that overlap — e.g. one starts an `--insecure` navigation and another
+// pane performs a plain open before the cert handshake fires — the last
+// IPC wins, and the earlier pane can lose (or gain) the bypass
+// spuriously. A full fix (per-pane partitions, each with its own proc)
+// is tracked in #325; this PR stays within the original #324 / #323
+// scope and only fixes the eager-install race.
 let previewCertBypassEnabled = false;
 
 // Mark the start of the main process so every log line can be prefixed
