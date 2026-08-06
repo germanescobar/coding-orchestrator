@@ -21,6 +21,31 @@ const DEFAULT_CLIENT_PORT = 4500;
 const MAX_PORT_SEARCH_OFFSET = 100;
 const PREVIEW_PARTITION = "controller-preview";
 
+// Toggle for the preview-pane cert-verify bypass. Set by the
+// `controller:set-preview-cert-policy` IPC handler when the agent passes
+// `--insecure` to `controller browser open`, and reset by the next
+// non-`--insecure` open (so the bypass is per-call, not sticky).
+//
+// We can't just call `setCertificateVerifyProc` on demand inside the IPC
+// handler: in Electron the proc only takes effect if it's installed on
+// the session before any webview starts using it. Once a webview has
+// navigated through `controller-preview`, swapping the proc is a no-op —
+// the next load still uses Chromium's default verifier and fails on
+// self-signed loopback certs. Installing the proc eagerly at startup
+// and reading this flag from inside the closure avoids that race
+// entirely; the IPC handler is now a one-line flag flip.
+//
+// Known limitation: every preview pane shares the same
+// `controller-preview` partition (see `PreviewBrowserPool.tsx`), so this
+// flag is effectively process-wide. When two panes issue `open` calls
+// that overlap — e.g. one starts an `--insecure` navigation and another
+// pane performs a plain open before the cert handshake fires — the last
+// IPC wins, and the earlier pane can lose (or gain) the bypass
+// spuriously. A full fix (per-pane partitions, each with its own proc)
+// is tracked in #325; this PR stays within the original #324 / #323
+// scope and only fixes the eager-install race.
+let previewCertBypassEnabled = false;
+
 // Mark the start of the main process so every log line can be prefixed
 // with elapsed time. Helpful for diagnosing slow first-launch flows where
 // macOS Gatekeeper / code-sign verification can take 30+ seconds before
@@ -384,7 +409,34 @@ function denyPreviewSessionPermissions(session: Session): void {
 }
 
 function attachPreviewPartitionGuards(): void {
-  denyPreviewSessionPermissions(electronSession.fromPartition(PREVIEW_PARTITION));
+  const session = electronSession.fromPartition(PREVIEW_PARTITION);
+  denyPreviewSessionPermissions(session);
+  // Install the cert-verify proc ONCE, before any webview touches the
+  // session. See the `previewCertBypassEnabled` comment for why we can't
+  // install it lazily inside the IPC handler — Electron only honors a
+  // proc that was in place before the first connection.
+  //
+  // The proc is scoped to loopback hosts so the agent can reach a local
+  // dev server with a self-signed cert without gaining the ability to
+  // talk to an arbitrary external host without cert validation. External
+  // requests return `-3` (Chromium's default verification result) rather
+  // than `-2` ("fail"), so legitimate HTTPS subresources loaded by an
+  // insecure-localhost page — a CDN script, font, or external API over
+  // a valid cert — are still checked and accepted. Returning `-2` would
+  // actively break those loads.
+  session.setCertificateVerifyProc((request, callback) => {
+    if (!previewCertBypassEnabled) {
+      callback(-3);
+      return;
+    }
+    const host = (request.hostname ?? "").toLowerCase();
+    const isLoopback =
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "[::1]" ||
+      host === "::1";
+    callback(isLoopback ? 0 : -3);
+  });
 }
 
 function blockPreviewPopups(contents: WebContents): void {
@@ -439,10 +491,17 @@ function attachPreviewWebviewGuards(contents: WebContents): void {
 }
 
 /**
- * Install (or clear) a TLS-cert verification bypass on the preview pane's
- * session. Called from the renderer through the
- * `controller:set-preview-cert-policy` IPC handler when the agent passes
- * `--insecure` to `controller browser open`.
+ * Toggle the TLS-cert verification bypass on the preview pane's session.
+ * Called from the renderer through the `controller:set-preview-cert-policy`
+ * IPC handler when the agent passes `--insecure` to `controller browser open`.
+ *
+ * The actual cert-verify proc is installed eagerly at app startup by
+ * `attachPreviewPartitionGuards` — once a webview has navigated through
+ * `controller-preview`, calling `setCertificateVerifyProc` from the IPC
+ * handler is a silent no-op and the next load still uses Chromium's default
+ * verifier. Flipping the `previewCertBypassEnabled` flag here is enough:
+ * the proc reads the flag on every verification and decides whether to
+ * allow loopback certs.
  *
  * The bypass is intentionally scoped to localhost-shaped hosts so the agent
  * can reach a local dev server with a self-signed cert without gaining the
@@ -452,36 +511,13 @@ function attachPreviewWebviewGuards(contents: WebContents): void {
  */
 function setPreviewCertPolicy(opts: unknown): { ok: boolean; error?: string } {
   if (opts === null) {
-    electronSession.fromPartition(PREVIEW_PARTITION).setCertificateVerifyProc(null);
+    previewCertBypassEnabled = false;
     return { ok: true };
   }
   if (!opts || typeof opts !== "object") {
     return { ok: false, error: "Cert-policy opts must be an object or null" };
   }
-  const insecure = (opts as { insecure?: unknown }).insecure === true;
-  const session = electronSession.fromPartition(PREVIEW_PARTITION);
-  if (!insecure) {
-    session.setCertificateVerifyProc(null);
-    return { ok: true };
-  }
-  // Loopback hosts only. The server-side policy in `browser-policy.ts` has
-  // already rejected non-loopback targets by the time the renderer asks for
-  // the bypass, so this is a defense-in-depth filter, not the primary gate.
-  //
-  // For non-loopback requests we return `-3` (Electron's "use Chromium's
-  // default verification result" sentinel) rather than `-2` ("fail"), so a
-  // legitimate HTTPS subresource loaded by an insecure-localhost page — a
-  // CDN script, font, or external API over a valid cert — is still checked
-  // and accepted. Returning `-2` would actively break those loads.
-  session.setCertificateVerifyProc((request, callback) => {
-    const host = (request.hostname ?? "").toLowerCase();
-    const isLoopback =
-      host === "localhost" ||
-      host === "127.0.0.1" ||
-      host === "[::1]" ||
-      host === "::1";
-    callback(isLoopback ? 0 : -3);
-  });
+  previewCertBypassEnabled = (opts as { insecure?: unknown }).insecure === true;
   return { ok: true };
 }
 
