@@ -133,6 +133,7 @@ import {
 } from "../lib/composer-draft.ts";
 import { describeApprovalInput } from "../lib/describe-approval-input.ts";
 import { getLatestPendingToolApproval } from "../lib/pending-tool-approval.ts";
+import { extractFilesFromClipboard } from "../lib/clipboard-files.ts";
 
 interface SessionViewProps {
   projectId: string;
@@ -6325,6 +6326,21 @@ export function SessionView({
                     if (!canAttachMore) return;
                     event.preventDefault();
                     addComposerFiles(event.dataTransfer.files);
+                  }}
+                  onPaste={(event) => {
+                    // Paste handles both pasting directly into the input and
+                    // pasting onto the drop zone but not the textarea (events
+                    // bubble up from the textarea). We forward any file items
+                    // through the same `addComposerFiles` pipeline used by
+                    // drag-and-drop and the file-picker button. For a plain
+                    // text paste `extractFilesFromClipboard` returns [] so we
+                    // leave the default browser behavior alone — the text
+                    // still gets inserted into the textarea.
+                    if (!canAttachMore) return;
+                    const files = extractFilesFromClipboard(event.clipboardData);
+                    if (files.length === 0) return;
+                    event.preventDefault();
+                    addComposerFiles(files);
                   }}
                 >
                   <input
