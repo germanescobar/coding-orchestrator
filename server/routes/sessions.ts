@@ -76,6 +76,7 @@ import {
   listQueue,
   removeFromQueue,
   dequeueFirst,
+  resolveQueuedMessage,
   clearQueue,
   type QueuedMessage,
   type QueuedMessageInput,
@@ -2100,10 +2101,22 @@ sessionsRouter.post(
       const result = await acceptCodexSteer({
         queuedMessageId,
         steer: () => codexAppServerManager.steerSession(req.params.sessionId, message),
-        getQueuedMessage: async (id) =>
-          (await listQueue(req.params.sessionId)).find((item) => item.id === id),
-        removeQueuedMessage: async (id) => {
-          await removeFromQueue(req.params.sessionId, id);
+        steerQueuedMessage: async (id) => {
+          const resolution = await resolveQueuedMessage(
+            req.params.sessionId,
+            id,
+            async () => {
+              const outcome = await codexAppServerManager.steerSession(
+                req.params.sessionId,
+                message
+              );
+              return { result: outcome, remove: outcome === "steered" };
+            }
+          );
+          return {
+            message: resolution.message,
+            outcome: resolution.result,
+          };
         },
         buildFollowUp: async () => {
           const session = await getSession(worktree.path, req.params.sessionId);

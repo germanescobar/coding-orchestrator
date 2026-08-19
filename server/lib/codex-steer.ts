@@ -7,8 +7,12 @@ export type CodexSteerResult =
 interface AcceptCodexSteerOptions {
   queuedMessageId?: string;
   steer: () => Promise<"steered" | "turn-ended">;
-  getQueuedMessage: (id: string) => Promise<QueuedMessage | undefined>;
-  removeQueuedMessage: (id: string) => Promise<void>;
+  steerQueuedMessage: (
+    id: string
+  ) => Promise<{
+    message: QueuedMessage | null;
+    outcome?: "steered" | "turn-ended";
+  }>;
   buildFollowUp: () => Promise<QueuedMessageInput>;
   enqueueFollowUp: (input: QueuedMessageInput) => Promise<QueuedMessage>;
 }
@@ -21,19 +25,20 @@ interface AcceptCodexSteerOptions {
 export async function acceptCodexSteer(
   options: AcceptCodexSteerOptions
 ): Promise<CodexSteerResult> {
-  const outcome = await options.steer();
-  if (outcome === "steered") {
-    if (options.queuedMessageId) {
-      await options.removeQueuedMessage(options.queuedMessageId);
-    }
-    return { disposition: "steered" };
-  }
-
   if (options.queuedMessageId) {
+    const resolution = await options.steerQueuedMessage(options.queuedMessageId);
+    if (resolution.outcome === "steered") {
+      return { disposition: "steered" };
+    }
     return {
       disposition: "queued",
-      message: await options.getQueuedMessage(options.queuedMessageId),
+      message: resolution.message ?? undefined,
     };
+  }
+
+  const outcome = await options.steer();
+  if (outcome === "steered") {
+    return { disposition: "steered" };
   }
 
   const queued = await options.enqueueFollowUp(await options.buildFollowUp());

@@ -77,6 +77,44 @@ export async function removeFromQueue(
   });
 }
 
+export interface QueuedMessageResolution<T> {
+  message: QueuedMessage | null;
+  result?: T;
+  removed: boolean;
+}
+
+/*
+ * Resolve ownership of one queued message while holding the same per-session
+ * lock used by dequeueFirst. The async resolver may perform the native steer;
+ * queue advancement cannot dequeue the item until the resolver decides
+ * whether ownership transferred successfully.
+ */
+export async function resolveQueuedMessage<T>(
+  sessionId: string,
+  messageId: string,
+  resolve: (message: QueuedMessage) => Promise<{ result: T; remove: boolean }>
+): Promise<QueuedMessageResolution<T>> {
+  return withLock(sessionId, async () => {
+    const queue = await readQueue(sessionId);
+    const index = queue.findIndex((message) => message.id === messageId);
+    if (index === -1) {
+      return { message: null, removed: false };
+    }
+
+    const message = queue[index];
+    const resolution = await resolve(message);
+    if (resolution.remove) {
+      queue.splice(index, 1);
+      await writeQueue(sessionId, queue);
+    }
+    return {
+      message,
+      result: resolution.result,
+      removed: resolution.remove,
+    };
+  });
+}
+
 /** Remove and return the first queued message, or null if the queue is empty. */
 export async function dequeueFirst(
   sessionId: string

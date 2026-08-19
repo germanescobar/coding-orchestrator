@@ -131,6 +131,10 @@ import {
   clearComposerDraft,
   type ComposerDraft,
 } from "../lib/composer-draft.ts";
+import {
+  shouldEnqueueCodexSteer,
+  type NativeSteerState,
+} from "../lib/codex-steer-state.ts";
 import { describeApprovalInput } from "../lib/describe-approval-input.ts";
 import { getLatestPendingToolApproval } from "../lib/pending-tool-approval.ts";
 
@@ -2931,7 +2935,10 @@ export function SessionView({
   const [ownStreamActive, setOwnStreamActive] = useState(false);
   // Codex ends native steering at its terminal event, before the enclosing
   // SSE emits `done`. Keep that narrower lifecycle separate from `streaming`.
-  const nativeSteerAvailableRef = useRef(false);
+  const nativeSteerStateRef = useRef<NativeSteerState>("unknown");
+  useEffect(() => {
+    nativeSteerStateRef.current = "unknown";
+  }, [sessionId]);
   // Messages enqueued while a run is streaming (replayed one-at-a-time on
   // clean completion). The server is the source of truth; this mirrors it
   // for rendering. See issue #113.
@@ -3873,7 +3880,10 @@ export function SessionView({
         const active = runtimes.some(
           (entry) => entry.sessionId === sessionId && entry.active
         );
-        if (active) setStreaming(true);
+        if (active) {
+          nativeSteerStateRef.current = "unknown";
+          setStreaming(true);
+        }
         void refreshQueue();
       } catch {
         // Ignore transient polling failures.
@@ -3917,6 +3927,9 @@ export function SessionView({
         const isActive = runtimes.some(
           (entry) => entry.sessionId === sessionId && entry.active,
         );
+        if (isActive) {
+          nativeSteerStateRef.current = "unknown";
+        }
         if (!isActive) {
           // An emulated steer (Claude/Anita) on a run this component is only
           // watching via polling — not its own SSE — resumes here once the
@@ -4636,7 +4649,7 @@ export function SessionView({
       } else if (data.type === "anita_event") {
         const adaEvent = data.event;
         if (adaEvent.type === "run.started") {
-          nativeSteerAvailableRef.current = true;
+          nativeSteerStateRef.current = "active";
           detectedSessionId = adaEvent.sessionId;
           attachToSession(adaEvent.sessionId);
         } else if (adaEvent.type === "assistant.text") {
@@ -4784,7 +4797,7 @@ export function SessionView({
             ]);
           }
         } else if (adaEvent.type === "run.failed") {
-          nativeSteerAvailableRef.current = false;
+          nativeSteerStateRef.current = "terminal";
           runFailed = true;
           if (isVisible()) {
             setStreamItems((prev) => [
@@ -4793,7 +4806,7 @@ export function SessionView({
             ]);
           }
         } else if (adaEvent.type === "run.completed") {
-          nativeSteerAvailableRef.current = false;
+          nativeSteerStateRef.current = "terminal";
           if (adaEvent.sessionId) detectedSessionId = adaEvent.sessionId;
           if ((adaEvent.status === "max_iterations" || adaEvent.stopReason === "max_turns") && isVisible()) {
             setStreamItems((prev) => [
@@ -5177,7 +5190,7 @@ export function SessionView({
         // Once the terminal event is visible, use the ordinary durable queue
         // directly. The route independently performs the same fallback for
         // requests already racing the event.
-        if (!nativeSteerAvailableRef.current) {
+        if (shouldEnqueueCodexSteer(nativeSteerStateRef.current)) {
           await handleEnqueue();
           return;
         }

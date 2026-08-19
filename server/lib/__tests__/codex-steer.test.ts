@@ -17,15 +17,17 @@ function queued(id = "queued-1"): QueuedMessage {
 }
 
 function options(outcome: "steered" | "turn-ended", queuedMessageId?: string) {
-  const calls = { enqueued: 0, removed: 0 };
+  const calls = { enqueued: 0, queuedSteers: 0 };
   const item = queued(queuedMessageId);
   return {
     calls,
     input: {
       queuedMessageId,
       steer: async () => outcome,
-      getQueuedMessage: async () => item,
-      removeQueuedMessage: async () => { calls.removed += 1; },
+      steerQueuedMessage: async () => {
+        calls.queuedSteers += 1;
+        return { message: item, outcome };
+      },
       buildFollowUp: async (): Promise<QueuedMessageInput> => item,
       enqueueFollowUp: async () => { calls.enqueued += 1; return item; },
     },
@@ -35,26 +37,26 @@ function options(outcome: "steered" | "turn-ended", queuedMessageId?: string) {
 test("accepted native steer does not enqueue and removes a promoted item once", async () => {
   const fixture = options("steered", "queued-1");
   assert.deepEqual(await acceptCodexSteer(fixture.input), { disposition: "steered" });
-  assert.deepEqual(fixture.calls, { enqueued: 0, removed: 1 });
+  assert.deepEqual(fixture.calls, { enqueued: 0, queuedSteers: 1 });
 });
 
 test("turn-finalization race preserves typed text as a queued follow-up", async () => {
   const fixture = options("turn-ended");
   const result = await acceptCodexSteer(fixture.input);
   assert.equal(result.disposition, "queued");
-  assert.deepEqual(fixture.calls, { enqueued: 1, removed: 0 });
+  assert.deepEqual(fixture.calls, { enqueued: 1, queuedSteers: 0 });
 });
 
 test("turn-finalization race leaves a promoted queue item exactly once", async () => {
   const fixture = options("turn-ended", "queued-1");
   const result = await acceptCodexSteer(fixture.input);
   assert.equal(result.disposition, "queued");
-  assert.deepEqual(fixture.calls, { enqueued: 0, removed: 0 });
+  assert.deepEqual(fixture.calls, { enqueued: 0, queuedSteers: 1 });
 });
 
 test("genuine native steer failure does not enqueue or remove queue state", async () => {
   const fixture = options("steered");
   fixture.input.steer = async () => { throw new Error("protocol failure"); };
   await assert.rejects(() => acceptCodexSteer(fixture.input), /protocol failure/);
-  assert.deepEqual(fixture.calls, { enqueued: 0, removed: 0 });
+  assert.deepEqual(fixture.calls, { enqueued: 0, queuedSteers: 0 });
 });
