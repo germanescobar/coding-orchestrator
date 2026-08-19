@@ -7,6 +7,7 @@ import {
   enqueue,
   listQueue,
   removeFromQueue,
+  resolveQueuedMessage,
   dequeueFirst,
   clearQueue,
   type QueuedMessageInput,
@@ -81,6 +82,41 @@ test("removeFromQueue removes by id and reports whether it matched", async () =>
     assert.equal(await removeFromQueue("s1", a.id), true);
     assert.deepEqual((await listQueue("s1")).map((m) => m.text), ["b"]);
     assert.equal(await removeFromQueue("s1", "nope"), false);
+  });
+});
+
+test("resolveQueuedMessage blocks dequeue until promoted ownership is settled", async () => {
+  await withTempHome(async () => {
+    const promoted = await enqueue("s1", input("promoted"));
+    await enqueue("s1", input("next"));
+
+    let releaseResolver: (() => void) | undefined;
+    const resolverEntered = new Promise<void>((resolve) => {
+      releaseResolver = resolve;
+    });
+    let allowResolution: (() => void) | undefined;
+    const resolutionAllowed = new Promise<void>((resolve) => {
+      allowResolution = resolve;
+    });
+
+    const resolution = resolveQueuedMessage("s1", promoted.id, async () => {
+      releaseResolver?.();
+      await resolutionAllowed;
+      return { result: "steered" as const, remove: true };
+    });
+    await resolverEntered;
+
+    let dequeueSettled = false;
+    const dequeue = dequeueFirst("s1").finally(() => {
+      dequeueSettled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(dequeueSettled, false, "dequeue must wait for steer ownership");
+
+    allowResolution?.();
+    assert.equal((await resolution).removed, true);
+    assert.equal((await dequeue)?.text, "next");
+    assert.deepEqual(await listQueue("s1"), []);
   });
 });
 

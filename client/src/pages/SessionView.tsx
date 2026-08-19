@@ -131,6 +131,10 @@ import {
   clearComposerDraft,
   type ComposerDraft,
 } from "../lib/composer-draft.ts";
+import {
+  shouldEnqueueCodexSteer,
+  type NativeSteerState,
+} from "../lib/codex-steer-state.ts";
 import { describeApprovalInput } from "../lib/describe-approval-input.ts";
 import { getLatestPendingToolApproval } from "../lib/pending-tool-approval.ts";
 import { extractFilesFromClipboard } from "../lib/clipboard-files.ts";
@@ -2930,6 +2934,12 @@ export function SessionView({
   // draining (when there's no own SSE). The event poller keys off this so it
   // engages once our SSE closes but the run continues server-side (#113).
   const [ownStreamActive, setOwnStreamActive] = useState(false);
+  // Codex ends native steering at its terminal event, before the enclosing
+  // SSE emits `done`. Keep that narrower lifecycle separate from `streaming`.
+  const nativeSteerStateRef = useRef<NativeSteerState>("unknown");
+  useEffect(() => {
+    nativeSteerStateRef.current = "unknown";
+  }, [sessionId]);
   // Messages enqueued while a run is streaming (replayed one-at-a-time on
   // clean completion). The server is the source of truth; this mirrors it
   // for rendering. See issue #113.
@@ -3871,7 +3881,10 @@ export function SessionView({
         const active = runtimes.some(
           (entry) => entry.sessionId === sessionId && entry.active
         );
-        if (active) setStreaming(true);
+        if (active) {
+          nativeSteerStateRef.current = "unknown";
+          setStreaming(true);
+        }
         void refreshQueue();
       } catch {
         // Ignore transient polling failures.
@@ -3915,6 +3928,9 @@ export function SessionView({
         const isActive = runtimes.some(
           (entry) => entry.sessionId === sessionId && entry.active,
         );
+        if (isActive) {
+          nativeSteerStateRef.current = "unknown";
+        }
         if (!isActive) {
           // An emulated steer (Claude/Anita) on a run this component is only
           // watching via polling — not its own SSE — resumes here once the
@@ -4634,6 +4650,7 @@ export function SessionView({
       } else if (data.type === "anita_event") {
         const adaEvent = data.event;
         if (adaEvent.type === "run.started") {
+          nativeSteerStateRef.current = "active";
           detectedSessionId = adaEvent.sessionId;
           attachToSession(adaEvent.sessionId);
         } else if (adaEvent.type === "assistant.text") {
@@ -4781,6 +4798,7 @@ export function SessionView({
             ]);
           }
         } else if (adaEvent.type === "run.failed") {
+          nativeSteerStateRef.current = "terminal";
           runFailed = true;
           if (isVisible()) {
             setStreamItems((prev) => [
@@ -4789,6 +4807,7 @@ export function SessionView({
             ]);
           }
         } else if (adaEvent.type === "run.completed") {
+          nativeSteerStateRef.current = "terminal";
           if (adaEvent.sessionId) detectedSessionId = adaEvent.sessionId;
           if ((adaEvent.status === "max_iterations" || adaEvent.stopReason === "max_turns") && isVisible()) {
             setStreamItems((prev) => [
@@ -5158,7 +5177,7 @@ export function SessionView({
       promotedId = first.id;
     }
 
-    if (promotedId) {
+    if (promotedId && !providerUsesNativeSteering) {
       try {
         await removeSessionQueuedMessage(projectId, targetSessionId, promotedId);
         setQueue((prev) => prev.filter((m) => m.id !== promotedId));
@@ -5167,15 +5186,40 @@ export function SessionView({
       }
     }
 
-    setMessage("");
-    // The draft text was just consumed by the steer. Clear it explicitly: the
-    // write-through effect is skipped while steerInProgress is set.
-    clearComposerDraft(composerDraftKey);
-    setStreamItems((prev) => [...prev, { type: "user_message", text: steerText, at: Date.now() }]);
-
     if (providerUsesNativeSteering) {
       try {
-        await steerSession(projectId, targetSessionId, steerText, worktreeId);
+        // Once the terminal event is visible, use the ordinary durable queue
+        // directly. The route independently performs the same fallback for
+        // requests already racing the event.
+        if (shouldEnqueueCodexSteer(nativeSteerStateRef.current)) {
+          await handleEnqueue();
+          return;
+        }
+        const result = await steerSession(
+          projectId,
+          targetSessionId,
+          steerText,
+          worktreeId,
+          promotedId ?? undefined
+        );
+        if (promotedId && result.disposition === "steered") {
+          setQueue((prev) => prev.filter((item) => item.id !== promotedId));
+        } else if (result.disposition === "queued") {
+          if (!promotedId && result.message) {
+            setQueue((prev) => [...prev, result.message!]);
+          }
+          if (!promotedId) {
+            setMessage("");
+            clearComposerDraft(composerDraftKey);
+          }
+          return;
+        }
+        setMessage("");
+        clearComposerDraft(composerDraftKey);
+        setStreamItems((prev) => [
+          ...prev,
+          { type: "user_message", text: steerText, at: Date.now() },
+        ]);
       } catch (err) {
         setStreamItems((prev) => [
           ...prev,
@@ -5184,6 +5228,13 @@ export function SessionView({
       }
       return;
     }
+
+    setMessage("");
+    clearComposerDraft(composerDraftKey);
+    setStreamItems((prev) => [
+      ...prev,
+      { type: "user_message", text: steerText, at: Date.now() },
+    ]);
 
     // Emulated steer (Claude/Anita): stop the current run; the stream's
     // `done` handler resumes with the steer text once the process exits.
