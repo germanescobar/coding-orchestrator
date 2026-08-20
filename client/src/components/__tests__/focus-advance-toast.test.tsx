@@ -12,7 +12,7 @@ import { FocusAdvanceToast } from "../focus-advance-toast.tsx";
  * Regression test for the focus-advance countdown toast (issue
  * follow-up to #235).
  *
- * Background: issue #235 moved every Controller Mode shortcut to a
+ * Background: issue #235 moved every focus-queue shortcut to a
  * modifier-based chord so it fires regardless of focus (default
  * `Ctrl+S` for stay, `Ctrl+N` for continue). The toast copy was left
  * untouched, advertising "Press S to stay · N to continue" — strings
@@ -55,8 +55,8 @@ function labelFor(chord: string): string {
 
 test("toast falls back to default stay / next chips when bindings are null", () => {
   const html = render(null);
-  const stayDefault = labelFor(DEFAULT_SHORTCUT_BINDINGS.controllerModeStay);
-  const nextDefault = labelFor(DEFAULT_SHORTCUT_BINDINGS.controllerModeNext);
+  const stayDefault = labelFor(DEFAULT_SHORTCUT_BINDINGS.focusStay);
+  const nextDefault = labelFor(DEFAULT_SHORTCUT_BINDINGS.focusAdvanceNext);
   assert.ok(
     html.includes(`>${stayDefault}</span> to stay`),
     `expected toast to render default stay label "${stayDefault}", got: ${html}`,
@@ -79,12 +79,12 @@ test("toast falls back to default stay / next chips when bindings are null", () 
 test("toast surfaces the rebound chord when the user customises it in Settings", () => {
   const rebound: ShortcutBindings = {
     ...DEFAULT_SHORTCUT_BINDINGS,
-    controllerModeStay: "ctrl-shift-s",
-    controllerModeNext: "ctrl-shift-n",
+    focusStay: "ctrl-shift-s",
+    focusAdvanceNext: "ctrl-shift-n",
   };
   const html = render(rebound);
-  const stayLabel = labelFor(rebound.controllerModeStay);
-  const nextLabel = labelFor(rebound.controllerModeNext);
+  const stayLabel = labelFor(rebound.focusStay);
+  const nextLabel = labelFor(rebound.focusAdvanceNext);
   assert.ok(
     html.includes(`>${stayLabel}</span> to stay`),
     `expected rebound stay label "${stayLabel}", got: ${html}`,

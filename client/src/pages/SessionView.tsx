@@ -150,18 +150,13 @@ interface SessionViewProps {
   // the transcript. Resolves the short form (session-only) to its owning
   // project/worktree before navigating. No-op if the parent doesn't provide it.
   onOpenConversation?: (target: ControllerLinkTarget) => void;
-  controllerMode?: boolean;
   /**
-   * Effective shortcut bindings for Controller Mode chords. `null` while
-   * the settings hook is still loading. SessionView reads these so the
-   * `<Kbd>` chips and the inline "press S to stay" listener reflect the
-   * user's rebinds. See issue #235.
+   * Effective shortcut bindings for the focus-queue chords (Next /
+   * Stay / Done). `null` while the settings hook is still loading.
+   * SessionView reads these so the inline "press Ctrl+S to stay"
+   * listener matches the user's rebinds. See issue #235.
    */
   shortcutBindings?: import("../../../shared/shortcuts.ts").ShortcutBindings | null;
-  focusPosition?: { current: number; total: number };
-  onFocusDone?: () => void;
-  onFocusSkip?: () => void;
-  onFocusExit?: () => void;
   onFocusPinnedChange?: () => void;
   // Opens the archive confirmation dialog for the current session.
   // Owned by the parent because it shares its `archiveConfirmOpen`
@@ -180,13 +175,13 @@ interface SessionViewProps {
   // other views (sidebar, focus queue) that cache the title separately.
   onTitleChange?: () => void;
   // Fires right after the user sends a message (or answers an agent
-  // prompt) in controller mode, with the id of the session the message
-  // was sent from. The parent can use this to advance to the next
-  // focus item. See issue #81 follow-up: "respond and advance to the
-  // next conversation".
+  // prompt), with the id of the session the message was sent from.
+  // The parent can use this to advance to the next focus item. See
+  // issue #81 follow-up: "respond and advance to the next
+  // conversation".
   onFocusAdvanceAfterSend?: (sessionId: string) => void;
   /**
-   * When non-null, a controller-mode advance has been scheduled after
+   * When non-null, a focus-advance countdown has been scheduled after
    * a send. While this is set, SessionView preserves the in-flight
    * user-message bubble in the originating session (we skip the
    * session-change cleanup that would otherwise wipe it) so the user
@@ -2898,12 +2893,7 @@ export function SessionView({
   onSessionCreated,
   onBackgroundComplete,
   onOpenConversation,
-  controllerMode = false,
   shortcutBindings = null,
-  focusPosition,
-  onFocusDone,
-  onFocusSkip,
-  onFocusExit,
   onFocusPinnedChange,
   onTitleChange,
   onFocusAdvanceAfterSend,
@@ -3383,18 +3373,17 @@ export function SessionView({
     };
   }, [projectId, worktreeId, sessionId]);
 
-  // While controller mode is active, drop the user straight into the composer
-  // whenever the active session changes (entering controller mode, skipping to
-  // the next pinned session, or marking the current one done). This keeps
-  // the controller-mode triage loop keyboard-driven: the user can `Esc` out
-  // of the input to fire a shortcut and is placed back at the keyboard the
-  // moment the new session is ready.
+  // Drop the user straight into the composer whenever the active
+  // session changes. The auto-advance runs unconditionally after a
+  // reply, so the user is in a triage loop by default and should
+  // land in the composer the moment a new session is ready. They
+  // can `Esc` out to fire a shortcut.
   useEffect(() => {
-    if (!controllerMode || !sessionId) return;
+    if (!sessionId) return;
     const textarea = textareaRef.current;
     if (!textarea || textarea.disabled) return;
     textarea.focus();
-  }, [sessionId, controllerMode]);
+  }, [sessionId]);
 
   useEffect(() => {
     const isOriginatingCountdown =
@@ -3412,7 +3401,6 @@ export function SessionView({
 
     if (
       hadVisibleFocusAdvanceRef.current &&
-      controllerMode &&
       sessionId &&
       textarea &&
       !textarea.disabled
@@ -3420,7 +3408,7 @@ export function SessionView({
       textarea.focus();
     }
     hadVisibleFocusAdvanceRef.current = false;
-  }, [focusAdvanceCountdown, controllerMode, sessionId]);
+  }, [focusAdvanceCountdown, sessionId]);
 
   useEffect(() => {
     const isOriginatingCountdown =
@@ -3428,13 +3416,13 @@ export function SessionView({
       focusAdvanceCountdown?.sentFromSessionId === sessionId;
     if (!isOriginatingCountdown || !focusAdvanceCountdown) return;
 
-    // Mirror the central `useControllerModeShortcuts` "stay" chord so the
+    // Mirror the central `useFocusShortcuts` "stay" chord so the
     // user can cancel a pending advance with their (possibly rebound)
     // Cmd/Ctrl+S even when focus is inside this session's composer. The
     // central hook also fires this path, but stopping propagation here
     // keeps the textarea free of literal `s` characters in case the
     // event reaches us first. See issue #235.
-    const stayChord = parseChord(shortcutBindings?.controllerModeStay ?? "ctrl-s");
+    const stayChord = parseChord(shortcutBindings?.focusStay ?? "ctrl-s");
 
     const handleStayShortcut = (event: KeyboardEvent) => {
       if (event.repeat) return;
@@ -4535,15 +4523,15 @@ export function SessionView({
       return false;
     }
 
-    // In controller mode, signal the parent to advance to the next focus
-    // item as soon as the user commits to a message. The parent owns
-    // the navigation logic and the "stay put if the only pinned item
-    // is the one we just sent to" rule (issue #81 follow-up).
-    // Continuations (queued replay / emulated steer) never advance focus.
-    // For an existing session we can advance immediately; for a send from
+    // Signal the parent to advance to the next focus item as soon as
+    // the user commits to a message. The parent owns the navigation
+    // logic and the "stay put if the only pinned item is the one we
+    // just sent to" rule (issue #81 follow-up). Continuations
+    // (queued replay / emulated steer) never advance focus. For an
+    // existing session we can advance immediately; for a send from
     // the new-thread composer (no `sessionId` yet) we defer until the
     // stream attaches and the new session id is known (issue #120).
-    if (controllerMode && onFocusAdvanceAfterSend && !runOverrides) {
+    if (onFocusAdvanceAfterSend && !runOverrides) {
       if (sessionId) {
         onFocusAdvanceAfterSend(sessionId);
       } else {
@@ -5543,11 +5531,11 @@ export function SessionView({
         .then(setEvents)
         .catch(() => {});
       // Submitting the structured-input form is the "I'm done with this
-      // session for now" moment in Controller Mode, same as sending a
-      // message: schedule the focus-advance countdown. Dismiss
+      // session for now" moment, same as sending a message: schedule
+      // the focus-advance countdown. Dismiss
       // (handleStructuredUserInputDismiss) is the explicit stay signal
       // and is intentionally not wired to advance (issue #277).
-      if (controllerMode && onFocusAdvanceAfterSend) {
+      if (onFocusAdvanceAfterSend) {
         if (targetSessionId) {
           onFocusAdvanceAfterSend(targetSessionId);
         } else {
@@ -5646,11 +5634,11 @@ export function SessionView({
         .then(setEvents)
         .catch(() => {});
       // Resolving an approval card is the same "I'm done with this session
-      // for now" moment in Controller Mode as sending a message: schedule
-      // the focus-advance countdown so the user doesn't have to hit
-      // Next manually. Deny is the explicit "I want to stay and
-      // reconsider" signal, so it doesn't advance (issue #277).
-      if (controllerMode && onFocusAdvanceAfterSend && decision !== "deny") {
+      // for now" moment as sending a message: schedule the focus-advance
+      // countdown so the user doesn't have to hit Next manually. Deny
+      // is the explicit "I want to stay and reconsider" signal, so it
+      // doesn't advance (issue #277).
+      if (onFocusAdvanceAfterSend && decision !== "deny") {
         if (targetSessionId) {
           onFocusAdvanceAfterSend(targetSessionId);
         } else {
@@ -5760,52 +5748,6 @@ export function SessionView({
 
   return (
     <>
-      {controllerMode && (
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-blue-500/20 bg-blue-500/15 px-3 py-2 text-blue-200 md:px-4">
-          <div className="min-w-0 text-xs text-blue-200/80">
-            <span className="font-medium text-blue-200">Controller Mode</span>
-            <span className="ml-2">
-              {focusPosition && focusPosition.total > 0
-                ? `${focusPosition.current || 1} / ${focusPosition.total}`
-                : "No sessions on radar"}
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              onClick={onFocusSkip}
-              className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-blue-200/80 transition-colors hover:bg-blue-500/20 hover:text-blue-100 disabled:pointer-events-none disabled:opacity-50"
-              title={`Next (${formatChord(shortcutBindings?.controllerModeNext ?? "ctrl-n", IS_MAC)})`}
-            >
-              <StepForward className="h-3.5 w-3.5" />
-              Next
-              <Kbd>{formatChord(shortcutBindings?.controllerModeNext ?? "ctrl-n", IS_MAC)}</Kbd>
-            </button>
-            <button
-              type="button"
-              onClick={onFocusDone}
-              disabled={!sessionId}
-              className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-blue-200/80 transition-colors hover:bg-blue-500/20 hover:text-blue-100 disabled:pointer-events-none disabled:opacity-50"
-              title={`Mark done (${formatChord(shortcutBindings?.controllerModeDone ?? "ctrl-d", IS_MAC)})`}
-            >
-              <CheckCircle2 className="h-3.5 w-3.5" />
-              Done
-              <Kbd>{formatChord(shortcutBindings?.controllerModeDone ?? "ctrl-d", IS_MAC)}</Kbd>
-            </button>
-            <button
-              type="button"
-              onClick={onFocusExit}
-              className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-blue-200/80 transition-colors hover:bg-blue-500/20 hover:text-blue-100"
-              title={`Exit Controller Mode (${formatChord(shortcutBindings?.controllerModeToggle ?? "ctrl-t", IS_MAC)})`}
-            >
-              <LogOut className="h-3.5 w-3.5" />
-              Exit
-              <Kbd>{formatChord(shortcutBindings?.controllerModeToggle ?? "ctrl-t", IS_MAC)}</Kbd>
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Header */}
       <header className={`${sessionId ? "flex" : "hidden md:flex"} h-12 md:h-14 shrink-0 items-center justify-end md:justify-between border-b border-border bg-background px-3 md:px-4`}>
         <div className="hidden md:flex flex-col justify-center min-w-0">

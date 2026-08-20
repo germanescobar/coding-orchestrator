@@ -17,6 +17,18 @@ export interface SessionRuntimeState {
    * immediately without racing the async persistence of the request event.
    */
   pendingApprovals?: Map<string, ClaudeApprovalRequest>;
+  /**
+   * True when the agent has paused on a `user.input_requested` event
+   * (e.g. Claude's structured-input flow) and is waiting for the user
+   * to answer. The child process is killed at that point so the runtime
+   * is `active: false`, but the session still needs the user's
+   * attention — the focus-queue sidebar surfaces it as the highest
+   * priority item regardless of active/inactive state.
+   *
+   * Cleared whenever a new stream starts (`markSessionActive`) so a
+   * resumed run doesn't carry the flag forward.
+   */
+  awaitingUserInput?: boolean;
 }
 
 const runtimes = new Map<string, SessionRuntimeState>();
@@ -25,7 +37,13 @@ export function markSessionActive(
   sessionId: string,
   runtime: Omit<SessionRuntimeState, "active"> = {}
 ) {
-  runtimes.set(sessionId, { active: true, ...runtime });
+  runtimes.set(sessionId, {
+    active: true,
+    ...runtime,
+    // A new stream is a fresh run; the previous turn's "waiting on the
+    // user" pause can't carry over.
+    awaitingUserInput: undefined,
+  });
 }
 
 export function markSessionInactive(sessionId: string) {
@@ -33,6 +51,9 @@ export function markSessionInactive(sessionId: string) {
   if (runtime) {
     // The process is gone, so any approvals it was blocked on can no longer be
     // answered — drop them so a stale decision can't target a dead child.
+    // `awaitingUserInput` is preserved: the user still owes the answer
+    // even though the child is dead (e.g. Claude's structured-input
+    // pause kills the child but the prompt is still on screen).
     runtimes.set(sessionId, {
       ...runtime,
       active: false,
@@ -61,6 +82,22 @@ export function recordPendingApproval(
   runtime.pendingApprovals.set(request.requestId, request);
 }
 
+/**
+ * Mark the session as paused on a user-input request. Called by the
+ * stream handler when a `user.input_requested` event lands (Claude's
+ * structured-input flow kills the child at that point, so the runtime
+ * flips `active: false` shortly after — the flag survives that
+ * transition).
+ */
+export function setSessionAwaitingUserInput(
+  sessionId: string,
+  awaiting: boolean
+) {
+  const runtime = runtimes.get(sessionId);
+  if (!runtime) return;
+  runtime.awaitingUserInput = awaiting;
+}
+
 /** Remove and return a pending approval once the user has decided. */
 export function consumePendingApproval(
   sessionId: string,
@@ -80,6 +117,13 @@ export interface SessionRuntimeSummary {
   provider?: string;
   projectId?: string;
   worktreeId?: string;
+  /**
+   * True when the agent is paused on a user-input request (Claude's
+   * structured-input flow) OR has at least one pending tool approval.
+   * The focus-queue sidebar uses this as the highest-priority
+   * "needs your attention" signal regardless of `active` state.
+   */
+  awaitingInput?: boolean;
 }
 
 /**
@@ -90,9 +134,13 @@ export interface SessionRuntimeSummary {
 export function listSessionRuntimes(): SessionRuntimeSummary[] {
   const summaries: SessionRuntimeSummary[] = [];
   for (const [sessionId, state] of runtimes) {
+    const awaitingInput =
+      state.awaitingUserInput === true ||
+      (state.pendingApprovals?.size ?? 0) > 0;
     summaries.push({
       sessionId,
       active: state.active,
+      awaitingInput: awaitingInput || undefined,
       provider: state.provider,
       projectId: state.metadata?.projectId,
       worktreeId: state.metadata?.worktreeId,

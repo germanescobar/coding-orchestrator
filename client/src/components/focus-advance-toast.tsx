@@ -12,7 +12,7 @@ import { formatChord, isMacPlatform } from "../lib/shortcut-match.ts";
  * visible shortcut matches the binding the listener fires.
  *
  * Background: the original copy read "Press S to stay · N to
- * continue" and worked when Controller Mode used single-letter
+ * continue" and worked when the focus-queue used single-letter
  * shortcuts. Issue #235 moved every shortcut to a modifier-based
  * chord (default `Ctrl+S` / `Ctrl+N`) so it fires regardless of
  * focus — but the toast copy was never updated, leaving the chips
@@ -59,13 +59,13 @@ export function FocusAdvanceToast({
   // the bundled defaults if bindings haven't loaded yet so the chips
   // never read "Press S to stay" — that string is misleading because
   // the listener only fires on the modifier-based chord. `isMacPlatform`
-  // matches the rest of the Controller Mode UI.
+  // matches the rest of the focus-queue UI.
   const stayChord =
-    bindings?.controllerModeStay ??
-    DEFAULT_SHORTCUT_BINDINGS.controllerModeStay;
+    bindings?.focusStay ??
+    DEFAULT_SHORTCUT_BINDINGS.focusStay;
   const nextChord =
-    bindings?.controllerModeNext ??
-    DEFAULT_SHORTCUT_BINDINGS.controllerModeNext;
+    bindings?.focusAdvanceNext ??
+    DEFAULT_SHORTCUT_BINDINGS.focusAdvanceNext;
   const onMac = isMacPlatform();
   const stayLabel = formatChord(stayChord, onMac);
   const nextLabel = formatChord(nextChord, onMac);

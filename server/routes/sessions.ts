@@ -64,6 +64,7 @@ import {
   markSessionActive,
   markSessionInactive,
   recordPendingApproval,
+  setSessionAwaitingUserInput,
   stopSessionRuntime,
 } from "../lib/session-runtime.js";
 import {
@@ -1414,6 +1415,14 @@ export async function handleSessionStream(
               .catch(() => {});
             if (providerId === "claude" && event.type === "user.input_requested") {
               pausedForClaudeUserInput = true;
+              // Flag the session as awaiting user input BEFORE killing
+              // the child: markSessionInactive runs in the close handler
+              // and mustn't wipe the flag (it doesn't, but order still
+              // matters — the runtime state has to be consistent by
+              // the time the close handler fires).
+              if (streamSessionId) {
+                setSessionAwaitingUserInput(streamSessionId, true);
+              }
               child.kill("SIGTERM");
             }
             // Stand the watchdog down while an approval is pending, and re-arm
@@ -1428,6 +1437,12 @@ export async function handleSessionStream(
               }
             } else if (awaitingApproval) {
               awaitingApproval = false;
+              // Approval was answered; the session is no longer
+              // awaiting input. Clear the flag so the focus queue
+              // demotes the session back to its regular bucket.
+              if (streamSessionId) {
+                setSessionAwaitingUserInput(streamSessionId, false);
+              }
               resetWatchdog();
             }
           }
