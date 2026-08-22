@@ -1,6 +1,12 @@
-import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
-import { orchestratorHome, terminalTabsRegistryFile } from "./paths.js";
+import {
+  RegistryParseError,
+  readJsonRegistry,
+  validateRecord,
+  withLock,
+  writeJsonRegistry,
+} from "./json-registry.js";
+import { terminalTabsRegistryFile } from "./paths.js";
 
 export interface TerminalTab {
   id: string;
@@ -112,36 +118,84 @@ function normalizeTerminalTabs(value: unknown): TerminalTab[] {
   return tabs.length > 0 ? tabs : [DEFAULT_TERMINAL_TAB];
 }
 
-async function readRegistry(): Promise<Registry> {
-  try {
-    const content = await fs.readFile(terminalTabsRegistryFile(), "utf-8");
-    const parsed = JSON.parse(content);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Registry)
-      : {};
-  } catch {
-    return {};
-  }
+/**
+ * Read-modify-write against the terminal tabs registry.
+ *
+ * Issue #332: this helper has the same race risk that `worktrees.ts`
+ * had — concurrent reads of a half-written file, followed by a write
+ * that persisted `{}` as the new contents. We now hold a per-file
+ * mutex and only persist whatever the caller leaves in `registry` (or
+ * whatever falls out of the mutate callback).
+ */
+async function withTerminalTabsRegistry<T>(
+  fn: (registry: Registry) => Promise<T>
+): Promise<T> {
+  const file = terminalTabsRegistryFile();
+  return withLock(file, async () => {
+    const { value: registry } = await readJsonRegistry<Registry>(file, {
+      defaultValue: {},
+      backup: `${file}.bak`,
+      validate: validateRecord<TerminalTab[]>,
+    });
+    const result = await fn(registry);
+    await writeJsonRegistry(file, registry);
+    return result;
+  });
 }
 
-async function writeRegistry(registry: Registry): Promise<void> {
-  await fs.mkdir(orchestratorHome(), { recursive: true });
-  await fs.writeFile(terminalTabsRegistryFile(), JSON.stringify(registry, null, 2));
+/**
+ * Load the terminal tabs registry without persisting anything. Use
+ * this for read-only callers (the merge-with-tmux fallback in
+ * `getTerminalTabs`) that don't mutate the registry, so the rare
+ * parse-failure path doesn't trigger a `writeRegistry` from the lock
+ * holding its content stale.
+ */
+async function readTerminalTabsRegistry(): Promise<Registry> {
+  const file = terminalTabsRegistryFile();
+  return readJsonRegistry<Registry>(file, {
+    defaultValue: {},
+    backup: `${file}.bak`,
+    validate: validateRecord<TerminalTab[]>,
+  }).then((r) => r.value);
 }
 
 export async function getTerminalTabs(
   projectId: string,
   worktreeId: string
 ): Promise<TerminalTab[]> {
-  const registry = await readRegistry();
-  const key = registryKey(projectId, worktreeId);
-  const tabs = normalizeTerminalTabs(registry[key]);
-  const merged = mergeDiscoveredTabs(tabs, listTmuxTerminalIds(projectId, worktreeId));
-  if (merged.length !== tabs.length) {
-    registry[key] = merged;
-    await writeRegistry(registry);
+  try {
+    const registry = await readTerminalTabsRegistry();
+    const key = registryKey(projectId, worktreeId);
+    const tabs = normalizeTerminalTabs(registry[key]);
+    const merged = mergeDiscoveredTabs(tabs, listTmuxTerminalIds(projectId, worktreeId));
+    if (merged.length !== tabs.length) {
+      // Persist the merged view back so the next read doesn't have to
+      // re-discover tmux sessions. We do this under the lock so a
+      // concurrent `setTerminalTabs` doesn't overwrite our merged
+      // view with stale data.
+      await withTerminalTabsRegistry(async (locked) => {
+        const lockedTabs = normalizeTerminalTabs(locked[key]);
+        // `merged` already includes any tabs that were in the registry
+        // when we first read it; if a concurrent writer added new
+        // tabs in the meantime, prefer the union.
+        const union = mergeDiscoveredTabs(
+          mergeTerminalTabs(lockedTabs, merged),
+          listTmuxTerminalIds(projectId, worktreeId)
+        );
+        locked[key] = union;
+      });
+    }
+    return merged;
+  } catch (err) {
+    if (err instanceof RegistryParseError) {
+      console.error(`terminal-tabs.json is unreadable: ${err.message}`);
+      // Return the default tab rather than empty so the UI doesn't
+      // blank out. The corrupted file is left in place so an operator
+      // can decide whether to recover from `terminal-tabs.json.bak`.
+      return [DEFAULT_TERMINAL_TAB];
+    }
+    throw err;
   }
-  return merged;
 }
 
 export async function setTerminalTabs(
@@ -150,30 +204,30 @@ export async function setTerminalTabs(
   tabs: unknown,
   options: SetTerminalTabsOptions = {}
 ): Promise<TerminalTab[]> {
-  const registry = await readRegistry();
-  const key = registryKey(projectId, worktreeId);
-  const currentTabs = normalizeTerminalTabs(registry[key]);
-  const incomingTabs = normalizeTerminalTabs(tabs);
-  const discoveredIds = listTmuxTerminalIds(projectId, worktreeId).filter(
-    (id) => id !== options.removeTerminalId
-  );
-  const mergedTabs = mergeDiscoveredTabs(
-    mergeTerminalTabs(currentTabs, incomingTabs),
-    discoveredIds
-  );
-  const normalized = removeTerminalTab(mergedTabs, options.removeTerminalId);
-  registry[key] = normalized;
-  await writeRegistry(registry);
-  return normalized;
+  return withTerminalTabsRegistry(async (registry) => {
+    const key = registryKey(projectId, worktreeId);
+    const currentTabs = normalizeTerminalTabs(registry[key]);
+    const incomingTabs = normalizeTerminalTabs(tabs);
+    const discoveredIds = listTmuxTerminalIds(projectId, worktreeId).filter(
+      (id) => id !== options.removeTerminalId
+    );
+    const mergedTabs = mergeDiscoveredTabs(
+      mergeTerminalTabs(currentTabs, incomingTabs),
+      discoveredIds
+    );
+    const normalized = removeTerminalTab(mergedTabs, options.removeTerminalId);
+    registry[key] = normalized;
+    return normalized;
+  });
 }
 
 export async function removeTerminalTabsForWorktree(
   projectId: string,
   worktreeId: string
 ): Promise<void> {
-  const registry = await readRegistry();
-  const key = registryKey(projectId, worktreeId);
-  if (!(key in registry)) return;
-  delete registry[key];
-  await writeRegistry(registry);
+  await withTerminalTabsRegistry(async (registry) => {
+    const key = registryKey(projectId, worktreeId);
+    if (!(key in registry)) return;
+    delete registry[key];
+  });
 }

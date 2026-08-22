@@ -893,6 +893,28 @@ worktreesRouter.delete(
       return;
     }
 
+    // Issue #332: a paused worktree (no active session, no running PTY)
+    // can still carry uncommitted changes. The previous version called
+    // `git worktree remove --force` and then `fs.rm --recursive`, which
+    // would silently destroy any of those changes. Refuse the delete by
+    // default; require `?force=1` and (for dirty worktrees) a successful
+    // archive script run before destructive removal.
+    const forceParam = getQueryString(req.query.force);
+    const forceDelete = forceParam === "1" || forceParam === "true";
+
+    // Always compute dirty status so we can show the file list in
+    // every error path. Skipping the check when `?force=1` is set
+    // would hide the very state we need to gate the destructive
+    // removal on.
+    const dirtyFiles = await listDirtyFiles(worktree.path);
+    if (dirtyFiles.length > 0 && !forceDelete) {
+      res.status(409).json({
+        error: "worktree has uncommitted changes; pass ?force=1 to delete",
+        dirtyFiles,
+      });
+      return;
+    }
+
     const sessions = await getSessions(worktree.path);
     const activeIds = sessions
       .filter((s) => getSessionRuntime(s.id).active)
@@ -943,15 +965,29 @@ worktreesRouter.delete(
         res.status(500).json({ error: `archive exited with ${exitCode}` });
         return;
       }
+    } else if (dirtyFiles.length > 0) {
+      // Force-deleting a dirty worktree without an archive script
+      // configured would still destroy uncommitted changes — we already
+      // persisted `dirtyFiles` for the caller but we have no recovery
+      // path. Refuse rather than proceed.
+      res.status(409).json({
+        error:
+          "worktree has uncommitted changes and no archive script is configured; configure archive.sh or commit/stash the changes before deleting",
+        dirtyFiles,
+      });
+      return;
     }
 
-    // Remove via git first; fall back to fs.rm if directory still exists.
-    await runGitExitCode(project.path, [
-      "worktree",
-      "remove",
-      "--force",
-      worktree.path,
-    ]);
+    // Remove via git first. Only pass `--force` when we knowingly
+    // bypassed the dirty-check (i.e. the caller passed `?force=1` and
+    // archive.sh already captured the state). For a normal clean
+    // delete, let git refuse — that gives us an early signal that
+    // something else (a concurrent write, a stale status) dirtied the
+    // tree between our check and now.
+    const gitArgs = forceDelete
+      ? ["worktree", "remove", "--force", worktree.path]
+      : ["worktree", "remove", worktree.path];
+    await runGitExitCode(project.path, gitArgs);
     if (existsSync(worktree.path)) {
       await fs.rm(worktree.path, { recursive: true, force: true });
     }
@@ -964,6 +1000,35 @@ worktreesRouter.delete(
 );
 
 // --- helpers ---
+
+/**
+ * List the dirty files in a worktree (modified, staged, or untracked)
+ * relative to its HEAD. Used by the DELETE route (issue #332) to refuse
+ * deletes that would destroy uncommitted work.
+ *
+ * Returns an empty array when the worktree is clean, when the directory
+ * doesn't exist yet, or when `git status` can't be read for any reason
+ * — we deliberately do NOT silently treat those as "dirty" because that
+ * would block legitimate deletes. The first two are non-dirty (clean
+ * absent directory or a brand-new worktree); only the last case is
+ * ambiguous, and we'd rather risk letting the user delete a worktree
+ * whose git status we couldn't read than refusing every delete when
+ * git is misbehaving.
+ */
+async function listDirtyFiles(cwd: string): Promise<string[]> {
+  if (!existsSync(cwd)) return [];
+  const output = await runGitCapture(cwd, [
+    "status",
+    "--porcelain",
+    "--ignore-submodules=dirty",
+    "--untracked-files=all",
+  ]);
+  if (!output) return [];
+  return output
+    .split("\n")
+    .map((line) => line.replace(/^\s*\S+\s+/, "").trim())
+    .filter(Boolean);
+}
 
 function runStreamed(
   command: string,
