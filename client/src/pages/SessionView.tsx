@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState, useEffect, useRef, createContext, useContext } from "react";
+import { memo, useCallback, useMemo, useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { diffLines } from "diff";
 import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square, Diff, PanelRight, Zap, Plus, X, Paperclip, FileText, FileCode, Folder, FolderOpen, CheckCircle2, StepForward, LogOut, Radar, Play, Sparkles, Globe2, RefreshCw, Pencil, Archive } from "lucide-react";
 import hljs from "highlight.js/lib/core";
@@ -4053,6 +4053,23 @@ export function SessionView({
     if (!stickToBottomRef.current) return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [events, streamItems]);
+
+  // The user message bubble appears in the DOM the moment they hit send,
+  // but until now nothing nudged the scroll container to follow it. If the
+  // user was already pinned to the bottom the new bubble was added *below*
+  // the visible viewport (browsers don't auto-shift scrollTop when content
+  // grows at the end) and stayed hidden until the agent's first stream
+  // event tripped the [events, streamItems] effect above. Scroll on the
+  // pending-message transition so the user can see their own message right
+  // away; once the run kicks off, the stream effect takes over for the
+  // rest of the turn. Behavior is `auto` (not `smooth`) so the bubble is
+  // visible before the browser paints the next frame, which prevents a
+  // single-frame flash of the chat scrolled away from the user's message.
+  useLayoutEffect(() => {
+    if (!pendingMessage) return;
+    if (!stickToBottomRef.current) return;
+    bottomRef.current?.scrollIntoView({ behavior: "auto" });
+  }, [pendingMessage]);
 
   const handleScroll = () => {
     const el = scrollContainerRef.current;
