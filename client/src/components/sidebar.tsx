@@ -194,13 +194,17 @@ function worktreeVisibilityKey(projectId: string, worktreeId: string): string {
 // The destructive confirm button used by the project and worktree delete
 // dialogs. When `loading` is true the label is swapped for a spinner and
 // the button is disabled so the user can't double-click while the
-// destructive request is in flight. Exported for unit testing.
+// destructive request is in flight. `label` lets the caller swap the
+// default "Delete" text (e.g. "Force delete" when the worktree has
+// uncommitted changes — issue #332). Exported for unit testing.
 export function DestructiveConfirmButton({
   loading,
   onClick,
+  label,
 }: {
   loading: boolean;
   onClick: () => void;
+  label?: string;
 }) {
   return (
     <Button variant="destructive" onClick={onClick} disabled={loading}>
@@ -210,7 +214,7 @@ export function DestructiveConfirmButton({
           Deleting…
         </>
       ) : (
-        "Delete"
+        label ?? "Delete"
       )}
     </Button>
   );
@@ -285,6 +289,12 @@ export function Sidebar({
     projectId: string;
     worktreeId: string;
     name: string;
+    // Issue #332: when the orchestrator refuses a delete because the
+    // worktree has uncommitted changes, we keep the offending file
+    // list on the confirm state so the dialog can show it and offer
+    // a force-retry. `null` until the first delete attempt returns
+    // 409 with `dirtyFiles`.
+    dirtyFiles: string[] | null;
   } | null>(null);
   const [renameSession, setRenameSession] = useState<{
     projectId: string;
@@ -456,14 +466,41 @@ export function Sidebar({
   const confirmDeleteWorktreeAction = async () => {
     if (!confirmDeleteWorktree) return;
     if (deletingWorktree) return;
-    const { projectId, worktreeId } = confirmDeleteWorktree;
+    const { projectId, worktreeId, dirtyFiles } = confirmDeleteWorktree;
+    // Issue #332: when the orchestrator already returned the dirty
+    // file list for this worktree, the user has seen the warning and
+    // clicked through to retry — pass `?force=1` so we don't loop on
+    // the same 409. A first-time attempt (dirtyFiles === null) uses
+    // the safe-by-default path so the user gets the chance to abort.
+    const force = dirtyFiles !== null;
     setDeletingWorktree(true);
     try {
-      await deleteWorktree(projectId, worktreeId);
+      await deleteWorktree(projectId, worktreeId, { force });
       setConfirmDeleteWorktree(null);
       await loadAll();
       toast.success("Worktree deleted");
     } catch (err) {
+      // The orchestrator's safe-by-default gate (issue #332) returns
+      // 409 with `dirtyFiles` when the worktree has uncommitted
+      // changes, and 409 with the same field when `?force=1` was sent
+      // but no archive script is configured. Capture the file list
+      // and keep the dialog open so the user can see what changed
+      // and decide whether to retry with force (only when an archive
+      // is configured).
+      const dirty = (err as Error & { dirtyFiles?: unknown }).dirtyFiles;
+      if (
+        Array.isArray(dirty) &&
+        dirty.length > 0 &&
+        !force
+      ) {
+        setConfirmDeleteWorktree({
+          projectId,
+          worktreeId,
+          name: confirmDeleteWorktree.name,
+          dirtyFiles: dirty,
+        });
+        return;
+      }
       toast.error(
         err instanceof Error ? err.message : "Failed to delete worktree",
       );
@@ -982,6 +1019,7 @@ export function Sidebar({
                                       projectId: project.id,
                                       worktreeId: worktree.id,
                                       name: worktree.name,
+                                      dirtyFiles: null,
                                     });
                                   }}
                                   title="Delete worktree"
@@ -1144,15 +1182,55 @@ export function Sidebar({
       >
         <DialogContent showCloseButton={false}>
           <DialogHeader>
-            <DialogTitle>Delete worktree</DialogTitle>
+            <DialogTitle>
+              {confirmDeleteWorktree?.dirtyFiles
+                ? "Force delete worktree"
+                : "Delete worktree"}
+            </DialogTitle>
             <DialogDescription>
-              Delete worktree{" "}
-              <span className="font-medium text-foreground">
-                {confirmDeleteWorktree?.name}
-              </span>
-              ? This removes the directory from disk. The git branch is kept.
+              {confirmDeleteWorktree?.dirtyFiles ? (
+                <>
+                  Worktree{" "}
+                  <span className="font-medium text-foreground">
+                    {confirmDeleteWorktree.name}
+                  </span>{" "}
+                  has uncommitted changes. Force-deleting will discard
+                  them permanently (the orchestrator runs the
+                  project&apos;s <code>archive.sh</code> first, when
+                  one is configured, and refuses otherwise).
+                </>
+              ) : (
+                <>
+                  Delete worktree{" "}
+                  <span className="font-medium text-foreground">
+                    {confirmDeleteWorktree?.name}
+                  </span>
+                  ? This removes the directory from disk. The git
+                  branch is kept.
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
+          {confirmDeleteWorktree?.dirtyFiles && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
+              <p className="mb-1 font-medium text-destructive">
+                Uncommitted changes:
+              </p>
+              <ul className="list-disc space-y-0.5 pl-5 font-mono text-foreground/80">
+                {confirmDeleteWorktree.dirtyFiles
+                  .slice(0, 10)
+                  .map((file) => (
+                    <li key={file}>{file}</li>
+                  ))}
+                {confirmDeleteWorktree.dirtyFiles.length > 10 && (
+                  <li>
+                    … and {confirmDeleteWorktree.dirtyFiles.length - 10}{" "}
+                    more
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
           <DialogFooter>
             <DialogClose
               render={<Button variant="outline" disabled={deletingWorktree} />}
@@ -1162,6 +1240,9 @@ export function Sidebar({
             <DestructiveConfirmButton
               loading={deletingWorktree}
               onClick={confirmDeleteWorktreeAction}
+              label={
+                confirmDeleteWorktree?.dirtyFiles ? "Force delete" : undefined
+              }
             />
           </DialogFooter>
         </DialogContent>

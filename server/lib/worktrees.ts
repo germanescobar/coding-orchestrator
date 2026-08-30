@@ -1,8 +1,14 @@
-import fs from "node:fs/promises";
 import path from "node:path";
 import { v4 as uuidv4 } from "uuid";
 import { getProject, getProjects, type Project } from "./projects.js";
-import { orchestratorHome, worktreesRegistryFile } from "./paths.js";
+import {
+  RegistryParseError,
+  readJsonRegistry,
+  validateArray,
+  withLock,
+  writeJsonRegistry,
+} from "./json-registry.js";
+import { worktreesRegistryFile } from "./paths.js";
 
 export interface Worktree {
   id: string;
@@ -20,25 +26,34 @@ export interface Worktree {
 
 const MAIN_WORKTREE_NAME = "main";
 
-async function ensureHome() {
-  await fs.mkdir(orchestratorHome(), { recursive: true });
-}
-
-async function readRegistry(): Promise<Worktree[]> {
-  try {
-    const content = await fs.readFile(worktreesRegistryFile(), "utf-8");
-    return JSON.parse(content) as Worktree[];
-  } catch {
-    return [];
-  }
-}
-
-async function writeRegistry(worktrees: Worktree[]): Promise<void> {
-  await ensureHome();
-  await fs.writeFile(
-    worktreesRegistryFile(),
-    JSON.stringify(worktrees, null, 2)
-  );
+/**
+ * Run `fn` with the worktrees registry loaded and the per-file mutex held.
+ *
+ * Issue #332: every read-modify-write against `worktrees.json` must go
+ * through this helper. Concurrent reads that observe a stale or partial
+ * file used to silently nuke the registry; holding the lock around the
+ * read-modify-write window prevents the interleaving that caused that
+ * loss.
+ *
+ * `fn` is given the current registry contents (or `[]` on first run)
+ * and may mutate the array in place. Whatever it leaves in the array
+ * is what gets persisted — there is no separate "compute new value"
+ * step that could race against another caller.
+ */
+async function withWorktreeRegistry<T>(
+  fn: (registry: Worktree[]) => Promise<T>
+): Promise<T> {
+  const file = worktreesRegistryFile();
+  return withLock(file, async () => {
+    const { value: registry } = await readJsonRegistry<Worktree[]>(file, {
+      defaultValue: [],
+      backup: `${file}.bak`,
+      validate: validateArray<Worktree>,
+    });
+    const result = await fn(registry);
+    await writeJsonRegistry(file, registry);
+    return result;
+  });
 }
 
 function buildMainWorktree(project: Project): Worktree {
@@ -53,28 +68,29 @@ function buildMainWorktree(project: Project): Worktree {
 }
 
 /**
- * Ensure a project has a main worktree row. Returns the registry after
- * lazy-creating the row if it was missing.
+ * Ensure a project has a main worktree row. Returns the main worktree
+ * after lazy-creating the row if it was missing. Mutates `registry` in
+ * place — callers must run inside a registry lock so concurrent callers
+ * don't both observe "no main", both create one, and both write back,
+ * leaving two orphan rows for the same project.
  */
-async function ensureMainInRegistry(
+function ensureMainInRegistry(
   project: Project,
   registry: Worktree[]
-): Promise<{ registry: Worktree[]; main: Worktree; created: boolean }> {
+): Worktree {
   const existing = registry.find(
     (w) => w.projectId === project.id && w.isMain
   );
-  if (existing) return { registry, main: existing, created: false };
-
+  if (existing) return existing;
   const main = buildMainWorktree(project);
-  const next = [...registry, main];
-  await writeRegistry(next);
-  return { registry: next, main, created: true };
+  registry.push(main);
+  return main;
 }
 
 export async function ensureMainWorktree(project: Project): Promise<Worktree> {
-  const registry = await readRegistry();
-  const { main } = await ensureMainInRegistry(project, registry);
-  return main;
+  return withWorktreeRegistry(async (registry) =>
+    ensureMainInRegistry(project, registry)
+  );
 }
 
 export async function getProjectWorktrees(
@@ -82,9 +98,21 @@ export async function getProjectWorktrees(
 ): Promise<Worktree[]> {
   const project = await getProject(projectId);
   if (!project) return [];
-  const registry = await readRegistry();
-  const { registry: next } = await ensureMainInRegistry(project, registry);
-  return next.filter((w) => w.projectId === projectId);
+  try {
+    return await withWorktreeRegistry(async (registry) => {
+      ensureMainInRegistry(project, registry);
+      return registry.filter((w) => w.projectId === projectId);
+    });
+  } catch (err) {
+    if (err instanceof RegistryParseError) {
+      // Surface the corruption to the operator but do not persist a
+      // replacement. Returning `[]` here would let a single bad write
+      // empty the entire registry on the next caller.
+      console.error(`worktrees.json is unreadable: ${err.message}`);
+      return [];
+    }
+    throw err;
+  }
 }
 
 export async function getWorktree(
@@ -147,36 +175,38 @@ export async function resolveWorktree(
 export async function addWorktree(
   worktree: Omit<Worktree, "id" | "createdAt"> & { id?: string }
 ): Promise<Worktree> {
-  const registry = await readRegistry();
   const record: Worktree = {
     id: worktree.id ?? uuidv4(),
     createdAt: new Date().toISOString(),
     ...worktree,
   };
-  registry.push(record);
-  await writeRegistry(registry);
-  return record;
+  return withWorktreeRegistry(async (registry) => {
+    registry.push(record);
+    return record;
+  });
 }
 
 export async function updateWorktree(
   worktreeId: string,
   patch: Partial<Worktree>
 ): Promise<Worktree | null> {
-  const registry = await readRegistry();
-  const idx = registry.findIndex((w) => w.id === worktreeId);
-  if (idx === -1) return null;
-  const updated: Worktree = { ...registry[idx], ...patch, id: registry[idx].id };
-  registry[idx] = updated;
-  await writeRegistry(registry);
-  return updated;
+  return withWorktreeRegistry(async (registry) => {
+    const idx = registry.findIndex((w) => w.id === worktreeId);
+    if (idx === -1) return null;
+    const updated: Worktree = { ...registry[idx], ...patch, id: registry[idx].id };
+    registry[idx] = updated;
+    return updated;
+  });
 }
 
 export async function removeWorktree(worktreeId: string): Promise<boolean> {
-  const registry = await readRegistry();
-  const next = registry.filter((w) => w.id !== worktreeId);
-  if (next.length === registry.length) return false;
-  await writeRegistry(next);
-  return true;
+  return withWorktreeRegistry(async (registry) => {
+    const next = registry.filter((w) => w.id !== worktreeId);
+    if (next.length === registry.length) return false;
+    registry.length = 0;
+    registry.push(...next);
+    return true;
+  });
 }
 
 /**
@@ -190,12 +220,13 @@ export const PORT_OFFSET_STRIDE = 3;
 
 /** Monotonic per-project port offset: max existing + stride, starting at stride. */
 export async function nextPortOffset(projectId: string): Promise<number> {
-  const registry = await readRegistry();
-  const used = registry
-    .filter((w) => w.projectId === projectId && typeof w.portOffset === "number")
-    .map((w) => w.portOffset as number);
-  if (used.length === 0) return PORT_OFFSET_STRIDE;
-  return Math.max(...used) + PORT_OFFSET_STRIDE;
+  return withWorktreeRegistry(async (registry) => {
+    const used = registry
+      .filter((w) => w.projectId === projectId && typeof w.portOffset === "number")
+      .map((w) => w.portOffset as number);
+    if (used.length === 0) return PORT_OFFSET_STRIDE;
+    return Math.max(...used) + PORT_OFFSET_STRIDE;
+  });
 }
 
 export function isMainWorktreeName(name: string): boolean {

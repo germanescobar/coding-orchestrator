@@ -42,3 +42,20 @@ test("DestructiveConfirmButton does not serialize a disabled attribute when not 
   // attribute on the rendered <button>.
   assert.doesNotMatch(html, /\sdisabled=""/);
 });
+
+test("DestructiveConfirmButton renders a custom label (issue #332 force-delete flow)", () => {
+  // Sidebar uses this to swap "Delete" for "Force delete" once the
+  // orchestrator has reported dirty files and the user has been
+  // warned. The spinner still wins over the custom label while
+  // loading so the user can't double-click through the request.
+  const html = renderToStaticMarkup(
+    <DestructiveConfirmButton
+      loading={false}
+      onClick={() => {}}
+      label="Force delete"
+    />,
+  );
+  assert.match(html, /Force delete/);
+  assert.doesNotMatch(html, />Delete</);
+  assert.doesNotMatch(html, /Deleting/);
+});

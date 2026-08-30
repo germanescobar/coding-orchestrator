@@ -1434,21 +1434,39 @@ export async function fetchSourceIndex(
 
 export async function deleteWorktree(
   projectId: string,
-  worktreeId: string
+  worktreeId: string,
+  options: { force?: boolean } = {}
 ): Promise<void> {
-  const res = await fetch(
-    `${BASE}/projects/${projectId}/worktrees/${worktreeId}`,
-    { method: "DELETE" }
-  );
+  const path = `${BASE}/projects/${projectId}/worktrees/${worktreeId}`;
+  // Issue #332: the orchestrator's safe-by-default delete gate needs a
+  // way to be overridden (`?force=1`) so destructive deletes can still
+  // proceed after the user has been warned. We append the flag with a
+  // simple ternary rather than reaching for URLSearchParams — the
+  // existing fetch wrappers in this module follow the same pattern,
+  // and this keeps the helper trivial to test under Node without a
+  // window polyfill.
+  const url = options.force ? `${path}?force=1` : path;
+  const res = await fetch(url, { method: "DELETE" });
   if (!res.ok) {
-    let message = "Failed to delete worktree";
+    let body: { error?: string; dirtyFiles?: string[] } = {};
     try {
-      const body = (await res.json()) as { error?: string };
-      if (body.error) message = body.error;
+      body = (await res.json()) as { error?: string; dirtyFiles?: string[] };
     } catch {
-      // ignore
+      // ignore — non-JSON body
     }
-    throw new Error(message);
+    const message = body.error ?? "Failed to delete worktree";
+    const err = new Error(message) as Error & {
+      dirtyFiles?: string[];
+      status?: number;
+    };
+    // Preserve the dirty-file list from the orchestrator's safe-by-default
+    // gate (issue #332) so the sidebar can show the offending files and
+    // offer a force-retry, rather than failing silently. The same
+    // structure is also used to surface a "no archive configured" refusal
+    // when the user has already opted into force.
+    if (Array.isArray(body.dirtyFiles)) err.dirtyFiles = body.dirtyFiles;
+    err.status = res.status;
+    throw err;
   }
 }
 
