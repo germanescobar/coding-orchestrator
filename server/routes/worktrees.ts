@@ -987,9 +987,43 @@ worktreesRouter.delete(
     const gitArgs = forceDelete
       ? ["worktree", "remove", "--force", worktree.path]
       : ["worktree", "remove", worktree.path];
-    await runGitExitCode(project.path, gitArgs);
-    if (existsSync(worktree.path)) {
-      await fs.rm(worktree.path, { recursive: true, force: true });
+    const gitExit = await runGitExitCode(project.path, gitArgs);
+    if (gitExit !== 0) {
+      // Git refused to remove the worktree. The most common cause is
+      // that the tree became dirty between our `git status` check
+      // and now (e.g. the archive script created a log file inside
+      // the worktree, or the user wrote a file mid-request).
+      //
+      // We only fall back to a recursive `fs.rm` when the caller has
+      // already accepted that destructive removal via `?force=1` — and
+      // in that case we also pass `--force` to git above, so this
+      // branch shouldn't normally fire. The two guards (gate at the
+      // top + force flag here) keep the previous footgun from coming
+      // back: a non-force delete can never trigger `fs.rm`, which is
+      // exactly the silent-destruction the dirty check exists to
+      // prevent.
+      if (!forceDelete) {
+        res.status(409).json({
+          error:
+            "worktree became dirty between the status check and the delete; refuse rather than recursively rm. Re-issue with ?force=1 after archiving.",
+          dirtyFiles: await listDirtyFiles(worktree.path),
+        });
+        return;
+      }
+      // Force-delete: git still failed for some other reason (the
+      // worktree entry was already gone, git crashed, etc.). Fall
+      // back to `fs.rm` only because the caller explicitly opted
+      // into destructive removal via `?force=1`.
+      if (existsSync(worktree.path)) {
+        await fs.rm(worktree.path, { recursive: true, force: true });
+      }
+    } else if (existsSync(worktree.path)) {
+      // Git succeeded but left the directory behind (rare — usually
+      // only happens if the directory is on a different filesystem).
+      // Same fallback policy as above: only the force path may rm.
+      if (forceDelete) {
+        await fs.rm(worktree.path, { recursive: true, force: true });
+      }
     }
 
     await removeWorktree(worktree.id);
@@ -1005,6 +1039,15 @@ worktreesRouter.delete(
  * List the dirty files in a worktree (modified, staged, or untracked)
  * relative to its HEAD. Used by the DELETE route (issue #332) to refuse
  * deletes that would destroy uncommitted work.
+ *
+ * Files under `.coding-agent/` (the orchestrator's own per-worktree
+ * scratch directory — `setup.log`, `archive.log`, session focus
+ * sidecars, etc.) are excluded from the result. We always write those
+ * files there for lack of a better home, and projects that don't
+ * gitignore `.coding-agent/` would otherwise see Controller's own
+ * bookkeeping as uncommitted user changes. `git status --porcelain`
+ * has no clean flag for this, so we filter the parsed output. The
+ * matching `git add` exclusion lives in `server/routes/sessions.ts`.
  *
  * Returns an empty array when the worktree is clean, when the directory
  * doesn't exist yet, or when `git status` can't be read for any reason
@@ -1027,7 +1070,20 @@ async function listDirtyFiles(cwd: string): Promise<string[]> {
   return output
     .split("\n")
     .map((line) => line.replace(/^\s*\S+\s+/, "").trim())
-    .filter(Boolean);
+    .filter((file) => file && !isControllerOwnedPath(file));
+}
+
+/**
+ * `true` for paths the orchestrator itself writes inside the
+ * worktree (currently just `.coding-agent/`). Keep in sync with the
+ * `git add` exclusion in `server/routes/sessions.ts:257` and the
+ * `git diff` exclusion at `server/routes/sessions.ts:279`.
+ */
+function isControllerOwnedPath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/^\.\//, "");
+  if (normalized === ".coding-agent") return true;
+  if (normalized.startsWith(".coding-agent/")) return true;
+  return false;
 }
 
 function runStreamed(

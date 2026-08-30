@@ -214,3 +214,128 @@ test("DELETE with ?force=1 refuses when the worktree is dirty but no archive.sh 
     assert.ok(stat.isDirectory());
   });
 });
+/*
+ * Issue #332 follow-ups from PR review.
+ *
+ * Two regressions we want to guard against:
+ *
+ *   (a) P1: when `git worktree remove` exits non-zero, the handler
+ *       must NOT fall through to `fs.rm --recursive`. The previous
+ *       behavior would silently destroy uncommitted changes that the
+ *       user had every right to assume were protected.
+ *
+ *   (b) P2: Controller-owned files under `.coding-agent/` (setup.log,
+ *       archive.log, focus sidecars) must not appear in the dirty
+ *       list. Projects that don't gitignore `.coding-agent/` would
+ *       otherwise see orchestrator bookkeeping as uncommitted user
+ *       changes.
+ */
+
+/*
+ * Issue #332 follow-ups from PR review.
+ *
+ * Two regressions we want to guard against:
+ *
+ *   (a) P1: when `git worktree remove` exits non-zero, the handler
+ *       must NOT fall through to `fs.rm --recursive`. The previous
+ *       behavior would silently destroy uncommitted changes that the
+ *       user had every right to assume were protected.
+ *
+ *   (b) P2: Controller-owned files under `.coding-agent/` (setup.log,
+ *       archive.log, focus sidecars) must not appear in the dirty
+ *       list. Projects that don't gitignore `.coding-agent/` would
+ *       otherwise see orchestrator bookkeeping as uncommitted user
+ *       changes.
+ */
+
+test("DELETE leaves the worktree alone when git worktree remove fails (P1)", async () => {
+  await withDeleteEnv(async ({ worktreePath }) => {
+    // Fresh dirty file. The clean-tree `git worktree remove` will
+    // refuse with exit 128 because the tree is no longer pristine.
+    await fs.writeFile(path.join(worktreePath, "README.md"), "v1-edited\n");
+  }, async ({ baseUrl, projectPath, worktreePath }) => {
+    // No `?force=1` — the safe-by-default path. The handler must
+    // report 409 rather than silently rm-ing the directory.
+    const res = await fetch(baseUrl, { method: "DELETE" });
+    assert.equal(res.status, 409);
+    const body = (await res.json()) as { error?: string; dirtyFiles?: string[] };
+    assert.match(body.error ?? "", /uncommitted changes/);
+
+    // Directory survives. The orchestrator must not have done an
+    // `fs.rm --recursive` after git's failure.
+    const stat = await fs.stat(worktreePath);
+    assert.ok(stat.isDirectory());
+    const content = await fs.readFile(path.join(worktreePath, "README.md"), "utf-8");
+    assert.match(content, /v1-edited/);
+
+    // And the worktree must still be registered with git itself —
+    // a half-removed worktree that's invisible to the UI but still
+    // on disk would let the next "create worktree" call collide
+    // with the orphaned directory.
+    const gitOutput = await new Promise<string>((resolve, reject) => {
+      const child = spawn("git", ["worktree", "list"], { cwd: projectPath });
+      let out = "";
+      child.stdout?.on("data", (d: Buffer) => {
+        out += d.toString();
+      });
+      child.on("close", (code) =>
+        code === 0 ? resolve(out) : reject(new Error(`git exit ${code}`)),
+      );
+      child.on("error", reject);
+    });
+    assert.match(gitOutput, new RegExp(escapeForRegex(worktreePath)));
+  });
+});
+
+test("DELETE still removes the directory when ?force=1 is set and git succeeds", async () => {
+  await withDeleteEnv(async () => {
+    // Clean worktree.
+  }, async ({ baseUrl, worktreePath }) => {
+    const res = await fetch(`${baseUrl}?force=1`, { method: "DELETE" });
+    assert.equal(res.status, 200);
+    await assert.rejects(fs.stat(worktreePath));
+  });
+});
+
+test("listDirtyFiles excludes Controller-owned files under .coding-agent/", async () => {
+  await withDeleteEnv(
+    async ({ worktreePath }) => {
+      // Make the worktree dirty with a mix of user and Controller-owned
+      // files. The project doesn't gitignore `.coding-agent/`, so git
+      // will report everything as uncommitted.
+      await fs.mkdir(path.join(worktreePath, ".coding-agent"), { recursive: true });
+      await fs.writeFile(path.join(worktreePath, "user-note.txt"), "scratch\n");
+      await fs.writeFile(
+        path.join(worktreePath, ".coding-agent", "setup.log"),
+        "controller wrote this\n",
+      );
+      await fs.writeFile(
+        path.join(worktreePath, ".coding-agent", "archive.log"),
+        "controller wrote this too\n",
+      );
+    },
+    async ({ baseUrl }) => {
+      const res = await fetch(baseUrl, { method: "DELETE" });
+      assert.equal(res.status, 409);
+      const body = (await res.json()) as { dirtyFiles: string[]; error: string };
+      // User file is reported…
+      assert.ok(
+        body.dirtyFiles.includes("user-note.txt"),
+        `expected user-note.txt in dirtyFiles, got: ${body.dirtyFiles.join(", ")}`,
+      );
+      // …but the Controller-owned files under `.coding-agent/` are
+      // filtered out, including the directory itself if it appears as
+      // an untracked entry.
+      for (const file of body.dirtyFiles) {
+        assert.ok(
+          file !== ".coding-agent" && !file.startsWith(".coding-agent/"),
+          `unexpected Controller-owned file in dirtyFiles: ${file}`,
+        );
+      }
+    },
+  );
+});
+
+function escapeForRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
