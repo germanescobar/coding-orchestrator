@@ -106,6 +106,48 @@ const USAGE = `Usage:
   to the existing event-list endpoint for live updates. <project> is optional
   and falls back to the project that owns cwd (see the worktrees section).
 
+  controller sessions wake <sessionId> --message <text> \\
+      [--delay <duration>] [--run-at <iso>] \\
+      [--provider|--agent codex|claude|anita] [--model <model>] [--mode default|plan] [--skill <name>]
+
+  \`sessions wake\` enqueues a follow-up message for an existing session (issue
+  #339). The message is replayed as the next turn once the current turn
+  finishes, exactly like a queued composer message. \`--delay <duration>\`
+  (forms: \`30s\`, \`5m\`, \`1h\`, \`2d\`) holds the message until the wall clock
+  has passed; the wakes consumer fires it on the next scheduler tick.
+  \`--run-at <iso>\` is the absolute-time counterpart. With no delay, the
+  message is replayed as soon as the live turn finishes. The session keeps its
+  existing transcript — the wake is the same shape as a queued message. The
+  server resolves the owning project from the session file, so the agent's
+  natural usage is just \`wake <self>\`.
+
+  controller sessions goal set <sessionId> --condition <text> [--max-turns <n>] [--expires-at <iso>]
+  controller sessions goal clear <sessionId>
+  controller sessions goal show <sessionId>
+
+  \`sessions goal\` attaches a condition-driven completion target to the
+  session (issue #339). After every turn, the server's GoalEvaluator
+  consumer asks a small fast model whether the condition is met; if so,
+  the goal clears and the session goes idle; if not and the queue is
+  empty, the evaluator enqueues a follow-up so the loop continues
+  without the agent having to remember to re-fire. \`--max-turns\` caps
+  the evaluator; \`--expires-at <iso>\` is an absolute hard deadline.
+  Set once per loop; re-setting preserves the evaluator's turn count.
+
+  controller sessions monitor start <sessionId> --description <text> --command <shell> \\
+      [--timeout-ms <ms>] [--persistent]
+  controller sessions monitor list <sessionId>
+  controller sessions monitor stop <monitorId>
+
+  \`sessions monitor\` spawns a long-running child process per session
+  whose stdout is captured line-by-line and appended to the session
+  event log as a \`monitor_event\` (issue #339). Useful for tailing
+  external state (\`gh pr checks --watch\`, \`kubectl get pods -w\`,
+  etc.) without blocking the turn. \`--timeout-ms\` defaults to 5 min
+  (max 1 hr); \`--persistent\` keeps the monitor alive for the session's
+  lifetime. The server caps monitors at 8 per session and lines at
+  1000 per monitor.
+
   controller schedules list [<project>] [--enabled-only]
   controller schedules show <project> <scheduleId>
   controller schedules add [<project>] --worktree <id> --prompt <text> \\
@@ -201,6 +243,31 @@ async function postJson(serverUrl, route, body) {
   try {
     response = await fetch(`${serverUrl.replace(/\/$/, "")}${route}`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, cwd: process.cwd() }),
+    });
+  } catch (error) {
+    fail(`Could not reach the orchestrator: ${error?.message ?? error}`);
+  }
+  let result;
+  try {
+    result = await response.json();
+  } catch {
+    fail(`Unexpected response (HTTP ${response.status})`);
+  }
+  return { response, result };
+}
+
+// PUT counterpart of `postJson` — used for resources where the verb
+// carries meaning (issue #339: `sessions goal` distinguishes set from
+// clear via the body's `action` field, but the wire verb still says
+// PUT so an HTTP-aware client can route correctly). The body shape
+// matches `postJson`, including the auto-attached `cwd`.
+async function putJson(serverUrl, route, body) {
+  let response;
+  try {
+    response = await fetch(`${serverUrl.replace(/\/$/, "")}${route}`, {
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...body, cwd: process.cwd() }),
     });
@@ -609,8 +676,204 @@ export function parseSessions(argv) {
         },
       };
     }
+    case "wake": {
+      // `sessions wake <sessionId> --message <text> [--delay 30s] ...`
+      // <project> is intentionally NOT a positional here: the server's
+      // `/api/sessions/:sessionId/wake` route resolves the owning project
+      // from the session file on disk. The agent's natural usage is
+      // `wake <self>` (issue #339), and requiring a project would force
+      // every call to thread a project id that the orchestrator already
+      // has. We re-do the positional parsing here rather than reusing the
+      // outer `<project>` strip above because the wake surface has a
+      // different positional shape.
+      const sessionId = rest[0];
+      if (!sessionId || sessionId.startsWith("--")) {
+        fail("sessions wake requires a sessionId");
+      }
+      const wakeArgs = rest.slice(1);
+      const messageIdx = wakeArgs.indexOf("--message");
+      if (messageIdx < 0) {
+        fail("sessions wake requires --message <text>");
+      }
+      assertKnownFlags(
+        wakeArgs.slice(0, messageIdx),
+        [
+          "--message",
+          "--delay",
+          "--run-at",
+          "--provider",
+          "--agent",
+          "--model",
+          "--mode",
+          "--skill",
+        ],
+        "sessions wake"
+      );
+      const delay = flagValue(wakeArgs, "--delay");
+      const runAt = flagValue(wakeArgs, "--run-at");
+      if (delay && runAt) {
+        fail("sessions wake: --delay and --run-at are mutually exclusive; pick one.");
+      }
+      const providerFromFlag = flagValue(wakeArgs, "--provider");
+      const providerFromAlias = flagValue(wakeArgs, "--agent");
+      let provider = undefined;
+      if (providerFromFlag != null && providerFromAlias != null) {
+        if (providerFromFlag !== providerFromAlias) {
+          fail(
+            `sessions wake: --provider (${providerFromFlag}) and --agent (${providerFromAlias}) disagree. ` +
+              `Pass only one of them.`
+          );
+        }
+        provider = providerFromFlag;
+      } else {
+        provider = providerFromFlag ?? providerFromAlias;
+      }
+      const model = flagValue(wakeArgs, "--model");
+      const mode = flagValue(wakeArgs, "--mode");
+      const skill = flagValue(wakeArgs, "--skill");
+      const trailing = wakeArgs.slice(messageIdx + 1);
+      // Reuse the same post-message flag guard as `start`. A trailing
+      // `--delay` / `--run-at` after the prompt would silently corrupt
+      // the wake message.
+      const WAKE_RESERVED = [
+        "--delay",
+        "--run-at",
+        "--provider",
+        "--agent",
+        "--model",
+        "--mode",
+        "--skill",
+      ];
+      const offendingFlag = trailing.find((arg) =>
+        WAKE_RESERVED.includes(arg)
+      );
+      if (offendingFlag) {
+        fail(
+          `--message must be the last flag on the command line, but found ${offendingFlag} after it. ` +
+            `Quote the prompt at the end, e.g. --message "<prompt>" …`
+        );
+      }
+      const message = trailing.join(" ").trim();
+      if (!message) {
+        fail("sessions wake requires --message <text>");
+      }
+      // `--delay` is the documented default; `--run-at` exists for the UI
+      // (date picker) and for tests. The server resolves either into an
+      // ISO timestamp before persisting — sending the raw form keeps
+      // the wire format independent of clock skew.
+      return {
+        project: "",
+        action: "wake",
+        sessionId,
+        body: {
+          // The wake route accepts `message` (the prompt text). We keep
+          // `text` / `visibleText` out of the wire shape so the server
+          // doesn't have to alias them — the agent sees a clean POST.
+          message,
+          provider: provider ?? "",
+          model: model ?? "",
+          mode: mode === "plan" ? "plan" : "default",
+          attachmentIds: [],
+          ...(skill ? { skillName: skill } : {}),
+          ...(delay ? { delay } : {}),
+          ...(runAt ? { runAtIso: runAt } : {}),
+        },
+      };
+    }
     default:
       fail(`Unknown sessions command: ${command}\n${USAGE}`);
+  }
+}
+
+// --- sessions goal surface (issue #339) ---
+
+/*
+ * `sessions goal <set|clear|show> <sessionId> ...` — same shape as
+ * `wake`: <project> is optional and resolved by the server from the
+ * session file (issue #339). The three subcommands map to three HTTP
+ * verbs on the per-session goal endpoint:
+ *   - set   → PUT  { action: "set",   condition, maxTurns?, expiresAt? }
+ *   - clear → PUT  { action: "clear" }
+ *   - show  → GET
+ *
+ * The positional parsing re-reads from `rest` (not `args`) because the
+ * outer `<project>` strip above eats the first non-flag token — if
+ * `<project>` is supplied, the session id would land at `args[0]`, but
+ * when it's omitted the session id IS `rest[0]`. Reading from `rest`
+ * works for both shapes; the unused `project` value is preserved for
+ * the route layer's resolver.
+ */
+export function parseGoal(argv) {
+  const [command, ...rest] = argv;
+  if (!command) fail("sessions goal requires a subcommand: set, clear, show");
+  // `<project>` is the optional first positional. Match `sessions wake`:
+  // if the next token starts with `--`, the user didn't supply a
+  // project and the run path falls back to cwd via `resolveProjectId`.
+  let project = "";
+  let args = rest;
+  if (rest[0] !== undefined && !rest[0].startsWith("--")) {
+    project = rest[0];
+    args = rest.slice(1);
+  }
+  switch (command) {
+    case "set": {
+      const sessionId = rest[0];
+      if (!sessionId || sessionId.startsWith("--")) {
+        fail("sessions goal set requires a sessionId");
+      }
+      const goalArgs = rest.slice(1);
+      assertKnownFlags(
+        goalArgs,
+        ["--condition", "--max-turns", "--expires-at"],
+        "sessions goal set"
+      );
+      const condition = flagValue(goalArgs, "--condition");
+      if (!condition || !condition.trim()) {
+        fail("sessions goal set requires --condition <text>");
+      }
+      const maxTurnsRaw = flagValue(goalArgs, "--max-turns");
+      let maxTurns;
+      if (maxTurnsRaw != null) {
+        const parsed = Number(maxTurnsRaw);
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+          fail("sessions goal set: --max-turns must be a positive integer");
+        }
+        maxTurns = parsed;
+      }
+      const expiresAt = flagValue(goalArgs, "--expires-at");
+      return {
+        project,
+        action: "set",
+        sessionId,
+        body: {
+          action: "set",
+          condition,
+          ...(maxTurns != null ? { maxTurns } : {}),
+          ...(expiresAt ? { expiresAt } : {}),
+        },
+      };
+    }
+    case "clear": {
+      const sessionId = rest[0];
+      if (!sessionId || sessionId.startsWith("--")) {
+        fail("sessions goal clear requires a sessionId");
+      }
+      return {
+        project,
+        action: "clear",
+        sessionId,
+        body: { action: "clear" },
+      };
+    }
+    case "show": {
+      const sessionId = rest[0];
+      if (!sessionId || sessionId.startsWith("--")) {
+        fail("sessions goal show requires a sessionId");
+      }
+      return { project, action: "show", sessionId };
+    }
+    default:
+      fail(`Unknown sessions goal command: ${command}\n${USAGE}`);
   }
 }
 
@@ -637,7 +900,204 @@ export async function runSessions(argv, serverUrl) {
     }
     return;
   }
+  if (parsed.action === "wake") {
+    // The wake route is mounted under `/api/sessions/:sessionId/wake` so
+    // the agent's natural `wake <self>` usage doesn't need a project id
+    // (the server resolves it from the session file). Issue #339.
+    const route = `/api/sessions/${parsed.sessionId}/wake`;
+    const { response, result } = await postJson(serverUrl, route, parsed.body);
+    if (response.status >= 400) {
+      fail(result?.error ?? `Failed to wake session (HTTP ${response.status})`);
+    }
+    const message = result?.message;
+    const queuedId = message?.id;
+    const runAt = message?.runAt;
+    if (typeof queuedId !== "string" || !queuedId) {
+      fail("Server did not return a queued message id");
+    }
+    process.stdout.write(`Enqueued wake ${queuedId}`);
+    if (typeof runAt === "string" && runAt) {
+      process.stdout.write(` (runs at ${runAt})`);
+    }
+    process.stdout.write(`\n`);
+    return;
+  }
   fail(`Unknown sessions action: ${parsed.action}`);
+}
+
+export async function runGoal(argv, serverUrl) {
+  const parsed = parseGoal(argv);
+  if (parsed.action === "show") {
+    const route = `/api/sessions/${parsed.sessionId}/goal`;
+    const { response, result } = await getJson(serverUrl, route);
+    if (response.status >= 400) {
+      fail(result?.error ?? `Failed to load goal (HTTP ${response.status})`);
+    }
+    const goal = result?.goal;
+    if (!goal) {
+      process.stdout.write("No goal attached.\n");
+      return;
+    }
+    process.stdout.write(
+      [
+        `session=${goal.sessionId}`,
+        `condition="${goal.condition}"`,
+        goal.maxTurns != null ? `maxTurns=${goal.maxTurns}` : null,
+        goal.expiresAt ? `expiresAt=${goal.expiresAt}` : null,
+        `turnsEvaluated=${goal.turnsEvaluated}`,
+        goal.lastReason ? `lastReason="${goal.lastReason}"` : null,
+      ]
+        .filter(Boolean)
+        .join("\n  ") + "\n"
+    );
+    return;
+  }
+  // set / clear share the same PUT endpoint; the body's `action` field
+  // distinguishes them on the server side.
+  const route = `/api/sessions/${parsed.sessionId}/goal`;
+  const { response, result } = await putJson(serverUrl, route, parsed.body);
+  if (response.status >= 400) {
+    fail(
+      result?.error ?? `Failed to ${parsed.action} goal (HTTP ${response.status})`
+    );
+  }
+  if (parsed.action === "clear") {
+    process.stdout.write("Goal cleared.\n");
+    return;
+  }
+  const goal = result?.goal;
+  process.stdout.write(
+    `Goal set (id=${goal?.sessionId ?? parsed.sessionId})\n` +
+      `  condition="${goal?.condition ?? ""}"\n`
+  );
+}
+
+// --- sessions monitor surface (issue #339) ---
+
+/*
+ * `sessions monitor <start|list|stop> ...`. Mirrors `goal`: the
+ * server-side `monitorBySessionIdRouter` resolves the owning project,
+ * so the agent invokes by session id only. \`start\` spawns the
+ * child; \`list\` returns active monitors; \`stop\` kills a monitor
+ * by its UUID.
+ */
+export function parseMonitor(argv) {
+  const [command, ...rest] = argv;
+  if (!command) {
+    fail("sessions monitor requires a subcommand: start, list, stop");
+  }
+  switch (command) {
+    case "start": {
+      const sessionId = rest[0];
+      if (!sessionId || sessionId.startsWith("--")) {
+        fail("sessions monitor start requires a sessionId");
+      }
+      const monitorArgs = rest.slice(1);
+      assertKnownFlags(
+        monitorArgs,
+        ["--description", "--command", "--timeout-ms", "--persistent"],
+        "sessions monitor start"
+      );
+      const description = flagValue(monitorArgs, "--description");
+      if (!description || !description.trim()) {
+        fail("sessions monitor start requires --description <text>");
+      }
+      const command = flagValue(monitorArgs, "--command");
+      if (!command || !command.trim()) {
+        fail("sessions monitor start requires --command <shell>");
+      }
+      const timeoutMsRaw = flagValue(monitorArgs, "--timeout-ms");
+      let timeoutMs;
+      if (timeoutMsRaw != null) {
+        const parsed = Number(timeoutMsRaw);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          fail("sessions monitor start: --timeout-ms must be a positive number");
+        }
+        timeoutMs = parsed;
+      }
+      const persistent = monitorArgs.includes("--persistent");
+      return {
+        action: "start",
+        sessionId,
+        body: {
+          description,
+          command,
+          ...(timeoutMs != null ? { timeoutMs } : {}),
+          ...(persistent ? { persistent: true } : {}),
+        },
+      };
+    }
+    case "list": {
+      const sessionId = rest[0];
+      if (!sessionId || sessionId.startsWith("--")) {
+        fail("sessions monitor list requires a sessionId");
+      }
+      return { action: "list", sessionId };
+    }
+    case "stop": {
+      const monitorId = rest[0];
+      if (!monitorId || monitorId.startsWith("--")) {
+        fail("sessions monitor stop requires a monitorId");
+      }
+      return { action: "stop", monitorId };
+    }
+    default:
+      fail(`Unknown sessions monitor command: ${command}\n${USAGE}`);
+  }
+}
+
+export async function runMonitor(argv, serverUrl) {
+  const parsed = parseMonitor(argv);
+  if (parsed.action === "start") {
+    const route = `/api/sessions/${parsed.sessionId}/monitors`;
+    const { response, result } = await postJson(serverUrl, route, parsed.body);
+    if (response.status >= 400) {
+      fail(
+        result?.error ?? `Failed to start monitor (HTTP ${response.status})`
+      );
+    }
+    const monitor = result?.monitor;
+    if (!monitor || typeof monitor.id !== "string") {
+      fail("Server did not return a monitor id");
+    }
+    process.stdout.write(`Started monitor ${monitor.id}\n`);
+    process.stdout.write(`  description=${JSON.stringify(monitor.description)}\n`);
+    process.stdout.write(`  command=${JSON.stringify(monitor.command)}\n`);
+    return;
+  }
+  if (parsed.action === "list") {
+    const route = `/api/sessions/${parsed.sessionId}/monitors`;
+    const { response, result } = await getJson(serverUrl, route);
+    if (response.status >= 400) {
+      fail(result?.error ?? `Failed to list monitors (HTTP ${response.status})`);
+    }
+    const monitors = Array.isArray(result?.monitors) ? result.monitors : [];
+    if (monitors.length === 0) {
+      process.stdout.write("No monitors.\n");
+      return;
+    }
+    for (const monitor of monitors) {
+      process.stdout.write(`${formatMonitorRow(monitor)}\n`);
+    }
+    return;
+  }
+  // stop — the monitor id is globally unique, so the route lives at
+  // `/api/sessions/monitors/<id>` (no session id needed in the URL).
+  const route = `/api/sessions/monitors/${parsed.monitorId}`;
+  const { response, result } = await deleteJson(serverUrl, route);
+  if (response.status >= 400) {
+    fail(result?.error ?? `Failed to stop monitor (HTTP ${response.status})`);
+  }
+  process.stdout.write("Monitor stopped.\n");
+}
+
+function formatMonitorRow(monitor) {
+  const sessionId = monitor.sessionId ?? "?";
+  const description = monitor.description ?? "";
+  const command = monitor.command ?? "";
+  const lineCount = monitor.lineCount ?? 0;
+  const persistent = monitor.persistent ? "persistent" : "transient";
+  return `${monitor.id}  [${persistent}]  session=${sessionId}  lines=${lineCount}\n  description: ${description}\n  command: ${command}`;
 }
 
 // --- schedules surface (issue #243) ---

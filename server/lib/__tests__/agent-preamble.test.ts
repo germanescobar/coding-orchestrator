@@ -228,6 +228,55 @@ test("full preamble is stable for the same catalog (snapshot)", async () => {
       "- github (openapi/tools) — OpenAPI (https://github.example) — run `tools`/`describe` to discover operations, then `call`.",
       "- tavily (cli/cli) — Native CLI `tavily` — run `status`, then invoke it directly.",
       "</additional_integrations>",
+      "",
+      note,
+      "",
+      // The loop primitives intro (issue #339). Kept stable by re-reading
+      // the function output rather than hand-rolling a copy here — any
+      // drift between the snapshot and `loopPrimitivesIntro` will fail
+      // the equality check below.
+      "Controller ships three same-session primitives for condition-driven",
+      "loops (issue #339). All three compose with the existing session",
+      "queue: a follow-up turn runs once the current turn ends, in the same",
+      "session, with full context.",
+      "",
+      "  1. Deferred follow-up. `wake <self> --message \"...\" --delay 30s`",
+      `     enqueues a follow-up and holds it for the duration (forms: 30s,`,
+      `     5m, 1h, 2d). The wakes consumer fires it on the next scheduler`,
+      `     tick via \`${cliPath} sessions wake <self> --message "..." --delay 30s\`.`,
+      "",
+      "  2. Goal-driven loop. `goal set <self> --condition \"<text>\"`",
+      `     attaches a completion condition. After every turn the`,
+      `     GoalEvaluator (a small fast model) judges whether the condition`,
+      `     is met; on met it clears the goal, on not met it enqueues a`,
+      `     follow-up so the loop continues without your needing to re-fire.`,
+      `     \`--max-turns <n>\` is a hard ceiling.`,
+      "",
+      "  3. Event-stream watch. `monitor start <self> --description <text>`",
+      `     --command <shell> spawns a long-running child whose stdout becomes`,
+      `     a session event; each line lands in the event log as a`,
+      `     \`monitor_event\`. Bounded by \`--timeout-ms\` (default 5 min,`,
+      `     max 1 hr).`,
+      "",
+      "Worked example — open a PR and stay until CI is green:",
+      "",
+      "   # Turn 1: write, push, open PR, attach a goal.",
+      `   gh pr create --fill`,
+      `   ${cliPath} sessions goal set <self> --condition \\`,
+      `     "all required CI checks on PR #N are SUCCESS" --max-turns 5`,
+      `   ${cliPath} sessions wake <self> --message "Check gh pr checks <N>; if all`,
+      `     SUCCESS, stop the goal; if any FAILURE, read the failing job log,`,
+      `     fix, push, and re-set the goal" --delay 30s`,
+      "",
+      "   # Turn N (after 30s): wake consumer fires the follow-up; the agent",
+      "   # reads CI, fixes any failure, and ends the turn.",
+      "",
+      "   # Turn N+1: GoalEvaluator judges. If met, the goal clears and the",
+      "   # session goes idle; if not, the evaluator enqueues the next turn.",
+      "   # The loop continues until met or `--max-turns` is exceeded.",
+      "",
+      "These primitives are not a sandbox — they're plain Controller",
+      "subcommands you can invoke like any other shell command.",
     ].join("\n");
     assert.equal(preamble, expected);
   });
@@ -296,5 +345,23 @@ test("preamble frames skills and integrations as additive, not exhaustive", asyn
       additionalCount >= 2,
       `expected "*additional*" to appear in both intros, saw ${additionalCount}`
     );
+  });
+});
+
+test("preamble documents the same-session loop primitives (issue #339)", async () => {
+  // The agent preamble must teach the three new primitives (`wake
+  // --delay`, `goal set`, `monitor start`) with a worked example, so
+  // an agent can adopt them without reading separate docs.
+  await withTempHome(async () => {
+    const preamble = await buildControllerPreamble();
+    assert.match(preamble, /Controller ships three same-session primitives/);
+    assert.match(preamble, /wake <self> --message "\.\.\." --delay 30s/);
+    assert.match(preamble, /goal set <self> --condition/);
+    assert.match(preamble, /monitor start <self>/);
+    assert.match(preamble, /Worked example — open a PR and stay until CI is green/);
+    // The worked example must mention every primitive in context — a
+    // truncated example would teach the agent the wrong surface.
+    assert.match(preamble, /sessions goal set/);
+    assert.match(preamble, /sessions wake <self>/);
   });
 });

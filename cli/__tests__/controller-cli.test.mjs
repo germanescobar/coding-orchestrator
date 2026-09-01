@@ -989,6 +989,582 @@ test("runSessions start POSTs to the new sessions endpoint and prints the URL", 
   assert.match(out, /Started session sess-xyz/);
   assert.match(out, /controller:\/\/project\/proj-uuid-1\/worktree\/wt-1\/session\/sess-xyz/);
 });
+
+// --- sessions wake (issue #339) ---
+
+test("parseSessions wake builds a wake payload with --delay", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseSessions([
+    "wake",
+    "sess-abc",
+    "--delay",
+    "30s",
+    "--message",
+    "Check `gh pr checks 42`",
+  ]);
+  assert.equal(parsed.action, "wake");
+  assert.equal(parsed.sessionId, "sess-abc");
+  assert.equal(parsed.body.message, "Check `gh pr checks 42`");
+  assert.equal(parsed.body.delay, "30s");
+  assert.equal(parsed.body.runAtIso, undefined);
+});
+
+test("parseSessions wake accepts --run-at and rejects combining --delay with --run-at", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseSessions([
+    "wake",
+    "sess-abc",
+    "--run-at",
+    "2026-12-31T23:59:59.000Z",
+    "--message",
+    "ring in the new year",
+  ]);
+  assert.equal(parsed.body.runAtIso, "2026-12-31T23:59:59.000Z");
+  assert.equal(parsed.body.delay, undefined);
+
+  // Mutually exclusive: a CLI user shouldn't be able to combine them.
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseSessions([
+          "wake",
+          "sess-abc",
+          "--delay",
+          "30s",
+          "--run-at",
+          "2026-12-31T23:59:59.000Z",
+          "--message",
+          "x",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /--delay and --run-at are mutually exclusive/);
+});
+
+test("parseSessions wake requires sessionId", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseSessions([
+          "wake",
+          "--message",
+          "hi",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /sessions wake requires a sessionId/);
+});
+
+test("parseSessions wake accepts --agent alias for --provider", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseSessions([
+    "wake",
+    "sess-abc",
+    "--agent",
+    "claude",
+    "--message",
+    "hi",
+  ]);
+  assert.equal(parsed.body.provider, "claude");
+});
+
+test("runSessions wake POSTs to the per-session wake endpoint", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const calls = [];
+  const stdoutChunks = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    // `runSessions wake` resolves the project from cwd first (matching
+    // the other actions), then posts to the per-session wake endpoint.
+    // Stub both shapes so the action runs cleanly.
+    if (String(url).includes("/api/projects?cwd=")) {
+      return {
+        status: 200,
+        json: async () => ({ project: { id: "proj-from-cwd", name: "FromCwd" } }),
+      };
+    }
+    return {
+      status: 201,
+      json: async () => ({
+        message: {
+          id: "wake-1",
+          runAt: "2026-06-26T08:00:30.000Z",
+        },
+      }),
+    };
+  };
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runSessions(
+      [
+        "wake",
+        "sess-abc",
+        "--delay",
+        "30s",
+        "--message",
+        "Check CI",
+      ],
+      "http://controller.test"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  const wakeCall = calls.find((c) =>
+    c.url.endsWith("/api/sessions/sess-abc/wake")
+  );
+  assert.ok(wakeCall, "expected a POST to the per-session wake endpoint");
+  assert.equal(wakeCall.init.method, "POST");
+  const body = JSON.parse(wakeCall.init.body);
+  assert.equal(body.message, "Check CI");
+  assert.equal(body.delay, "30s");
+  const out = stdoutChunks.join("");
+  assert.match(out, /Enqueued wake wake-1/);
+  assert.match(out, /runs at 2026-06-26T08:00:30.000Z/);
+});
+
+// --- sessions goal (issue #339) ---
+
+test("parseGoal set builds a goal payload with --condition and --max-turns", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseGoal([
+    "set",
+    "sess-abc",
+    "--condition",
+    "all CI checks pass",
+    "--max-turns",
+    "5",
+  ]);
+  assert.equal(parsed.action, "set");
+  assert.equal(parsed.sessionId, "sess-abc");
+  assert.equal(parsed.body.action, "set");
+  assert.equal(parsed.body.condition, "all CI checks pass");
+  assert.equal(parsed.body.maxTurns, 5);
+});
+
+test("parseGoal set rejects a missing --condition", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  let stderrText = "";
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrText += String(chunk);
+    return true;
+  };
+  try {
+    await assert.rejects(
+      async () => cli.parseGoal(["set", "sess-abc", "--max-turns", "5"]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.match(stderrText, /requires --condition/);
+});
+
+test("parseGoal set rejects a non-positive --max-turns", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = () => true;
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseGoal([
+          "set",
+          "sess-abc",
+          "--condition",
+          "x",
+          "--max-turns",
+          "0",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+});
+
+test("parseGoal clear builds an action=clear payload", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseGoal(["clear", "sess-abc"]);
+  assert.equal(parsed.action, "clear");
+  assert.equal(parsed.sessionId, "sess-abc");
+  assert.equal(parsed.body.action, "clear");
+});
+
+test("parseGoal show reads via GET on the per-session goal endpoint", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseGoal(["show", "sess-abc"]);
+  assert.equal(parsed.action, "show");
+  assert.equal(parsed.sessionId, "sess-abc");
+});
+
+test("runGoal set PUTs the goal payload and prints the condition", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const calls = [];
+  const stdoutChunks = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return {
+      status: 201,
+      json: async () => ({
+        goal: {
+          sessionId: "sess-abc",
+          condition: "all CI checks pass",
+          maxTurns: 5,
+          turnsEvaluated: 0,
+          setAt: "2026-06-26T08:00:00.000Z",
+        },
+      }),
+    };
+  };
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runGoal(
+      ["set", "sess-abc", "--condition", "all CI checks pass", "--max-turns", "5"],
+      "http://controller.test"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  const setCall = calls.find((c) =>
+    c.url.endsWith("/api/sessions/sess-abc/goal")
+  );
+  assert.ok(setCall, "expected a request to the goal endpoint");
+  assert.equal(setCall.init.method, "PUT");
+  const body = JSON.parse(setCall.init.body);
+  assert.equal(body.action, "set");
+  assert.equal(body.condition, "all CI checks pass");
+  assert.equal(body.maxTurns, 5);
+  const out = stdoutChunks.join("");
+  assert.match(out, /Goal set/);
+  assert.match(out, /all CI checks pass/);
+});
+
+test("runGoal clear PUTs an action=clear payload", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const calls = [];
+  const stdoutChunks = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return { status: 200, json: async () => ({ goal: null }) };
+  };
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runGoal(["clear", "sess-abc"], "http://controller.test");
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  const call = calls.find((c) =>
+    c.url.endsWith("/api/sessions/sess-abc/goal")
+  );
+  assert.ok(call, "expected a request to the goal endpoint");
+  assert.equal(call.init.method, "PUT");
+  const body = JSON.parse(call.init.body);
+  assert.equal(body.action, "clear");
+  const out = stdoutChunks.join("");
+  assert.match(out, /Goal cleared/);
+});
+
+test("runGoal show GETs the goal endpoint and prints the fields", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const stdoutChunks = [];
+  globalThis.fetch = async () => ({
+    status: 200,
+    json: async () => ({
+      goal: {
+        sessionId: "sess-abc",
+        condition: "all checks pass",
+        maxTurns: 5,
+        turnsEvaluated: 2,
+        lastReason: "still going",
+        setAt: "2026-06-26T08:00:00.000Z",
+      },
+    }),
+  });
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runGoal(["show", "sess-abc"], "http://controller.test");
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  const out = stdoutChunks.join("");
+  assert.match(out, /condition="all checks pass"/);
+  assert.match(out, /maxTurns=5/);
+  assert.match(out, /turnsEvaluated=2/);
+  assert.match(out, /lastReason="still going"/);
+});
+
+// --- sessions monitor (issue #339) ---
+
+test("parseMonitor start builds a monitor payload", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseMonitor([
+    "start",
+    "sess-abc",
+    "--description",
+    "watch CI",
+    "--command",
+    "gh pr checks 42 --watch",
+    "--timeout-ms",
+    "60000",
+  ]);
+  assert.equal(parsed.action, "start");
+  assert.equal(parsed.sessionId, "sess-abc");
+  assert.equal(parsed.body.description, "watch CI");
+  assert.equal(parsed.body.command, "gh pr checks 42 --watch");
+  assert.equal(parsed.body.timeoutMs, 60000);
+  assert.equal(parsed.body.persistent, undefined);
+});
+
+test("parseMonitor start accepts --persistent", async () => {
+  const cli = await loadCli();
+  const parsed = cli.parseMonitor([
+    "start",
+    "sess-abc",
+    "--description",
+    "long-lived watcher",
+    "--command",
+    "tail -f /tmp/log",
+    "--persistent",
+  ]);
+  assert.equal(parsed.body.persistent, true);
+});
+
+test("parseMonitor start rejects missing description", async () => {
+  const cli = await loadCli();
+  const originalExit = process.exit;
+  const originalStderr = process.stderr.write.bind(process.stderr);
+  let exitCode = null;
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__exit__");
+  };
+  process.stderr.write = () => true;
+  try {
+    await assert.rejects(
+      async () =>
+        cli.parseMonitor([
+          "start",
+          "sess-abc",
+          "--command",
+          "watch ci",
+        ]),
+      /__exit__/
+    );
+  } finally {
+    process.exit = originalExit;
+    process.stderr.write = originalStderr;
+  }
+  assert.equal(exitCode, 1);
+});
+
+test("runMonitor start POSTs to the per-session monitors endpoint", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const calls = [];
+  const stdoutChunks = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return {
+      status: 201,
+      json: async () => ({
+        monitor: {
+          id: "mon-1",
+          sessionId: "sess-abc",
+          description: "watch CI",
+          command: "gh pr checks 42 --watch",
+          lineCount: 0,
+          persistent: false,
+        },
+      }),
+    };
+  };
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runMonitor(
+      [
+        "start",
+        "sess-abc",
+        "--description",
+        "watch CI",
+        "--command",
+        "gh pr checks 42 --watch",
+      ],
+      "http://controller.test"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  const call = calls.find((c) =>
+    c.url.endsWith("/api/sessions/sess-abc/monitors")
+  );
+  assert.ok(call, "expected a POST to the per-session monitors endpoint");
+  assert.equal(call.init.method, "POST");
+  const body = JSON.parse(call.init.body);
+  assert.equal(body.description, "watch CI");
+  assert.equal(body.command, "gh pr checks 42 --watch");
+  const out = stdoutChunks.join("");
+  assert.match(out, /Started monitor mon-1/);
+  assert.match(out, /description="watch CI"/);
+});
+
+test("runMonitor list GETs the per-session monitors endpoint", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const calls = [];
+  const stdoutChunks = [];
+  globalThis.fetch = async (url) => {
+    calls.push({ url: String(url) });
+    return {
+      status: 200,
+      json: async () => ({
+        monitors: [
+          {
+            id: "mon-1",
+            sessionId: "sess-abc",
+            description: "watch CI",
+            command: "gh pr checks 42 --watch",
+            lineCount: 3,
+            persistent: false,
+          },
+        ],
+      }),
+    };
+  };
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runMonitor(["list", "sess-abc"], "http://controller.test");
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  const call = calls.find((c) =>
+    c.url.endsWith("/api/sessions/sess-abc/monitors")
+  );
+  assert.ok(call, "expected a GET to the per-session monitors endpoint");
+  const out = stdoutChunks.join("");
+  assert.match(out, /mon-1/);
+  assert.match(out, /lines=3/);
+});
+
+test("runMonitor stop DELETEs the monitor endpoint", async () => {
+  const cli = await loadCli();
+  const originalFetch = globalThis.fetch;
+  const originalStdout = process.stdout.write.bind(process.stdout);
+  const calls = [];
+  const stdoutChunks = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    // `deleteJson` reads `.text()` for the body — match the real
+    // Response shape so the helper doesn't crash on a mock.
+    return {
+      status: 200,
+      json: async () => ({ ok: true }),
+      text: async () => JSON.stringify({ ok: true }),
+    };
+  };
+  process.stdout.write = (chunk) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await cli.runMonitor(["stop", "mon-1"], "http://controller.test");
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdout;
+  }
+  const call = calls.find((c) =>
+    c.url.endsWith("/api/sessions/monitors/mon-1")
+  );
+  assert.ok(call, "expected a DELETE to the monitor endpoint");
+  assert.equal(call.init.method, "DELETE");
+  const out = stdoutChunks.join("");
+  assert.match(out, /Monitor stopped/);
+});
+
 // --- schedules surface (issue #243) ---
 
 test("presetToCron maps structured presets to cron (mirror of server)", async () => {

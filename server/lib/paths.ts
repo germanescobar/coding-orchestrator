@@ -125,6 +125,26 @@ export function sessionFocusFile(sessionId: string): string {
   return path.join(sessionFocusDir(), `${sessionId}.json`);
 }
 
+// --- Session Goals (issue #339) ---
+
+/**
+ * Directory holding per-session goal sidecars. Goals are the
+ * condition-driven complement to the focus queue (issue #339): the
+ * session can carry a `condition` + cap (`maxTurns` / `expiresAt`) that
+ * the `GoalEvaluator` consumer evaluates after every turn. Goals live
+ * in a sibling directory to `focus` so the two Controller-owned sidecars
+ * never share a file path — a focus write must never clobber a goal
+ * (or vice versa) and a malformed goal file must not break focus reads.
+ */
+export function sessionGoalsDir(): string {
+  return path.join(orchestratorHome(), "goals");
+}
+
+/** Per-session goal sidecar, keyed by the session id. */
+export function sessionGoalFile(sessionId: string): string {
+  return path.join(sessionGoalsDir(), `${sessionId}.json`);
+}
+
 // --- Session & Event Storage ---
 
 /**

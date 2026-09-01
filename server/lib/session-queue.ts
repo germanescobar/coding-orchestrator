@@ -34,6 +34,16 @@ export interface QueuedMessage {
    * mention block in the prompt matches what the user typed.
    */
   mentions?: { path: string; type: "file" | "directory" }[];
+  /**
+   * Optional ISO timestamp for deferred wakeups (issue #339). When set, the
+   * message is not dequeued for the agent until the wall clock passes it —
+   * the wakes consumer (registered on the shared wakeup loop in
+   * `scheduler.ts`) calls `advanceSessionQueue` once the delay has elapsed,
+   * so the queue stays drained without a client or a follow-up turn. Items
+   * without `runAt` keep their existing "process as soon as a turn finishes"
+   * behavior.
+   */
+  runAt?: string;
   createdAt: string;
 }
 
@@ -115,14 +125,29 @@ export async function resolveQueuedMessage<T>(
   });
 }
 
-/** Remove and return the first queued message, or null if the queue is empty. */
+/** Remove and return the first queued message, or null if the queue is empty.
+ *
+ * Honors deferred-wakeup `runAt` (issue #339): a head whose `runAt` is still
+ * in the future is *not* popped, since firing the agent before the delay
+ * would defeat the purpose. The wakes consumer (registered on the shared
+ * wakeup loop from #243) calls `advanceSessionQueue` once the delay has
+ * elapsed, which re-invokes this function and gets the now-ready head. The
+ * peek-then-pop happens under the same per-session lock so a concurrent
+ * enqueue can't race the check.
+ */
 export async function dequeueFirst(
   sessionId: string
 ): Promise<QueuedMessage | null> {
   return withLock(sessionId, async () => {
     const queue = await readQueue(sessionId);
-    const first = queue.shift();
+    const first = queue[0];
     if (!first) return null;
+    if (first.runAt && new Date(first.runAt).getTime() > Date.now()) {
+      // Not yet. The wakes consumer will fire `advanceSessionQueue` on the
+      // session once the delay has elapsed.
+      return null;
+    }
+    queue.shift();
     await writeQueue(sessionId, queue);
     return first;
   });
