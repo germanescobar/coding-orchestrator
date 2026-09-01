@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { getProject } from "../lib/projects.js";
+import { getProject, getProjects } from "../lib/projects.js";
 import { getProjectWorktrees, resolveWorktree } from "../lib/worktrees.js";
 
 const execAsync = promisify(exec);
@@ -1538,10 +1538,20 @@ export async function handleSessionStream(
         sseSend({ type: "done", exitCode: effectiveExitCode });
         if (clientConnected) res.end();
 
-        // On a clean completion, run the next enqueued message (if any).
+        // On a run termination, run the next enqueued message (if any).
         // This happens server-side so the queue drains regardless of
-        // whether any client is connected (see issue #113).
-        if (streamSessionId && !pausedForClaudeUserInput && code === 0) {
+        // whether any client is connected (see issue #113). Draining on
+        // `run.failed` as well as `run.completed` is required by the
+        // same-session goal loop (issue #339): a follow-up enqueued by
+        // the goal evaluator after a failed turn would otherwise be
+        // silently ignored. We do *not* drain after a user-initiated
+        // cancellation — pausing the queue there matches the existing UX
+        // where a cancelled turn waits for the user to act.
+        if (
+          streamSessionId &&
+          !pausedForClaudeUserInput &&
+          !runCancelled
+        ) {
           void scheduleSessionQueueAdvance(
             req.params.projectId,
             worktreeId,
@@ -1656,6 +1666,21 @@ function scheduleSessionQueueAdvance(
     }
   });
   return next;
+}
+
+/**
+ * Drain a session's queue from outside the route pipeline (issue #339).
+ * Used by the wakes consumer (`server/lib/wakes.ts`) to fire deferred
+ * wakeups: each tick sees the head's `runAt` is now due and delegates to
+ * the same chain that the run-completion handler uses, so the replay goes
+ * through the identical preflight + headless-stream machinery.
+ */
+export function advanceSessionQueueFromConsumer(
+  projectId: string,
+  worktreeId: string,
+  sessionId: string
+): Promise<void> {
+  return scheduleSessionQueueAdvance(projectId, worktreeId, sessionId);
 }
 
 /** Persist a visible error for a queued message that could not be started. */
@@ -1815,10 +1840,24 @@ async function streamCodexPlanSession(
     sseSend({ type: "done", exitCode });
     if (clientConnected) res.end();
 
-    // Drain the next enqueued message on a clean completion (server-side,
-    // independent of any client; see issue #113).
+    // Drain the next enqueued message on a run termination (server-side,
+    // independent of any client; see issue #113). Draining on non-zero
+    // exits as well is required by the same-session goal loop (issue
+    // #339): a follow-up enqueued by the goal evaluator after a failed
+    // turn would otherwise be silently ignored. Cancelled runs already
+    // exit through their own drain handler in the run-completion branch,
+    // not here.
     if (streamSessionId && exitCode === 0) {
       void scheduleSessionQueueAdvance(projectId, worktreeId, streamSessionId);
+    } else if (streamSessionId && exitCode !== 0) {
+      // Failed run: only drain if there is something in the queue. An
+      // empty queue means the agent (or the user) didn't ask for a
+      // follow-up, so we leave the session idle rather than auto-firing
+      // a confusing turn.
+      const queue = await listQueue(streamSessionId).catch(() => []);
+      if (queue.length > 0) {
+        void scheduleSessionQueueAdvance(projectId, worktreeId, streamSessionId);
+      }
     }
   }
 
@@ -2351,6 +2390,471 @@ sessionsRouter.delete(
   }
 );
 
+// --- Wake (issue #339) ---
+//
+// `controller sessions wake <sessionId> --message <text> [--delay 30s |
+// --run-at <iso>]`. Adds a follow-up to the session's queue and optionally
+// defers it via `runAt`. The wakes consumer fires the deferred item on the
+// next scheduler tick by calling the existing `advanceSessionQueue` chain
+// — no new execution model. The route resolves the (project, worktree) from
+// the session file on disk so the CLI doesn't need to know the project id
+// (the agent's natural usage is `wake <self>`). The route reuses the
+// session's own provider/model when the caller doesn't override them,
+// matching the steer-follow-up pattern in `/user-input`.
+sessionsRouter.post(
+  "/:projectId/sessions/:sessionId/wake",
+  async (req, res) => {
+    const project = await getProject(req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
+    const session = await getSession(worktree.path, req.params.sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    const text = typeof raw.message === "string" ? raw.message : "";
+    if (!text.trim()) {
+      res.status(400).json({ error: "message is required" });
+      return;
+    }
+    let runAt: string | undefined;
+    if (typeof raw.runAtIso === "string" && raw.runAtIso.trim()) {
+      const parsed = new Date(raw.runAtIso);
+      if (Number.isNaN(parsed.getTime())) {
+        res.status(400).json({ error: `Invalid --run-at timestamp "${raw.runAtIso}"` });
+        return;
+      }
+      runAt = parsed.toISOString();
+    } else if (typeof raw.delay === "string" && raw.delay.trim()) {
+      const { resolveRunAt } = await import("../lib/wakes.js");
+      const resolved = resolveRunAt(raw.delay);
+      if (resolved == null) {
+        res.status(400).json({
+          error: `Invalid --delay "${raw.delay}"; expected forms: 30s, 5m, 1h, 2d`,
+        });
+        return;
+      }
+      runAt = resolved;
+    }
+    const message: QueuedMessage = await enqueueMessage(req.params.sessionId, {
+      text,
+      visibleText: text,
+      provider:
+        typeof raw.provider === "string" && raw.provider
+          ? raw.provider
+          : session.provider ?? "claude",
+      model:
+        typeof raw.model === "string" && raw.model
+          ? raw.model
+          : session.model,
+      reasoningEffort: session.reasoningEffort,
+      serviceTier: session.serviceTier === "fast" ? "fast" : undefined,
+      mode: session.mode === "plan" ? "plan" : "default",
+      attachmentIds: [],
+      ...(typeof raw.skillName === "string" && raw.skillName
+        ? { skillName: raw.skillName }
+        : {}),
+      ...(runAt ? { runAt } : {}),
+    });
+    res.status(201).json({ message });
+  }
+);
+
+// Same handler mounted under `/api/sessions/:sessionId/wake` so the CLI can
+// drive a wake with just a session id and skip the project id resolution
+// (issue #339). The handler walks every project's session store to find the
+// session; in a single-project controller this is one directory read.
+// Note: mounted under `/api/sessions` from `index.ts`, not the
+// `/api/projects` prefix the rest of this router uses.
+export const wakeBySessionIdRouter = Router();
+wakeBySessionIdRouter.post("/:sessionId/wake", async (req, res) => {
+  const projects = await getProjects();
+  let session: Awaited<ReturnType<typeof getSession>> = null;
+  let owningProjectId = "";
+  for (const project of projects) {
+    const candidate = await getSession(project.path, req.params.sessionId);
+    if (candidate) {
+      session = candidate;
+      owningProjectId = project.id;
+      break;
+    }
+  }
+  if (!session) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+  const raw = (req.body ?? {}) as Record<string, unknown>;
+  const text = typeof raw.message === "string" ? raw.message : "";
+  if (!text.trim()) {
+    res.status(400).json({ error: "message is required" });
+    return;
+  }
+  let runAt: string | undefined;
+  if (typeof raw.runAtIso === "string" && raw.runAtIso.trim()) {
+    const parsed = new Date(raw.runAtIso);
+    if (Number.isNaN(parsed.getTime())) {
+      res.status(400).json({ error: `Invalid --run-at timestamp "${raw.runAtIso}"` });
+      return;
+    }
+    runAt = parsed.toISOString();
+  } else if (typeof raw.delay === "string" && raw.delay.trim()) {
+    const { resolveRunAt } = await import("../lib/wakes.js");
+    const resolved = resolveRunAt(raw.delay);
+    if (resolved == null) {
+      res.status(400).json({
+        error: `Invalid --delay "${raw.delay}"; expected forms: 30s, 5m, 1h, 2d`,
+      });
+      return;
+    }
+    runAt = resolved;
+  }
+  const message: QueuedMessage = await enqueueMessage(req.params.sessionId, {
+    text,
+    visibleText: text,
+    provider:
+      typeof raw.provider === "string" && raw.provider
+        ? raw.provider
+        : session.provider ?? "claude",
+    model:
+      typeof raw.model === "string" && raw.model
+        ? raw.model
+        : session.model,
+    reasoningEffort: session.reasoningEffort,
+    serviceTier: session.serviceTier === "fast" ? "fast" : undefined,
+    mode: session.mode === "plan" ? "plan" : "default",
+    attachmentIds: [],
+    ...(typeof raw.skillName === "string" && raw.skillName
+      ? { skillName: raw.skillName }
+      : {}),
+    ...(runAt ? { runAt } : {}),
+  });
+  res.status(201).json({ message, projectId: owningProjectId });
+});
+
+// --- Goals (issue #339) ---
+//
+// `controller sessions goal set|clear|show <project> <sessionId> ...`.
+// Goals are session-scoped completion conditions: the goal evaluator
+// (registered on the shared wakeup loop from #243) reads the goal after
+// every turn and either clears it (met) or enqueues a follow-up (not
+// met + empty queue). The route lives at
+// `/api/projects/:projectId/sessions/:sessionId/goal`.
+
+sessionsRouter.get(
+  "/:projectId/sessions/:sessionId/goal",
+  async (req, res) => {
+    const { readSessionGoal } = await import("../lib/goal-state.js");
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
+    const session = await getSession(worktree.path, req.params.sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    const goal = await readSessionGoal(req.params.sessionId);
+    res.json({ goal });
+  }
+);
+
+sessionsRouter.put(
+  "/:projectId/sessions/:sessionId/goal",
+  async (req, res) => {
+    const {
+      buildSessionGoal,
+      clearSessionGoal,
+      readSessionGoal,
+      writeSessionGoal,
+    } = await import("../lib/goal-state.js");
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
+    const session = await getSession(worktree.path, req.params.sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    const action = raw.action === "clear" ? "clear" : "set";
+    if (action === "clear") {
+      await clearSessionGoal(req.params.sessionId);
+      res.json({ goal: null });
+      return;
+    }
+    try {
+      const goal = buildSessionGoal(req.params.sessionId, {
+        condition: typeof raw.condition === "string" ? raw.condition : "",
+        maxTurns:
+          typeof raw.maxTurns === "number" && Number.isInteger(raw.maxTurns)
+            ? raw.maxTurns
+            : undefined,
+        expiresAt:
+          typeof raw.expiresAt === "string" && raw.expiresAt.trim()
+            ? raw.expiresAt
+            : undefined,
+      });
+      // Merge over an existing goal so re-setting preserves
+      // `turnsEvaluated` (the cap continues counting). Pass
+      // `updatedAt` through unchanged so consumers can compare.
+      const existing = await readSessionGoal(req.params.sessionId);
+      const merged: typeof goal = existing
+        ? { ...goal, turnsEvaluated: existing.turnsEvaluated }
+        : goal;
+      await writeSessionGoal(merged);
+      res.status(201).json({ goal: merged });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+);
+
+// Same goal surface mounted under `/api/sessions/:sessionId/goal` so the
+// CLI can drive it without resolving a project id (issue #339). The
+// handler walks the project list to find the owning project, so the
+// single-session endpoint has the same shape as `/api/sessions/:sessionId/wake`.
+export const goalBySessionIdRouter = Router();
+goalBySessionIdRouter.get("/:sessionId/goal", async (req, res) => {
+  const { readSessionGoal } = await import("../lib/goal-state.js");
+  const goal = await readSessionGoal(req.params.sessionId);
+  res.json({ goal });
+});
+
+goalBySessionIdRouter.put("/:sessionId/goal", async (req, res) => {
+  const {
+    buildSessionGoal,
+    clearSessionGoal,
+    readSessionGoal,
+    writeSessionGoal,
+  } = await import("../lib/goal-state.js");
+  const raw = (req.body ?? {}) as Record<string, unknown>;
+  const action = raw.action === "clear" ? "clear" : "set";
+  if (action === "clear") {
+    await clearSessionGoal(req.params.sessionId);
+    res.json({ goal: null });
+    return;
+  }
+  try {
+    const goal = buildSessionGoal(req.params.sessionId, {
+      condition: typeof raw.condition === "string" ? raw.condition : "",
+      maxTurns:
+        typeof raw.maxTurns === "number" && Number.isInteger(raw.maxTurns)
+          ? raw.maxTurns
+          : undefined,
+      expiresAt:
+        typeof raw.expiresAt === "string" && raw.expiresAt.trim()
+          ? raw.expiresAt
+          : undefined,
+    });
+    const existing = await readSessionGoal(req.params.sessionId);
+    const merged = existing
+      ? { ...goal, turnsEvaluated: existing.turnsEvaluated }
+      : goal;
+    await writeSessionGoal(merged);
+    res.status(201).json({ goal: merged });
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// --- Monitors (issue #339) ---
+//
+// `controller sessions monitor start|list|stop <sessionId> ...` runs a
+// long-lived child process whose stdout is captured line-by-line and
+// appended to the session event log as a `monitor_event`. Monitors are
+// session-scoped (they live in memory for the lifetime of the server
+// process), bounded by a default 5-minute timeout, and capped at 8 per
+// session. The route layer mirrors the `goal` / `wake` shape: the
+// project-scoped route resolves the session, the per-session mount
+// skips project resolution and the agent invokes by session id only.
+//
+// The actual store + lifecycle lives in `server/lib/monitors.ts` so
+// this file stays focused on HTTP wiring.
+
+sessionsRouter.post(
+  "/:projectId/sessions/:sessionId/monitors",
+  async (req, res) => {
+    const { startMonitor, MAX_MONITORS_PER_SESSION, MAX_LINE_BUFFER } =
+      await import("../lib/monitors.js");
+    const project = await getProject(req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const worktree = await resolveWorktree(
+      req.params.projectId,
+      req.query.worktreeId as string | undefined
+    );
+    if (!worktree) {
+      res.status(404).json({ error: "Worktree not found" });
+      return;
+    }
+    const session = await getSession(worktree.path, req.params.sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    const description =
+      typeof raw.description === "string" ? raw.description : "";
+    const command = typeof raw.command === "string" ? raw.command : "";
+    if (!description.trim()) {
+      res.status(400).json({ error: "description is required" });
+      return;
+    }
+    if (!command.trim()) {
+      res.status(400).json({ error: "command is required" });
+      return;
+    }
+    const persistent = raw.persistent === true;
+    const timeoutMs =
+      typeof raw.timeoutMs === "number" && raw.timeoutMs > 0
+        ? raw.timeoutMs
+        : undefined;
+    try {
+      const monitor = startMonitor({
+        sessionId: req.params.sessionId,
+        worktreePath: worktree.path,
+        description,
+        command,
+        persistent,
+        timeoutMs,
+        limits: { maxPerSession: MAX_MONITORS_PER_SESSION, maxLines: MAX_LINE_BUFFER },
+      });
+      res.status(201).json({ monitor });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+);
+
+sessionsRouter.get(
+  "/:projectId/sessions/:sessionId/monitors",
+  async (req, res) => {
+    const { listMonitors } = await import("../lib/monitors.js");
+    res.json({
+      monitors: listMonitors(req.params.sessionId),
+    });
+  }
+);
+
+sessionsRouter.delete(
+  "/:projectId/monitors/:monitorId",
+  async (req, res) => {
+    const { stopMonitor } = await import("../lib/monitors.js");
+    const stopped = stopMonitor(req.params.monitorId);
+    if (!stopped) {
+      res.status(404).json({ error: "Monitor not found" });
+      return;
+    }
+    res.json({ ok: true, monitor: stopped });
+  }
+);
+
+// Per-session monitor surface (issue #339). Mounted at
+// `/api/sessions/:sessionId/monitors` so the CLI can drop the project
+// resolution step — the project is walked the same way the wake +
+// goal surfaces walk it.
+export const monitorBySessionIdRouter = Router();
+monitorBySessionIdRouter.post(
+  "/:sessionId/monitors",
+  async (req, res) => {
+    const { startMonitor, MAX_MONITORS_PER_SESSION, MAX_LINE_BUFFER } =
+      await import("../lib/monitors.js");
+    const { getProjects } = await import("../lib/projects.js");
+    const projects = await getProjects();
+    let worktreePath: string | null = null;
+    for (const project of projects) {
+      const session = await getSession(project.path, req.params.sessionId);
+      if (session) {
+        worktreePath = project.path;
+        break;
+      }
+    }
+    if (!worktreePath) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    const raw = (req.body ?? {}) as Record<string, unknown>;
+    const description =
+      typeof raw.description === "string" ? raw.description : "";
+    const command = typeof raw.command === "string" ? raw.command : "";
+    if (!description.trim()) {
+      res.status(400).json({ error: "description is required" });
+      return;
+    }
+    if (!command.trim()) {
+      res.status(400).json({ error: "command is required" });
+      return;
+    }
+    const persistent = raw.persistent === true;
+    const timeoutMs =
+      typeof raw.timeoutMs === "number" && raw.timeoutMs > 0
+        ? raw.timeoutMs
+        : undefined;
+    try {
+      const monitor = startMonitor({
+        sessionId: req.params.sessionId,
+        worktreePath,
+        description,
+        command,
+        persistent,
+        timeoutMs,
+        limits: { maxPerSession: MAX_MONITORS_PER_SESSION, maxLines: MAX_LINE_BUFFER },
+      });
+      res.status(201).json({ monitor });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+);
+monitorBySessionIdRouter.get(
+  "/:sessionId/monitors",
+  async (req, res) => {
+    const { listMonitors } = await import("../lib/monitors.js");
+    res.json({ monitors: listMonitors(req.params.sessionId) });
+  }
+);
+// Stop by monitor id (no session qualifier needed — monitor ids are
+// globally unique).
+monitorBySessionIdRouter.delete("/monitors/:monitorId", async (req, res) => {
+  const { stopMonitor } = await import("../lib/monitors.js");
+  const stopped = stopMonitor(req.params.monitorId);
+  if (!stopped) {
+    res.status(404).json({ error: "Monitor not found" });
+    return;
+  }
+  res.json({ ok: true, monitor: stopped });
+});
+
 /** Validate and normalize an enqueue request body into a QueuedMessageInput. */
 function parseQueuedMessageInput(body: unknown): QueuedMessageInput | null {
   if (!body || typeof body !== "object") return null;
@@ -2395,7 +2899,25 @@ function parseQueuedMessageInput(body: unknown): QueuedMessageInput | null {
     attachmentIds,
     skillName: typeof raw.skillName === "string" ? raw.skillName : undefined,
     mentions: mentions && mentions.length > 0 ? mentions : undefined,
+    // Deferred-wakeup (issue #339): an optional ISO timestamp that
+    // tells the wakes consumer to hold the message until the wall clock
+    // passes it. Empty / malformed input is dropped silently — a queued
+    // message without a delay behaves exactly like before, and a typo
+    // should not fail the whole enqueue.
+    runAt: parseRunAt(raw.runAt),
   };
+}
+
+/**
+ * Normalize a `runAt` field from the enqueue payload into an ISO string.
+ * Empty / malformed values collapse to `undefined`. Anything not a string
+ * is treated as missing; an invalid ISO is also dropped silently.
+ */
+function parseRunAt(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return undefined;
+  return parsed.toISOString();
 }
 
 /**

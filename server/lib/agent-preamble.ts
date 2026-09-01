@@ -98,6 +98,66 @@ function integrationsIntro(): string {
   );
 }
 
+/**
+ * Document the three same-session loop primitives (issue #339):
+ * `wake --delay` for deferred follow-ups, `goal set` for condition-driven
+ * loops, and `monitor start` for event-stream watches. Each primitive is
+ * framed with the canonical CI-loop worked example so an agent can adopt
+ * it without reading separate docs.
+ *
+ * Returns `null` when the agent preamble doesn't need a primitives block
+ * (the empty case keeps the existing tests stable).
+ */
+function loopPrimitivesIntro(): string {
+  const cli = controllerCliShellPath();
+  return [
+    controllerCliNote(),
+    "",
+    "Controller ships three same-session primitives for condition-driven",
+    "loops (issue #339). All three compose with the existing session",
+    "queue: a follow-up turn runs once the current turn ends, in the same",
+    "session, with full context.",
+    "",
+    "  1. Deferred follow-up. `wake <self> --message \"...\" --delay 30s`",
+    `     enqueues a follow-up and holds it for the duration (forms: 30s,`,
+    `     5m, 1h, 2d). The wakes consumer fires it on the next scheduler`,
+    `     tick via \`${cli} sessions wake <self> --message "..." --delay 30s\`.`,
+    "",
+    "  2. Goal-driven loop. `goal set <self> --condition \"<text>\"`",
+    `     attaches a completion condition. After every turn the`,
+    `     GoalEvaluator (a small fast model) judges whether the condition`,
+    `     is met; on met it clears the goal, on not met it enqueues a`,
+    `     follow-up so the loop continues without your needing to re-fire.`,
+    `     \`--max-turns <n>\` is a hard ceiling.`,
+    "",
+    "  3. Event-stream watch. `monitor start <self> --description <text>`",
+    `     --command <shell> spawns a long-running child whose stdout becomes`,
+    `     a session event; each line lands in the event log as a`,
+    `     \`monitor_event\`. Bounded by \`--timeout-ms\` (default 5 min,`,
+    `     max 1 hr).`,
+    "",
+    "Worked example — open a PR and stay until CI is green:",
+    "",
+    "   # Turn 1: write, push, open PR, attach a goal.",
+    `   gh pr create --fill`,
+    `   ${cli} sessions goal set <self> --condition \\`,
+    `     "all required CI checks on PR #N are SUCCESS" --max-turns 5`,
+    `   ${cli} sessions wake <self> --message "Check gh pr checks <N>; if all`,
+    `     SUCCESS, stop the goal; if any FAILURE, read the failing job log,`,
+    `     fix, push, and re-set the goal" --delay 30s`,
+    "",
+    "   # Turn N (after 30s): wake consumer fires the follow-up; the agent",
+    "   # reads CI, fixes any failure, and ends the turn.",
+    "",
+    "   # Turn N+1: GoalEvaluator judges. If met, the goal clears and the",
+    "   # session goes idle; if not, the evaluator enqueues the next turn.",
+    "   # The loop continues until met or `--max-turns` is exceeded.",
+    "",
+    "These primitives are not a sandbox — they're plain Controller",
+    "subcommands you can invoke like any other shell command.",
+  ].join("\n");
+}
+
 const EMPTY_SKILLS =
   "<additional_skills>\n(none configured)\n</additional_skills>";
 const EMPTY_INTEGRATIONS =
@@ -166,6 +226,8 @@ export async function buildControllerPreamble(
     integrationsIntro(),
     "",
     integrationsBlock,
+    "",
+    loopPrimitivesIntro(),
   ].join("\n");
 }
 

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { projectsRouter } from "./routes/projects.js";
-import { sessionsRouter } from "./routes/sessions.js";
+import { sessionsRouter, wakeBySessionIdRouter, goalBySessionIdRouter, monitorBySessionIdRouter } from "./routes/sessions.js";
 import { worktreesRouter } from "./routes/worktrees.js";
 import { eventsRouter } from "./routes/events.js";
 import { modelsRouter } from "./routes/models.js";
@@ -27,12 +27,19 @@ import { shortcutsRouter } from "./routes/shortcuts.js";
 import { unifiedSkillsRouter } from "./routes/unified-skills.js";
 import { schedulesRouter } from "./routes/schedules.js";
 import { getProjects } from "./lib/projects.js";
+import { getSession } from "./lib/sessions.js";
 import {
   fireAndForget,
   registerConsumer,
   startScheduler,
 } from "./lib/scheduler.js";
 import { makeSchedulesConsumer } from "./lib/schedules.js";
+import { makeRouteAdvanceDeps, makeWakesConsumer } from "./lib/wakes.js";
+import {
+  listGoalSessions,
+  makeGoalEvaluatorConsumer,
+  type GoalEvaluatorDeps,
+} from "./lib/goal-evaluator.js";
 import { startSessionInProcess } from "./lib/session-start.js";
 import { installManagedSkills } from "./lib/managed-skills.js";
 import { installControllerCli, controllerCliInstalledPath } from "./lib/controller-cli.js";
@@ -61,6 +68,9 @@ app.use("/api/projects", worktreesRouter);
 app.use("/api/projects", sessionsRouter);
 app.use("/api/projects", eventsRouter);
 app.use("/api/projects", schedulesRouter);
+app.use("/api/sessions", wakeBySessionIdRouter);
+app.use("/api/sessions", goalBySessionIdRouter);
+app.use("/api/sessions", monitorBySessionIdRouter);
 app.use("/api/models", modelsRouter);
 app.use("/api/api-keys", apiKeysRouter);
 app.use("/api/agents", agentsRouter);
@@ -267,6 +277,41 @@ async function start(): Promise<void> {
       fireAndForget
     )
   );
+
+  // Register the wakes consumer (issue #339). Each tick it scans the
+  // session queue directory for heads whose `runAt` is now due and
+  // delegates to the same `scheduleSessionQueueAdvance` chain the run
+  // completion handler uses. `makeRouteAdvanceDeps` returns once the
+  // routes module is loaded; registering before that resolves would
+  // deadlock on a circular import.
+  const wakeDeps = await makeRouteAdvanceDeps();
+  registerConsumer(makeWakesConsumer(wakeDeps, fireAndForget));
+
+  // Register the goal evaluator consumer (issue #339). Each tick it
+  // enumerates sessions with an active goal and runs the cheap judge
+  // loop on each. The `locateSession` dep walks every project's
+  // session store so the evaluator doesn't have to know the project
+  // layout ahead of time — the same trick the wakes consumer uses.
+  const goalDeps: GoalEvaluatorDeps = {
+    locateSession: async (sessionId) => {
+      const projects = await getProjects();
+      for (const project of projects) {
+        const candidate = await getSession(project.path, sessionId);
+        if (candidate) {
+          return {
+            projectId: project.id,
+            worktreeId: candidate.worktreeId ?? "",
+            worktreePath: project.path,
+          };
+        }
+      }
+      return null;
+    },
+  };
+  registerConsumer(
+    makeGoalEvaluatorConsumer(goalDeps, fireAndForget, listGoalSessions)
+  );
+
   startScheduler();
 }
 
