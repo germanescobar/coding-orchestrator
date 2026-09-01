@@ -1,9 +1,7 @@
 import fs from "node:fs/promises";
-import path from "node:path";
-import { createHash } from "node:crypto";
-import { sessionQueuesDir, orchestratorHome } from "./paths.js";
-import { getProjects } from "./projects.js";
+import { sessionQueuesDir } from "./paths.js";
 import { listQueue, enqueue, type QueuedMessage, type QueuedMessageInput } from "./session-queue.js";
+import { locateSessionPath } from "./session-locator.js";
 
 /*
  * Deferred wakeups for the session queue (issue #339).
@@ -165,45 +163,12 @@ export async function listDueWakes(now: Date): Promise<string[]> {
 async function locateSession(
   sessionId: string
 ): Promise<{ projectId: string; worktreeId: string } | null> {
-  const projects = await getProjects();
-  for (const project of projects) {
-    const sessionsDir = path.join(
-      orchestratorHome(),
-      "projects",
-      projectStoreKey(project.path),
-      "sessions"
-    );
-    const sessionFile = path.join(sessionsDir, `${sessionId}.json`);
-    let exists = false;
-    try {
-      const stat = await fs.stat(sessionFile);
-      exists = stat.isFile();
-    } catch {
-      exists = false;
-    }
-    if (!exists) continue;
-    let worktreeId = "";
-    try {
-      const content = await fs.readFile(sessionFile, "utf-8");
-      const parsed = JSON.parse(content) as { worktreeId?: unknown };
-      if (typeof parsed.worktreeId === "string" && parsed.worktreeId) {
-        worktreeId = parsed.worktreeId;
-      }
-    } catch {
-      // Missing worktreeId is fine: `advanceSessionQueue` falls back to the
-      // project's main worktree when the resolver can't pin a specific one.
-    }
-    return { projectId: project.id, worktreeId };
-  }
-  return null;
-}
-
-// Mirror of `projectStoreDir`'s keying (see `paths.ts`). Duplicated here so
-// the consumer doesn't have to re-export a private helper.
-function projectStoreKey(projectPath: string): string {
-  const resolved = path.resolve(projectPath);
-  const key = createHash("sha256").update(resolved).digest("hex").slice(0, 16);
-  return `${path.basename(resolved)}-${key}`;
+  // Issue #339 review: the previous implementation only checked the
+  // main worktree's path, so sessions in non-main worktrees were
+  // silently dropped. The shared `locateSessionPath` walks every
+  // project × worktree pair via the canonical `projectStoreDir`
+  // resolution; delegate to it.
+  return locateSessionPath(sessionId);
 }
 
 /**

@@ -82,6 +82,7 @@ import {
   type QueuedMessageInput,
 } from "../lib/session-queue.js";
 import { acceptCodexSteer } from "../lib/codex-steer.js";
+import { locateSessionById } from "../lib/session-locator.js";
 
 // Strip ANSI escape codes (color, cursor, etc.)
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
@@ -2477,23 +2478,20 @@ sessionsRouter.post(
 // session; in a single-project controller this is one directory read.
 // Note: mounted under `/api/sessions` from `index.ts`, not the
 // `/api/projects` prefix the rest of this router uses.
+//
+// Issue #339 review: the original lookup only walked `project.path` (the
+// main worktree). Sessions created in a non-main worktree live under
+// `projectStoreDir(worktree.path)`, so the ID-only endpoint returned 404
+// for those. The shared `locateSessionById` helper below enumerates every
+// project × worktree pair.
 export const wakeBySessionIdRouter = Router();
 wakeBySessionIdRouter.post("/:sessionId/wake", async (req, res) => {
-  const projects = await getProjects();
-  let session: Awaited<ReturnType<typeof getSession>> = null;
-  let owningProjectId = "";
-  for (const project of projects) {
-    const candidate = await getSession(project.path, req.params.sessionId);
-    if (candidate) {
-      session = candidate;
-      owningProjectId = project.id;
-      break;
-    }
-  }
-  if (!session) {
+  const located = await locateSessionById(req.params.sessionId);
+  if (!located) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
+  const { session, projectId: owningProjectId } = located;
   const raw = (req.body ?? {}) as Record<string, unknown>;
   const text = typeof raw.message === "string" ? raw.message : "";
   if (!text.trim()) {
@@ -2635,6 +2633,12 @@ sessionsRouter.put(
 // CLI can drive it without resolving a project id (issue #339). The
 // handler walks the project list to find the owning project, so the
 // single-session endpoint has the same shape as `/api/sessions/:sessionId/wake`.
+//
+// Issue #339 review: `set` now verifies the session exists before
+// writing the sidecar, so a typo in `controller sessions goal set`
+// doesn't quietly create a durable goal for a nonexistent session.
+// `show` and `clear` stay unguarded — they're idempotent and safe to
+// run against a missing session id (the goal file just doesn't exist).
 export const goalBySessionIdRouter = Router();
 goalBySessionIdRouter.get("/:sessionId/goal", async (req, res) => {
   const { readSessionGoal } = await import("../lib/goal-state.js");
@@ -2654,6 +2658,17 @@ goalBySessionIdRouter.put("/:sessionId/goal", async (req, res) => {
   if (action === "clear") {
     await clearSessionGoal(req.params.sessionId);
     res.json({ goal: null });
+    return;
+  }
+  // `set` requires a real session (issue #339 review): an unknown
+  // session id would otherwise silently create a goal sidecar that
+  // nothing can ever enqueue against (the evaluator's locateSession
+  // would return null and clear the goal immediately, but the goal
+  // would still cycle as a no-op). Fail loudly so a typo'd id is
+  // surfaced at the call site.
+  const located = await locateSessionById(req.params.sessionId);
+  if (!located) {
+    res.status(404).json({ error: "Session not found" });
     return;
   }
   try {
@@ -2779,28 +2794,21 @@ sessionsRouter.delete(
 
 // Per-session monitor surface (issue #339). Mounted at
 // `/api/sessions/:sessionId/monitors` so the CLI can drop the project
-// resolution step — the project is walked the same way the wake +
-// goal surfaces walk it.
+// resolution step — the project + worktree is walked the same way the
+// wake + goal surfaces walk it (issue #339 review: enumerates every
+// worktree, not just the main one).
 export const monitorBySessionIdRouter = Router();
 monitorBySessionIdRouter.post(
   "/:sessionId/monitors",
   async (req, res) => {
     const { startMonitor, MAX_MONITORS_PER_SESSION, MAX_LINE_BUFFER } =
       await import("../lib/monitors.js");
-    const { getProjects } = await import("../lib/projects.js");
-    const projects = await getProjects();
-    let worktreePath: string | null = null;
-    for (const project of projects) {
-      const session = await getSession(project.path, req.params.sessionId);
-      if (session) {
-        worktreePath = project.path;
-        break;
-      }
-    }
-    if (!worktreePath) {
+    const located = await locateSessionById(req.params.sessionId);
+    if (!located) {
       res.status(404).json({ error: "Session not found" });
       return;
     }
+    const worktreePath = located.worktreePath;
     const raw = (req.body ?? {}) as Record<string, unknown>;
     const description =
       typeof raw.description === "string" ? raw.description : "";
@@ -3155,6 +3163,21 @@ sessionsRouter.post(
     // Drop any pending enqueued messages so an archived session leaves no
     // orphaned queue file behind.
     await clearQueue(req.params.sessionId);
+    // Stop every monitor for the archived session (issue #339 review).
+    // Persistent monitors otherwise keep executing their shell command
+    // and appending events to the now-archived session's event log
+    // until the user manually stops them or the server exits.
+    // Best-effort — a stuck SIGTERM can outlive the route handler, so
+    // the archive response doesn't block on the count.
+    try {
+      const { stopMonitorsForSession } = await import("../lib/monitors.js");
+      await stopMonitorsForSession(req.params.sessionId);
+    } catch (error) {
+      console.error(
+        `[archiveSession] monitor cleanup failed for ${req.params.sessionId}:`,
+        error instanceof Error ? error.message : error
+      );
+    }
     // Notify the sidebar in other windows so the row disappears without
     // polling (issue #210).
     emitSessionRemoved(req.params.projectId, worktree.id, req.params.sessionId);

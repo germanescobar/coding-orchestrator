@@ -14,6 +14,7 @@ import {
   appendEvent,
   type AgentEvent,
 } from "./sessions.js";
+import type { SessionState } from "./sessions.js";
 
 /*
  * Goal evaluator (issue #339).
@@ -63,6 +64,41 @@ export interface GoalEvaluatorDeps {
     worktreeId: string;
     worktreePath: string;
   } | null>;
+  /**
+   * Returns true when the session has an in-flight turn. The evaluator
+   * skips judgment while a turn is active so a five-turn goal can't be
+   * exhausted by repeated ticks of a single long run, and so an
+   * OpenRouter call doesn't fire while the agent is still writing.
+   * Defaults to "always idle" (test-only safe default).
+   */
+  isSessionActive?: (sessionId: string) => boolean;
+  /**
+   * Read the live session state. Used to (a) populate the continuation
+   * message with the session's `provider`/`model` so a Codex goal
+   * doesn't resume as Claude, and (b) bail out when the session is
+   * archived so an archived session can't keep generating paid calls.
+   * Optional; when omitted the evaluator falls back to Claude defaults
+   * and never detects the archived case.
+   */
+  readSession?: (
+    worktreePath: string,
+    sessionId: string
+  ) => Promise<SessionState | null>;
+  /**
+   * Trigger a queue advance after the evaluator enqueues a follow-up
+   * turn (issue #339 review). When the queue was empty, the existing
+   * triggers (`run.completed`, the wakes consumer) wouldn't fire the
+   * newly queued message, so the goal loop would stall after its
+   * first judgment. The injected dep keeps the `routes/sessions.ts`
+   * ↔ `goal-evaluator.ts` link one-way: the evaluator calls the
+   * consumer's advance helper, the consumer never imports the
+   * evaluator.
+   */
+  advanceSessionQueue?: (
+    projectId: string,
+    worktreeId: string,
+    sessionId: string
+  ) => Promise<void>;
   /** Wall-clock injection for tests. */
   now?: () => Date;
   /** API key lookup; defaults to the orchestrator's provider keys. */
@@ -87,10 +123,16 @@ interface GoalEvalResult {
 
 /**
  * Evaluate one session's goal. Returns the resulting goal state plus a
- * flag for whether the evaluator enqueued a follow-up. The caller is
- * responsible for registering the evaluator on the shared wakeup loop
- * (see `makeGoalEvaluatorConsumer`) and for not invoking this for
- * sessions that are mid-turn — the consumer checks runtime state.
+ * flag for whether the evaluator enqueued a follow-up.
+ *
+ * Gating (issue #339 review):
+ *   - Skip when the session has an in-flight turn. Without this a single
+ *     long turn could exhaust a five-turn goal purely via repeated ticks
+ *     and burn an OpenRouter call every 30 seconds with no progress to
+ *     judge against.
+ *   - When the session is archived, clear the goal without a model call.
+ *     An uncapped archived goal would otherwise keep paying for a
+ *     session the user has explicitly retired.
  */
 export async function evaluateGoal(
   sessionId: string,
@@ -99,6 +141,12 @@ export async function evaluateGoal(
   const goal = await readSessionGoal(sessionId);
   if (!goal) {
     return { goal: null, enqueued: false, reason: "no goal attached" };
+  }
+
+  // Active-run gate (issue #339 review). Defaults to "always idle"
+  // when the dep is omitted so existing tests don't need to wire it.
+  if (deps.isSessionActive?.(sessionId)) {
+    return { goal, enqueued: false, reason: "session is mid-turn" };
   }
 
   const now = (deps.now ?? (() => new Date()))();
@@ -116,13 +164,34 @@ export async function evaluateGoal(
     return { goal: null, enqueued: false, reason: "exceeded" };
   }
 
+  // Located session is needed for the rest of the path (transcript
+  // tail + post-judgment enqueue/advance). We also use it here to
+  // detect the archived case before paying for a model call.
+  const located = await deps.locateSession(sessionId).catch(() => null);
+  if (!located) {
+    // Session vanished entirely (e.g. between ticks). Drop the goal so
+    // the sidecar doesn't accumulate as cruft.
+    await clearSessionGoal(sessionId);
+    return { goal: null, enqueued: false, reason: "session not found" };
+  }
+  if (deps.readSession) {
+    const session = await deps
+      .readSession(located.worktreePath, sessionId)
+      .catch(() => null);
+    if (session?.status === "archived") {
+      await clearSessionGoal(sessionId);
+      await emitCleared(sessionId, "archived", deps);
+      return { goal: null, enqueued: false, reason: "archived" };
+    }
+  }
+
   // Otherwise ask the small model. A throw or a malformed response leaves
   // the goal in place (a transient failure shouldn't kill the loop), but
   // we surface the failure via `reason` so the user sees why the
   // evaluator didn't progress.
   let result: GoalEvalResult;
   try {
-    result = await judgeCondition(goal, sessionId, deps);
+    result = await judgeCondition(goal, sessionId, located, deps);
   } catch (error) {
     const reason = `judge failed: ${
       error instanceof Error ? error.message : String(error)
@@ -147,26 +216,65 @@ export async function evaluateGoal(
   // Not met: if the agent has already enqueued a follow-up, the queue
   // pipeline drains it naturally — we leave the goal in place and
   // exit. If the queue is empty, the evaluator enqueues a short prompt
-  // so the loop continues without requiring the agent to remember to
-  // re-fire. The cap above still bounds this.
-  const located = await deps.locateSession(sessionId).catch(() => null);
-  if (!located) {
-    return { goal: updated, enqueued: false, reason: result.reason };
-  }
+  // and immediately fires the queue advance so the loop continues
+  // without requiring the agent to remember to re-fire. The cap above
+  // still bounds this.
   const queue = await listQueue(sessionId).catch(() => []);
   if (queue.length > 0) {
     // The agent has already queued a follow-up; nothing to do.
     return { goal: updated, enqueued: false, reason: result.reason };
   }
   const prompt = deps.followUpPrompt ?? DEFAULT_FOLLOW_UP_PROMPT;
+  // Reuse the session's own provider/model when available so a Codex
+  // goal resumes as Codex and a Claude goal resumes with the configured
+  // model id (not the test stub). Falls back to the Claude default for
+  // tests / unconfigured sessions.
+  let provider = "claude";
+  let model = "claude/test";
+  let mode: "default" | "plan" = "default";
+  if (deps.readSession) {
+    const session = await deps
+      .readSession(located.worktreePath, sessionId)
+      .catch(() => null);
+    if (session) {
+      if (typeof session.provider === "string" && session.provider) {
+        provider = session.provider;
+      }
+      if (typeof session.model === "string" && session.model) {
+        model = session.model;
+      }
+      if (session.mode === "plan") mode = "plan";
+    }
+  }
   await enqueueMessage(sessionId, {
     text: prompt,
     visibleText: prompt,
-    provider: "claude",
-    model: "claude/test",
-    mode: "default",
+    provider,
+    model,
+    mode,
     attachmentIds: [],
   });
+  // Fire the queue advance so the freshly enqueued follow-up actually
+  // runs (issue #339 review). The wakes consumer only triggers on
+  // `runAt`-stamped heads, so without this hook the loop would stall
+  // after its first judgment.
+  if (deps.advanceSessionQueue) {
+    try {
+      await deps.advanceSessionQueue(
+        located.projectId,
+        located.worktreeId,
+        sessionId
+      );
+    } catch (error) {
+      // Best-effort: a failed advance leaves the message in the queue
+      // for the next scheduler tick / run-completion. Don't undo the
+      // enqueue or clear the goal.
+      console.error(
+        `[goal-evaluator] advance failed for ${sessionId}:`,
+        error instanceof Error ? error.message : error
+      );
+    }
+  }
   return { goal: updated, enqueued: true, reason: result.reason };
 }
 
@@ -216,6 +324,7 @@ function cryptoRandomId(): string {
 async function judgeCondition(
   goal: SessionGoal,
   sessionId: string,
+  located: { projectId: string; worktreeId: string; worktreePath: string },
   deps: GoalEvaluatorDeps
 ): Promise<GoalEvalResult> {
   const apiKeys = await (deps.getApiKey ?? getApiKeyEnvVars)();
@@ -229,7 +338,10 @@ async function judgeCondition(
     );
   }
 
-  const tail = await readTranscriptTail(sessionId, deps).catch(() => []);
+  const tail = await readTranscriptTail(
+    located.worktreePath,
+    sessionId
+  ).catch(() => []);
   const transcript = tail
     .map((event) => formatEventForJudge(event))
     .filter(Boolean)
@@ -267,12 +379,10 @@ async function judgeCondition(
  * balloon the judge's prompt.
  */
 async function readTranscriptTail(
-  sessionId: string,
-  deps: GoalEvaluatorDeps
+  worktreePath: string,
+  sessionId: string
 ): Promise<AgentEvent[]> {
-  const located = await deps.locateSession(sessionId).catch(() => null);
-  if (!located) return [];
-  const events = await getEvents(located.worktreePath, sessionId);
+  const events = await getEvents(worktreePath, sessionId);
   if (events.length <= TRANSCRIPT_TAIL_EVENTS) return events;
   return events.slice(events.length - TRANSCRIPT_TAIL_EVENTS);
 }

@@ -45,16 +45,24 @@ function makeDeps(
   overrides: Partial<GoalEvaluatorDeps> = {}
 ): GoalEvaluatorDeps {
   return {
-    locateSession: async (sessionId) => {
-      // Default locateSession returns null; tests that need it should
-      // supply their own. The evaluator treats null as "no project,
-      // skip the queue-enqueue safety net" — exactly the contract we
-      // want for the no-project tests.
-      if (overrides.locateSession) {
-        return overrides.locateSession(sessionId);
-      }
-      return null;
-    },
+    // Default locateSession returns null; tests that need a real
+    // location (e.g. the queue-enqueue safety net or the archived
+    // check) supply their own. The evaluator treats null as
+    // "session vanished, drop the goal" — a stricter contract than
+    // before (issue #339 review), but the surviving tests don't
+    // depend on the legacy "skip the safety net" semantics because
+    // the no-project tests don't exercise the goal-attach path.
+    locateSession: overrides.locateSession ?? (async () => null),
+    // Default readSession returns null (no archived-signal). Tests
+    // that want the "archived → clear without a model call" path
+    // supply their own.
+    readSession: overrides.readSession,
+    // Default isSessionActive returns false. Tests that want to gate
+    // on an active turn supply their own.
+    isSessionActive: overrides.isSessionActive,
+    // No advanceSessionQueue by default — the tests that exercise the
+    // advance path supply their own.
+    advanceSessionQueue: overrides.advanceSessionQueue,
     now: overrides.now ?? (() => FIXED_NOW),
     getApiKey: overrides.getApiKey ?? (async () => ({ openrouter: "test-key" })),
     model: overrides.model,
@@ -142,11 +150,26 @@ test("evaluateGoal clears a goal that exceeds maxTurns", async () => {
 });
 
 test("evaluateGoal clears the goal when the model says met", async () => {
-  await withTempHome(async () => {
+  await withTempHome(async (home) => {
     await writeSessionGoal(buildSessionGoal("s1", { condition: "green CI" }));
+    // Plant a session file so `locateSession` resolves; the new
+    // evaluator gates on a located session before paying for a model
+    // call (issue #339 review).
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({ id: "s1", workingDirectory: projectPath })
+    );
     const outcome = await evaluateGoal(
       "s1",
       makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
         callModel: async () => ({ met: true, reason: "all green" }),
       })
     );
@@ -158,18 +181,32 @@ test("evaluateGoal clears the goal when the model says met", async () => {
 });
 
 test("evaluateGoal increments turnsEvaluated on a not-met judgment", async () => {
-  await withTempHome(async () => {
+  await withTempHome(async (home) => {
     await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({ id: "s1", workingDirectory: projectPath })
+    );
     const outcome = await evaluateGoal(
       "s1",
       makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
         callModel: async () => ({ met: false, reason: "not yet" }),
       })
     );
     assert.ok(outcome.goal);
     assert.equal(outcome.goal?.turnsEvaluated, 1);
     assert.equal(outcome.goal?.lastReason, "not yet");
-    assert.equal(outcome.enqueued, false);
+    // enqueue + advance fire — assert that the queue has the message.
+    const queue = await listQueue("s1");
+    assert.equal(queue.length, 1);
   });
 });
 
@@ -253,11 +290,25 @@ test("evaluateGoal does not enqueue when the agent already queued a follow-up", 
 });
 
 test("evaluateGoal surfaces judge failures via lastReason without losing the goal", async () => {
-  await withTempHome(async () => {
+  await withTempHome(async (home) => {
     await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    // Plant a session file so the evaluator can locate the session
+    // before paying for a model call.
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({ id: "s1", workingDirectory: projectPath })
+    );
     const outcome = await evaluateGoal(
       "s1",
       makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
         callModel: async () => {
           throw new Error("rate-limited");
         },
@@ -291,15 +342,32 @@ test("runGoalEvaluatorSweep processes every candidate", async () => {
 });
 
 test("runGoalEvaluatorSweep survives a per-session failure", async () => {
-  await withTempHome(async () => {
+  await withTempHome(async (home) => {
     await writeSessionGoal(buildSessionGoal("s1", { condition: "a" }));
     await writeSessionGoal(buildSessionGoal("s2", { condition: "b" }));
+    // Plant session files so locateSession resolves a real path —
+    // otherwise the new "session vanished → drop the goal" branch
+    // would clear the goal before the judge can stamp `lastReason`.
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    for (const sid of ["s1", "s2"]) {
+      writeFileSync(
+        path.join(projectPath, "sessions", `${sid}.json`),
+        JSON.stringify({ id: sid, workingDirectory: projectPath })
+      );
+    }
     // Always throw — the sweep must not abort on a single session's
     // failure. Per-session calls run in parallel (`Promise.all`), so we
     // can't assert which one keeps `lastReason`, only that the failure
     // surface is contained.
     await runGoalEvaluatorSweep(["s1", "s2", "s3"], {
       ...makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
         callModel: async () => {
           throw new Error("boom");
         },
@@ -369,6 +437,240 @@ test("evaluateGoal emits a goal_cleared event when the cap clears the goal", asy
     const cleared = log.find((e) => e.type === "goal_cleared");
     assert.ok(cleared, "goal_cleared event is appended");
     assert.equal(cleared.data.reason, "exceeded");
+  });
+});
+
+// --- Issue #339 review fixes ---
+
+test("evaluateGoal skips judgment while the session is mid-turn", async () => {
+  // Without this gate, a 5-turn goal could be exhausted by repeated
+  // ticks of one long run, each one paying for an OpenRouter call
+  // against an unchanged transcript.
+  await withTempHome(async (home) => {
+    await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({ id: "s1", workingDirectory: projectPath })
+    );
+    let callCount = 0;
+    const outcome = await evaluateGoal(
+      "s1",
+      makeDeps({
+        isSessionActive: () => true,
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
+        callModel: async () => {
+          callCount += 1;
+          return { met: false, reason: "still going" };
+        },
+      })
+    );
+    assert.equal(callCount, 0, "no model call when the session is mid-turn");
+    assert.equal(outcome.reason, "session is mid-turn");
+    // Goal survives — the active gate is a skip, not a clear.
+    const reloaded = await readSessionGoal("s1");
+    assert.ok(reloaded);
+    assert.equal(reloaded.turnsEvaluated, 0);
+  });
+});
+
+test("evaluateGoal clears an archived session's goal without an LLM call", async () => {
+  // The session was archived; the evaluator must not keep paying for
+  // it. The clear path emits a goal_cleared event with reason
+  // "archived" so the UI can show the cause.
+  await withTempHome(async (home) => {
+    await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({ id: "s1", workingDirectory: projectPath, status: "archived" })
+    );
+    let callCount = 0;
+    const outcome = await evaluateGoal(
+      "s1",
+      makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
+        readSession: async () => ({
+          id: "s1",
+          workingDirectory: projectPath,
+          status: "archived",
+        }),
+        callModel: async () => {
+          callCount += 1;
+          return { met: false, reason: "x" };
+        },
+      })
+    );
+    assert.equal(callCount, 0, "no model call for archived sessions");
+    assert.equal(outcome.goal, null);
+    assert.equal(outcome.reason, "archived");
+    assert.equal(await readSessionGoal("s1"), null);
+  });
+});
+
+test("evaluateGoal drops the goal when locateSession cannot resolve the session", async () => {
+  // Session was deleted between enqueue and tick; the sidecar would
+  // accumulate as cruft otherwise.
+  await withTempHome(async () => {
+    await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    const outcome = await evaluateGoal(
+      "s1",
+      makeDeps({
+        locateSession: async () => null,
+      })
+    );
+    assert.equal(outcome.goal, null);
+    assert.equal(outcome.reason, "session not found");
+    assert.equal(await readSessionGoal("s1"), null);
+  });
+});
+
+test("evaluateGoal reuses the session's provider/model on continuation enqueue", async () => {
+  // A Codex (or any non-Claude) goal must not resume through Claude
+  // just because the evaluator's payload hardcoded provider: "claude".
+  await withTempHome(async (home) => {
+    await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({
+        id: "s1",
+        workingDirectory: projectPath,
+        provider: "codex",
+        model: "gpt-5",
+        mode: "default",
+      })
+    );
+    const advanceCalls: Array<{ projectId: string; sessionId: string }> = [];
+    await evaluateGoal(
+      "s1",
+      makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
+        readSession: async () => ({
+          id: "s1",
+          workingDirectory: projectPath,
+          provider: "codex",
+          model: "gpt-5",
+          mode: "default",
+        }),
+        callModel: async () => ({ met: false, reason: "still going" }),
+        advanceSessionQueue: async (projectId, _worktreeId, sessionId) => {
+          advanceCalls.push({ projectId, sessionId });
+        },
+      })
+    );
+    const queue = await listQueue("s1");
+    assert.equal(queue.length, 1);
+    assert.equal(queue[0].provider, "codex");
+    assert.equal(queue[0].model, "gpt-5");
+    assert.equal(advanceCalls.length, 1, "evaluator fires the queue advance");
+    assert.equal(advanceCalls[0].projectId, "proj-1");
+    assert.equal(advanceCalls[0].sessionId, "s1");
+  });
+});
+
+test("evaluateGoal does not fire advanceSessionQueue when the agent already queued", async () => {
+  // If the queue is non-empty when the evaluator runs, the evaluator
+  // should not enqueue nor advance — the agent's own queue item
+  // drains through the existing pipeline.
+  await withTempHome(async (home) => {
+    await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({ id: "s1", workingDirectory: projectPath })
+    );
+    // Plant a pre-existing queue item.
+    const queuesDir = path.join(home, "queues");
+    mkdirSync(queuesDir, { recursive: true });
+    writeFileSync(
+      path.join(queuesDir, "s1.json"),
+      JSON.stringify([
+        {
+          id: "pre-existing",
+          text: "agent follow-up",
+          visibleText: "agent follow-up",
+          provider: "codex",
+          model: "gpt-5",
+          mode: "default",
+          attachmentIds: [],
+          createdAt: new Date().toISOString(),
+        },
+      ])
+    );
+    let advanceCalls = 0;
+    const outcome = await evaluateGoal(
+      "s1",
+      makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
+        callModel: async () => ({ met: false, reason: "still going" }),
+        advanceSessionQueue: async () => {
+          advanceCalls += 1;
+        },
+      })
+    );
+    assert.equal(outcome.enqueued, false);
+    assert.equal(advanceCalls, 0);
+  });
+});
+
+test("evaluateGoal tolerates advanceSessionQueue failures", async () => {
+  // A failed advance shouldn't undo the enqueue or clear the goal —
+  // the message stays in the queue for the next scheduler tick /
+  // run-completion to drain.
+  await withTempHome(async (home) => {
+    await writeSessionGoal(buildSessionGoal("s1", { condition: "x" }));
+    const projectPath = path.join(home, "project");
+    mkdirSync(path.join(projectPath, "sessions"), { recursive: true });
+    mkdirSync(path.join(projectPath, "events"), { recursive: true });
+    writeFileSync(
+      path.join(projectPath, "sessions", "s1.json"),
+      JSON.stringify({ id: "s1", workingDirectory: projectPath })
+    );
+    await evaluateGoal(
+      "s1",
+      makeDeps({
+        locateSession: async () => ({
+          projectId: "proj-1",
+          worktreeId: "wt-1",
+          worktreePath: projectPath,
+        }),
+        callModel: async () => ({ met: false, reason: "still going" }),
+        advanceSessionQueue: async () => {
+          throw new Error("advance crashed");
+        },
+      })
+    );
+    // The enqueue still happened; the failure is logged not surfaced.
+    const queue = await listQueue("s1");
+    assert.equal(queue.length, 1);
+    const reloaded = await readSessionGoal("s1");
+    assert.ok(reloaded, "goal survives an advance failure");
+    assert.equal(reloaded.turnsEvaluated, 1);
   });
 });
 

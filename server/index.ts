@@ -290,22 +290,38 @@ async function start(): Promise<void> {
   // Register the goal evaluator consumer (issue #339). Each tick it
   // enumerates sessions with an active goal and runs the cheap judge
   // loop on each. The `locateSession` dep walks every project's
-  // session store so the evaluator doesn't have to know the project
-  // layout ahead of time — the same trick the wakes consumer uses.
+  // worktrees via the shared `locateSessionById` helper so the
+  // evaluator doesn't have to know the project layout ahead of time.
+  //
+  // Issue #339 review fixes:
+  //   - `isSessionActive` skips judgment while a turn is mid-flight
+  //     so a 5-turn goal can't be exhausted by ticks of one long run.
+  //   - `readSession` lets the evaluator see the live session's
+  //     `provider`/`model` (for continuation enqueue) and detect the
+  //     archived case (so an archived session doesn't keep paying).
+  //   - `advanceSessionQueue` fires the queue pipeline after the
+  //     evaluator enqueues a continuation, so the goal loop doesn't
+  //     stall after its first judgment.
+  const { getSessionRuntime } = await import("./lib/session-runtime.js");
+  const { locateSessionById } = await import("./lib/session-locator.js");
   const goalDeps: GoalEvaluatorDeps = {
     locateSession: async (sessionId) => {
-      const projects = await getProjects();
-      for (const project of projects) {
-        const candidate = await getSession(project.path, sessionId);
-        if (candidate) {
-          return {
-            projectId: project.id,
-            worktreeId: candidate.worktreeId ?? "",
-            worktreePath: project.path,
-          };
-        }
-      }
-      return null;
+      const located = await locateSessionById(sessionId);
+      if (!located) return null;
+      return {
+        projectId: located.projectId,
+        worktreeId: located.worktreeId,
+        worktreePath: located.worktreePath,
+      };
+    },
+    isSessionActive: (sessionId) => getSessionRuntime(sessionId).active,
+    readSession: async (worktreePath, sessionId) =>
+      getSession(worktreePath, sessionId),
+    advanceSessionQueue: async (projectId, worktreeId, sessionId) => {
+      const { advanceSessionQueueFromConsumer } = await import(
+        "./routes/sessions.js"
+      );
+      await advanceSessionQueueFromConsumer(projectId, worktreeId, sessionId);
     },
   };
   registerConsumer(
