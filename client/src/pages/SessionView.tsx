@@ -6380,6 +6380,22 @@ export function SessionView({
                 onSubmit={(e) => {
                   e.preventDefault();
                   if (steerInProgress) return;
+                  if (
+                    streaming &&
+                    !message.trim() &&
+                    composerAttachments.length === 0 &&
+                    queue.length > 0
+                  ) {
+                    // Secondary tap on Send while streaming with an empty
+                    // composer: promote the first queued message into an
+                    // interrupt (steer). Mirrors Cmd/Ctrl+Enter, but is
+                    // reachable on mobile where that shortcut isn't
+                    // available. `handleSteer` already handles the
+                    // "promote queued to steer" branch when the composer is
+                    // empty.
+                    void handleSteer();
+                    return;
+                  }
                   if (streaming) void handleEnqueue();
                   else void handleSend(e);
                 }}
@@ -7014,10 +7030,21 @@ export function SessionView({
                       <Button
                         type="submit"
                         size="icon"
-                        title={streaming ? "Queue for next run" : "Send"}
+                        title={
+                          streaming &&
+                          !message.trim() &&
+                          composerAttachments.length === 0 &&
+                          queue.length > 0
+                            ? "Send queued message (interrupt)"
+                            : streaming
+                              ? "Queue for next run"
+                              : "Send"
+                        }
                         disabled={
                           steerInProgress ||
-                          (!message.trim() && composerAttachments.length === 0) ||
+                          (!message.trim() &&
+                            composerAttachments.length === 0 &&
+                            !(streaming && queue.length > 0)) ||
                           !providerReady ||
                           (streaming && !(activeStreamSessionId ?? sessionId))
                         }
