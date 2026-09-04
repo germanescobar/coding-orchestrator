@@ -94,9 +94,9 @@ test("setAgentSetting normalizes blank path to null", async () => {
 
 test("setAgentSetting persists and clears defaultModel", async () => {
   await withTempHome(async () => {
-    await setAgentSetting("codex", { defaultModel: "gpt-5.5" });
+    await setAgentSetting("codex", { defaultModel: "gpt-6-astra" });
     let setting = await getAgentSetting("codex");
-    assert.equal(setting.defaultModel, "gpt-5.5");
+    assert.equal(setting.defaultModel, "gpt-6-astra");
 
     await setAgentSetting("codex", { defaultModel: null });
     setting = await getAgentSetting("codex");
