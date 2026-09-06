@@ -1,18 +1,17 @@
 /**
- * Persisted `visitedAt` storage for the focus queue.
+ * Persisted handled timestamps for the focus queue.
  *
- * The visit timestamps that drive `sortFocusQueue`'s visited/unvisited
+ * The timestamps that drive `sortFocusQueue`'s handled/unhandled
  * split live in App's React state, but they have to survive a reload
  * — otherwise every page refresh re-surfaces every pinned session as
- * "fresh," and pressing Next from any visited item walks forward
- * through the visited bucket instead of jumping to the top of remaining
- * unvisited. That's the regression the user's bug report (issue #333
- * follow-up) described after a reload.
+ * "fresh." The storage key and API retain their historical `visitedAt`
+ * names for backwards compatibility, but simply opening a session no
+ * longer writes them.
  *
  * Storage layout: a single localStorage entry holding a JSON object
- * `{ [sessionId]: <ISO timestamp of last visit> }`. Entries older
- * than `VISITED_AT_TTL_MS` are dropped on load so a visit from last
- * week doesn't pin a session as "visited" this week.
+ * `{ [sessionId]: <ISO timestamp of last advance> }`. Entries older
+ * than `VISITED_AT_TTL_MS` are dropped on load so stale triage state
+ * does not survive indefinitely.
  *
  * Storage failures (private-mode browsers, quota exceeded, malformed
  * JSON) fall back to an empty in-memory map and try to write through

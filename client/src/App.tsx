@@ -1,5 +1,5 @@
 import { Component, useState, useEffect, useCallback, useRef, type ReactNode } from "react";
-import { Archive, ArrowRight, Menu, Radar, X } from "lucide-react";
+import { Archive, ArrowRight, Menu, X } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -15,9 +15,7 @@ import {
   archiveSession,
   fetchProjects,
   markSessionFocusDone,
-  pinSessionFocus,
   subscribeProjectEvents,
-  unpinSessionFocus,
   type Project,
   type ProjectEvent,
   type Worktree,
@@ -25,6 +23,7 @@ import {
 import type { ControllerLinkTarget } from "../../shared/conversation-links.ts";
 import {
   Sidebar,
+  markFocusItemHandled,
   sortFocusQueue,
   type FocusQueueItem,
 } from "./components/sidebar.tsx";
@@ -41,16 +40,15 @@ import {
   useShortcutBindingsContext,
 } from "./lib/useShortcutBindings.tsx";
 import { FileIndexProvider } from "./lib/useFileIndex.tsx";
-import { FocusAdvanceToast } from "./components/focus-advance-toast.tsx";
-import { pickNextFocusItem } from "./lib/focus-advance.ts";
+import { pickFirstFocusItem } from "./lib/focus-advance.ts";
 import {
   loadSavedVisitedAt,
   persistVisitedAt,
 } from "./lib/focus-visited-storage.ts";
 
 /**
- * Time the focus-advance toast shows a "Moving to next..." countdown
- * before actually navigating. The countdown is what keeps the user
+ * Time the conversation panel shows its auto-advance countdown before
+ * navigating. The countdown is what keeps the user
  * from losing sight of the message they just sent: the in-flight
  * bubble stays on screen for at least this long, and they can
  * cancel the advance with the **Stay** button or Esc.
@@ -61,7 +59,6 @@ const FOCUS_ADVANCE_COUNTDOWN_MS = 4000;
 
 export interface PendingFocusAdvance {
   sentFromSessionId: string;
-  next: FocusQueueItem;
   /** Epoch ms when the advance was scheduled. */
   scheduledAt: number;
 }
@@ -142,43 +139,30 @@ function AppBody() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [focusQueue, setFocusQueue] = useState<FocusQueueItem[]>([]);
   const [focusRefreshKey, setFocusRefreshKey] = useState(0);
-  // Per-session "last visited" timestamp. Updated whenever the user
-  // lands on a session via any navigation (Next, auto-advance,
-  // mark-done follow-up, sidebar click, conversation link). Drives
+  // Per-session "last handled" timestamp. Updated only when the user
+  // advances past a session with Next or committed auto-advance. Drives
   // the visited/unvisited split in `sortFocusQueue` — finished
-  // sessions the user has never opened sit at the top of the
-  // finished block ("triage pile"), and any visit sinks them below
+  // sessions the user has not handled sit at the top of the
+  // finished block ("triage pile"), and advancing past one sinks it below
   // the unvisited pile so the user isn't bounced back to them on
-  // every cycle.
+  // every cycle. The persisted key retains its historical "visited"
+  // name for backwards compatibility.
   //
   // Hydrated from localStorage on first paint and persisted on
   // every update so the triage pile survives a reload. Without
   // persistence, a reload re-surfaces every pinned session as
-  // "fresh," and pressing Next from any visited item walks forward
-  // through the visited bucket instead of jumping to the top of
-  // remaining unvisited — the exact regression the user's bug
-  // report described after a reload.
+  // "fresh" again and loses the user's triage progress.
   const [visitedAt, setVisitedAt] = useState<Record<string, string>>(
     () => loadSavedVisitedAt(window.localStorage),
   );
   // Write-through to localStorage whenever `visitedAt` changes. A
   // dedicated effect is cleaner than wrapping the setter because
-  // `setVisitedAt` is invoked via updater functions and may receive
-  // stale references inside React's batching. Watching the state
-  // guarantees we persist exactly the value that just became
-  // canonical. Persistence failures are swallowed inside
+  // Watching the state guarantees we persist exactly the value that
+  // just became canonical. Persistence failures are swallowed inside
   // `persistVisitedAt`; the in-memory state still works.
   useEffect(() => {
     persistVisitedAt(window.localStorage, visitedAt);
   }, [visitedAt]);
-  // Epoch ms of the user's most recent "interaction" with the focus
-  // queue (Next / Reply / Mark Done). Drives the recently-finished
-  // bucket in `pickNextFocusItem`: an item whose `lastActiveAt` is at
-  // or after this timestamp is a fresh finish that the user hasn't
-  // answered yet, and the advance algorithm surfaces those first
-  // (oldest-arrival first). `0` means "never interacted yet" — the
-  // recently-finished bucket is empty in that case.
-  const [lastFocusInteractionAt, setLastFocusInteractionAt] = useState(0);
   // Post-reply auto-advance countdown: on by default. When off,
   // replies stay on the current session until the user hits Next,
   // Mark Done, or re-enables the toggle. The Next chord always
@@ -199,11 +183,11 @@ function AppBody() {
   });
   // Live shortcut bindings shared with the Settings panel and the
   // Focus-queue keyboard listener. Read here (top of AppBody) so
-  // both `handleFocusAdvanceAfterSend` and `useFocusShortcuts`
-  // can pass the same map into the toast and the keydown handler.
+  // both the conversation panel and `useFocusShortcuts` can use the
+  // same configured chords.
   const shortcutBindings = useShortcutBindingsContext();
   // Scheduled "advance to the next focus item" while a 4-second
-  // countdown is showing in a toast. Set by
+  // countdown is showing in the conversation panel. Set by
   // `handleFocusAdvanceAfterSend` after a send, cleared either by the
   // timer firing (then we navigate) or by any of the cancel paths
   // (S, Esc, manual nav, unmount). See issue #104.
@@ -217,16 +201,19 @@ function AppBody() {
     { added: number; deleted: number } | null
   >(null);
   const pendingFocusAdvanceRef = useRef<PendingFocusAdvance | null>(null);
+  const focusQueueRef = useRef<FocusQueueItem[]>([]);
+  const visitedAtRef = useRef(visitedAt);
   const advanceTimerRef = useRef<number | null>(null);
-  const advanceToastIdRef = useRef<string | number | null>(null);
   // The view to return to when settings is closed (the last non-settings view).
   const preSettingsViewRef = useRef<View>({ page: "empty" });
 
-  const dismissAdvanceToast = () => {
-    if (advanceToastIdRef.current === null) return;
-    toast.dismiss(advanceToastIdRef.current);
-    advanceToastIdRef.current = null;
-  };
+  useEffect(() => {
+    focusQueueRef.current = focusQueue;
+  }, [focusQueue]);
+
+  useEffect(() => {
+    visitedAtRef.current = visitedAt;
+  }, [visitedAt]);
 
   const setView = (v: View) => {
     // Entering settings: remember the view we're leaving so closing returns there.
@@ -243,7 +230,6 @@ function AppBody() {
       advanceTimerRef.current = null;
     }
     pendingFocusAdvanceRef.current = null;
-    dismissAdvanceToast();
     setPendingFocusAdvance((current) => (current ? null : current));
   };
 
@@ -251,19 +237,21 @@ function AppBody() {
 
   const handleFocusQueueChange = useCallback(
     (queue: FocusQueueItem[]) => {
-      // Overlay the per-session visit timestamps onto the items the
+      // Overlay the per-session handled timestamps onto the items the
       // sidebar emitted, then sort via the shared helper. The sidebar
       // builds the raw items (it owns the runtime / projectData
       // fetches); App owns the visit tracking and the canonical
       // ordering.
       const withVisits = queue.map((item) => {
-        const visited = visitedAt[item.session.id];
+        const visited = visitedAtRef.current[item.session.id];
         if (visited === item.lastVisitedAt) return item;
         return { ...item, lastVisitedAt: visited };
       });
-      setFocusQueue(sortFocusQueue(withVisits));
+      const sorted = sortFocusQueue(withVisits);
+      focusQueueRef.current = sorted;
+      setFocusQueue(sorted);
     },
-    [visitedAt],
+    [],
   );
 
   /**
@@ -283,9 +271,48 @@ function AppBody() {
   }, []);
 
   /**
-   * Commit a scheduled focus advance: navigate to the target session
-   * and clear the pending state. Safe to call when nothing is pending
-   * (it just no-ops).
+   * Advance past a session in two explicit steps: first mark and
+   * re-sort the current item, then open the new first queue item.
+   * Resolving the destination after the mutation keeps navigation
+   * aligned with exactly what the sidebar displays.
+   */
+  const advancePastFocusItem = useCallback(
+    (sessionId: string) => {
+      const currentQueue = focusQueueRef.current;
+      const isPinned = currentQueue.some(
+        (item) => item.session.id === sessionId,
+      );
+      let reordered = currentQueue;
+
+      if (isPinned) {
+        const handledAt = new Date().toISOString();
+        const nextVisitedAt = {
+          ...visitedAtRef.current,
+          [sessionId]: handledAt,
+        };
+        visitedAtRef.current = nextVisitedAt;
+        setVisitedAt(nextVisitedAt);
+
+        reordered = markFocusItemHandled(
+          currentQueue,
+          sessionId,
+          handledAt,
+        );
+        focusQueueRef.current = reordered;
+        setFocusQueue(reordered);
+      }
+
+      const next = pickFirstFocusItem(reordered, sessionId);
+      if (next) openFocusItem(next);
+    },
+    [openFocusItem],
+  );
+
+  /**
+   * Commit a scheduled focus advance: reorder the originating session,
+   * then navigate to the queue's new first row. The target is resolved
+   * here rather than when the countdown starts, so live queue changes
+   * during those four seconds are respected.
    */
   const commitPendingAdvance = useCallback(() => {
     const pending = pendingFocusAdvanceRef.current;
@@ -296,14 +323,8 @@ function AppBody() {
       window.clearTimeout(advanceTimerRef.current);
       advanceTimerRef.current = null;
     }
-    dismissAdvanceToast();
-    // Stamp the watermark AFTER navigating so the just-replied
-    // session's server-side `lastActiveAt` update (which happens a
-    // moment later when the stream closes) doesn't immediately look
-    // "fresh" and bounce the user back.
-    setLastFocusInteractionAt(Date.now());
-    openFocusItem(pending.next);
-  }, [openFocusItem]);
+    advancePastFocusItem(pending.sentFromSessionId);
+  }, [advancePastFocusItem]);
 
   /**
    * Cancel a scheduled focus advance: clear the pending state and
@@ -316,7 +337,6 @@ function AppBody() {
       window.clearTimeout(advanceTimerRef.current);
       advanceTimerRef.current = null;
     }
-    dismissAdvanceToast();
   }, []);
 
   // Clear the countdown on unmount so a stale timer doesn't fire
@@ -328,7 +348,6 @@ function AppBody() {
         advanceTimerRef.current = null;
       }
       pendingFocusAdvanceRef.current = null;
-      dismissAdvanceToast();
     };
   }, []);
 
@@ -467,41 +486,7 @@ function AppBody() {
     setMobileDiffSummary(null);
   }, [activeView.page === "session" ? activeView.sessionId : null]);
 
-  // Record a "visit" whenever the user lands on a session — Next,
-  // auto-advance, mark-done follow-up, sidebar click, conversation
-  // link, schedule link. The visited timestamp sinks the session
-  // below the unvisited triage pile in `sortFocusQueue`. We also
-  // record the *previous* session so leaving a session counts as a
-  // visit (otherwise auto-advance from A → B would only mark B as
-  // visited, leaving A marked as fresh-and-unvisited for the next
-  // cycle). The ref tracks the previous id so the effect can mark
-  // both endpoints of every transition.
-  const activeSessionId =
-    activeView.page === "session" ? activeView.sessionId : null;
-  const previousActiveSessionIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    const previous = previousActiveSessionIdRef.current;
-    const idsToMark = new Set<string>();
-    if (previous && previous !== activeSessionId) idsToMark.add(previous);
-    if (activeSessionId) idsToMark.add(activeSessionId);
-    previousActiveSessionIdRef.current = activeSessionId;
-    if (idsToMark.size === 0) return;
-    setVisitedAt((current) => {
-      const next = new Date().toISOString();
-      const updates: Record<string, string> = {};
-      let changed = false;
-      for (const id of idsToMark) {
-        if (current[id] !== next) {
-          updates[id] = next;
-          changed = true;
-        }
-      }
-      if (!changed) return current;
-      return { ...current, ...updates };
-    });
-  }, [activeSessionId]);
-
-  // When `visitedAt` changes, re-sort the queue so visited items
+  // When handled timestamps change, re-sort the queue so handled items
   // sink below the unvisited triage pile. Avoid an infinite loop
   // by checking that the timestamps are actually different before
   // triggering the sort.
@@ -520,14 +505,15 @@ function AppBody() {
         sorted.length === current.length &&
         sorted.every((item, i) => item === current[i])
       ) {
+        focusQueueRef.current = current;
         return current;
       }
+      focusQueueRef.current = sorted;
       return sorted;
     });
   }, [visitedAt]);
 
   const currentFocusItem = currentFocusIndex >= 0 ? focusQueue[currentFocusIndex] : null;
-
   const handleFocusSkip = () => {
     // If a countdown is already scheduled, `N` (and the **Next**
     // button) commit it immediately rather than skipping to a
@@ -540,20 +526,9 @@ function AppBody() {
       toast.info("Focus queue is empty");
       return;
     }
-    // Walk the recently-finished bucket first; otherwise plain
-    // circular advance. Recording the interaction after computing the
-    // target keeps the freshly-surfaced item in the bucket for this
-    // call (see `pickNextFocusItem`).
     const sentFromId =
       currentFocusItem?.session.id ?? activeView.sessionId ?? "";
-    const next = pickNextFocusItem(
-      focusQueue,
-      sentFromId,
-      lastFocusInteractionAt,
-    );
-    setLastFocusInteractionAt(Date.now());
-    if (!next) return;
-    openFocusItem(next);
+    advancePastFocusItem(sentFromId);
   };
 
   // Toggle the post-reply auto-advance countdown. Persists to
@@ -578,23 +553,6 @@ function AppBody() {
     }
     if (!nextValue) cancelPendingAdvance();
   }, [autoAdvance, cancelPendingAdvance]);
-
-  const handleToggleCurrentSessionPin = async () => {
-    if (activeView.page !== "session" || !activeView.sessionId) return;
-    const { projectId, worktreeId, sessionId } = activeView;
-    const pinned = currentFocusIndex >= 0;
-
-    try {
-      if (pinned) {
-        await unpinSessionFocus(projectId, sessionId, worktreeId);
-      } else {
-        await pinSessionFocus(projectId, sessionId, worktreeId);
-      }
-      setFocusRefreshKey((key) => key + 1);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to update focus queue");
-    }
-  };
 
   const handleArchiveCurrentSession = () => {
     if (activeView.page !== "session" || !activeView.sessionId) return;
@@ -642,6 +600,7 @@ function AppBody() {
             item.session.id === sessionId
           )
       );
+      focusQueueRef.current = nextQueue;
       setFocusQueue(nextQueue);
       setFocusRefreshKey((key) => key + 1);
 
@@ -650,15 +609,7 @@ function AppBody() {
         return;
       }
 
-      // Mark-done counts as an interaction: stamp the watermark so any
-      // items that finished *since* the last interaction are the next
-      // stop. The just-done session is already out of the queue, so
-      // we pass an empty sent-from id and let `pickNextFocusItem`
-      // resolve the freshest finished first.
-      setLastFocusInteractionAt(Date.now());
-      const next = pickNextFocusItem(nextQueue, "", Date.now());
-      if (!next) return;
-      openFocusItem(next);
+      openFocusItem(nextQueue[0]);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to update focus queue");
     }
@@ -678,67 +629,33 @@ function AppBody() {
   //
   // When `autoAdvance` is off, replies stay on the current session —
   // the user has to hit Next (manual skip), Mark Done (removes from
-  // queue), or re-enable the toggle. The watermark still bumps so
-  // the next manual Next press surfaces the just-replied session's
-  // "recently finished" correctly.
+  // queue), or re-enable the toggle. Staying does not reorder it.
   const handleFocusAdvanceAfterSend = useCallback(
     (sentFromSessionId: string) => {
-      // Stamp the watermark now: a reply is an interaction, and the
-      // just-replied session will get a server-side `lastActiveAt`
-      // update when its stream closes — that's "freshly finished"
-      // for the recently-finished bucket logic, which we want to
-      // kick in immediately on the next Next press.
-      setLastFocusInteractionAt(Date.now());
       if (!autoAdvance) return;
-      // Compute the target using the *previous* watermark so any item
-      // that finished since the last interaction is considered fresh.
-      // The watermark is updated *after* the countdown commits (in
-      // `commitPendingAdvance`), not here — otherwise the just-replied
-      // session's `lastActiveAt` (server-stamped moments later) would
-      // immediately look "fresh" and bounce the user back.
-      const next = pickNextFocusItem(
-        focusQueue,
-        sentFromSessionId,
-        lastFocusInteractionAt,
-      );
-      if (!next) return;
+      // Only schedule when another row exists, but deliberately do not
+      // cache which row it is. The commit resolves the new first item
+      // after demoting the current session and applying any live queue
+      // updates that arrived during the countdown.
+      if (!pickFirstFocusItem(focusQueueRef.current, sentFromSessionId)) return;
       // Replace any existing pending advance (the user sent again
       // before the previous countdown finished). The new origin
       // session is what matters; we restart the clock.
       if (advanceTimerRef.current !== null) {
         window.clearTimeout(advanceTimerRef.current);
       }
-      dismissAdvanceToast();
       const pendingAdvance = {
         sentFromSessionId,
-        next,
         scheduledAt: Date.now(),
       };
       pendingFocusAdvanceRef.current = pendingAdvance;
       setPendingFocusAdvance(pendingAdvance);
-      advanceToastIdRef.current = toast.custom(
-        () => (
-          <FocusAdvanceToast
-            scheduledAt={pendingAdvance.scheduledAt}
-            durationMs={FOCUS_ADVANCE_COUNTDOWN_MS}
-            bindings={shortcutBindings.bindings}
-            onCancel={cancelPendingAdvance}
-          />
-        ),
-        {
-          duration: Infinity,
-          position: "top-right",
-          unstyled: true,
-        },
-      );
       advanceTimerRef.current = window.setTimeout(() => {
         commitPendingAdvance();
       }, FOCUS_ADVANCE_COUNTDOWN_MS);
     },
     [
       autoAdvance,
-      focusQueue,
-      lastFocusInteractionAt,
       commitPendingAdvance,
       cancelPendingAdvance,
       shortcutBindings.bindings,
@@ -826,10 +743,6 @@ function AppBody() {
           }}
           onFocusQueueChange={handleFocusQueueChange}
           focusQueue={focusQueue}
-          autoAdvance={autoAdvance}
-          onToggleAutoAdvance={handleToggleAutoAdvance}
-          onSkip={handleFocusSkip}
-          shortcutBindings={shortcutBindings.bindings}
           focusRefreshKey={focusRefreshKey}
           eventsRefreshKey={eventsRefreshKey}
         />
@@ -863,19 +776,6 @@ function AppBody() {
               <span className="text-green-400/90">+{mobileDiffSummary.added}</span>{" "}
               <span className="text-red-400/90">-{mobileDiffSummary.deleted}</span>
             </span>
-          )}
-          {activeView.page === "session" && activeView.sessionId && (
-            <button
-              onClick={handleToggleCurrentSessionPin}
-              className={`shrink-0 rounded-md p-1.5 transition-colors ${
-                currentFocusIndex >= 0
-                  ? "bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 hover:text-blue-200"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
-              }`}
-              title={currentFocusIndex >= 0 ? "Remove from Radar" : "Add to Radar"}
-            >
-              <Radar className="h-4 w-4" />
-            </button>
           )}
           {activeView.page === "session" && activeView.sessionId && (
             <button
@@ -952,6 +852,10 @@ function AppBody() {
             }}
             onOpenConversation={handleOpenConversation}
             shortcutBindings={shortcutBindings.bindings}
+            autoAdvance={autoAdvance}
+            onToggleAutoAdvance={handleToggleAutoAdvance}
+            onFocusDone={handleFocusDone}
+            onFocusSkip={handleFocusSkip}
             onFocusPinnedChange={() => setFocusRefreshKey((key) => key + 1)}
             onTitleChange={() => setFocusRefreshKey((key) => key + 1)}
             onArchive={handleArchiveCurrentSession}
@@ -960,11 +864,9 @@ function AppBody() {
             focusAdvanceCountdown={
               pendingFocusAdvance
                 ? {
-                    // SessionView only needs the origin to preserve
-                    // the pending message and cancel if the user
-                    // starts typing there again. The visible
-                    // countdown lives in the toast.
                     sentFromSessionId: pendingFocusAdvance.sentFromSessionId,
+                    scheduledAt: pendingFocusAdvance.scheduledAt,
+                    durationMs: FOCUS_ADVANCE_COUNTDOWN_MS,
                     onCancel: cancelPendingAdvance,
                   }
                 : null

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  pickFirstFocusItem,
   pickNextFocusItem,
   type FocusQueueItemLike,
 } from "./focus-advance.ts";
@@ -22,6 +23,33 @@ function item(
 
 test("pickNextFocusItem returns null for an empty queue", () => {
   assert.equal(pickNextFocusItem([], "any", 0), null);
+});
+
+test("pickFirstFocusItem selects the top row when the current session is last", () => {
+  const queue = [
+    item("first", "2024-01-01T00:00:00.000Z"),
+    item("second", "2024-01-02T00:00:00.000Z"),
+    item("current", "2024-01-03T00:00:00.000Z"),
+  ];
+  assert.equal(pickFirstFocusItem(queue, "current")?.session.id, "first");
+});
+
+test("pickFirstFocusItem selects the top row when the current session is second-to-last", () => {
+  const queue = [
+    item("first", "2024-01-01T00:00:00.000Z"),
+    item("current", "2024-01-02T00:00:00.000Z"),
+    item("last", "2024-01-03T00:00:00.000Z"),
+  ];
+  assert.equal(pickFirstFocusItem(queue, "current")?.session.id, "first");
+});
+
+test("pickFirstFocusItem skips the current session when it is the top row", () => {
+  const queue = [
+    item("current", "2024-01-01T00:00:00.000Z"),
+    item("second", "2024-01-02T00:00:00.000Z"),
+  ];
+  assert.equal(pickFirstFocusItem(queue, "current")?.session.id, "second");
+  assert.equal(pickFirstFocusItem([queue[0]], "current"), null);
 });
 
 test("pickNextFocusItem stays put on a queue of one (sent-from IS the only item)", () => {
@@ -103,6 +131,26 @@ test("pickNextFocusItem walks recently-finished FIFO", () => {
   // the next freshest is finished-newer.
   const second = pickNextFocusItem(queue, "finished-older", Date.parse("2024-01-05T00:01:00.000Z"));
   assert.equal(second?.session.id, "finished-newer");
+});
+
+test("pickNextFocusItem excludes active sessions from recently-finished", () => {
+  const queue = [
+    item("finished", "2024-01-05T00:00:00.000Z", {
+      lastVisitedAt: "2024-01-05T00:01:00.000Z",
+    }),
+    item("running-fresh", "2024-01-06T00:00:00.000Z", {
+      active: true,
+    }),
+    item("sent-from", "2024-01-03T00:00:00.000Z", {
+      lastVisitedAt: "2024-01-03T00:01:00.000Z",
+    }),
+  ];
+  const next = pickNextFocusItem(
+    queue,
+    "sent-from",
+    Date.parse("2024-01-04T00:00:00.000Z"),
+  );
+  assert.equal(next?.session.id, "finished");
 });
 
 test("pickNextFocusItem skips the sent-from session in the recently-finished bucket", () => {

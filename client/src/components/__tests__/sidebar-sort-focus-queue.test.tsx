@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  markFocusItemHandled,
   sortFocusQueue,
   type FocusQueueItem,
 } from "../sidebar.tsx";
@@ -257,22 +258,22 @@ test("finished, visited: most-recently-visited at the very bottom of the visited
   ]);
 });
 
-test("visiting a finished session sinks it from the triage pile", () => {
+test("advancing past a finished session sinks it before choosing the new first row", () => {
   // The "before" state has A as unvisited (top of finished).
-  // The "after" state (simulating a visit by adding
-  // lastVisitedAt to A) puts A in the visited sub-block.
+  // Marking A handled and re-sorting is step one of advance.
   const before = sortFocusQueue([
     item("a", "2024-01-01T00:00:00.000Z", false),
     item("b", "2024-01-02T00:00:00.000Z", false),
   ]);
   assert.deepEqual(ids(before), ["a", "b"]);
 
-  // Same items, but A is now visited.
-  const after = sortFocusQueue([
-    item("a", "2024-01-01T00:00:00.000Z", false, "2024-01-05T00:00:00.000Z"),
-    item("b", "2024-01-02T00:00:00.000Z", false),
-  ]);
+  const after = markFocusItemHandled(
+    before,
+    "a",
+    "2024-01-05T00:00:00.000Z",
+  );
   assert.deepEqual(ids(after), ["b", "a"]);
+  assert.equal(after[0].session.id, "b");
 });
 
 test("full queue with visits: awaiting → unvisited → visited → running", () => {

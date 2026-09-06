@@ -1,6 +1,6 @@
 import { memo, useCallback, useMemo, useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { diffLines } from "diff";
-import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square, Diff, PanelRight, Zap, Plus, X, Paperclip, FileText, FileCode, Folder, FolderOpen, CheckCircle2, StepForward, LogOut, Radar, Play, Sparkles, Globe2, RefreshCw, Pencil, Archive } from "lucide-react";
+import { ArrowUp, Loader2, Copy, Check, ChevronDown, ChevronRight, TerminalSquare, MessageSquare, Square, Diff, PanelRight, Zap, Plus, X, Paperclip, FileText, FileCode, Folder, FolderOpen, StepForward, Play, Sparkles, Globe2, RefreshCw, Pencil, Archive } from "lucide-react";
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
 import css from "highlight.js/lib/languages/css";
@@ -44,6 +44,7 @@ import { Badge } from "@/components/ui/badge";
 import { Kbd } from "@/components/ui/kbd";
 import { Terminal, type TerminalHandle } from "@/components/terminal";
 import { TerminalMobileControls } from "@/components/terminal-mobile-controls";
+import { FocusConversationControls } from "@/components/focus-conversation-controls";
 import { useResizablePanel } from "@/lib/useResizablePanel";
 import { isControllerAvailable } from "@/lib/controller";
 import { formatChord, matchesEvent, parseChord } from "@/lib/shortcut-match";
@@ -138,6 +139,11 @@ import {
 import { describeApprovalInput } from "../lib/describe-approval-input.ts";
 import { getLatestPendingToolApproval } from "../lib/pending-tool-approval.ts";
 import { extractFilesFromClipboard } from "../lib/clipboard-files.ts";
+import {
+  getComposerLayout,
+  MOBILE_COMPOSER_MEDIA_QUERY,
+} from "../lib/mobile-composer.ts";
+import { getConversationCountdown } from "../lib/focus-conversation-countdown.ts";
 
 interface SessionViewProps {
   projectId: string;
@@ -157,6 +163,10 @@ interface SessionViewProps {
    * listener matches the user's rebinds. See issue #235.
    */
   shortcutBindings?: import("../../../shared/shortcuts.ts").ShortcutBindings | null;
+  autoAdvance?: boolean;
+  onToggleAutoAdvance?: () => void;
+  onFocusDone?: () => void;
+  onFocusSkip?: () => void;
   onFocusPinnedChange?: () => void;
   // Opens the archive confirmation dialog for the current session.
   // Owned by the parent because it shares its `archiveConfirmOpen`
@@ -185,11 +195,14 @@ interface SessionViewProps {
    * a send. While this is set, SessionView preserves the in-flight
    * user-message bubble in the originating session (we skip the
    * session-change cleanup that would otherwise wipe it) so the user
-   * always has time to see the message they just sent. Typing in the
-   * originating composer cancels the pending advance.
+   * always has time to see the message they just sent. The conversation
+   * controls render the countdown and Stay action; typing in the
+   * originating composer also cancels it.
    */
   focusAdvanceCountdown?: {
     sentFromSessionId: string;
+    scheduledAt: number;
+    durationMs: number;
     onCancel: () => void;
   } | null;
 }
@@ -289,7 +302,6 @@ const IS_TOUCH_DEVICE =
   typeof window !== "undefined" &&
   typeof window.matchMedia === "function" &&
   window.matchMedia("(pointer: coarse)").matches;
-
 function supportsAttachments(provider: string): boolean {
   return provider === "anita" || provider === "codex" || provider === "claude";
 }
@@ -2894,6 +2906,10 @@ export function SessionView({
   onBackgroundComplete,
   onOpenConversation,
   shortcutBindings = null,
+  autoAdvance = true,
+  onToggleAutoAdvance,
+  onFocusDone,
+  onFocusSkip,
   onFocusPinnedChange,
   onTitleChange,
   onFocusAdvanceAfterSend,
@@ -2914,6 +2930,18 @@ export function SessionView({
     []
   );
   const [message, setMessage] = useState(initialComposerDraft.text);
+  const [composerHasFocus, setComposerHasFocus] = useState(false);
+  const [isMobileComposerViewport, setIsMobileComposerViewport] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia(MOBILE_COMPOSER_MEDIA_QUERY).matches,
+  );
+  const composerLayout = getComposerLayout(
+    isMobileComposerViewport,
+    composerHasFocus,
+    COMPOSER_MAX_LINES,
+  );
   const [pendingMessage, setPendingMessage] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<SessionAttachment[]>([]);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
@@ -3367,23 +3395,34 @@ export function SessionView({
   }, [streaming]);
 
   useEffect(() => {
+    const mediaQuery = window.matchMedia(MOBILE_COMPOSER_MEDIA_QUERY);
+    const syncViewport = () => setIsMobileComposerViewport(mediaQuery.matches);
+    syncViewport();
+    mediaQuery.addEventListener("change", syncViewport);
+    return () => mediaQuery.removeEventListener("change", syncViewport);
+  }, []);
+
+  useEffect(() => {
     debugSessionIsolation("view.mounted", { projectId, worktreeId, sessionId });
     return () => {
       debugSessionIsolation("view.unmounted", { projectId, worktreeId, sessionId });
     };
   }, [projectId, worktreeId, sessionId]);
 
-  // Drop the user straight into the composer whenever the active
-  // session changes. The auto-advance runs unconditionally after a
-  // reply, so the user is in a triage loop by default and should
-  // land in the composer the moment a new session is ready. They
-  // can `Esc` out to fire a shortcut.
+  // Drop desktop users straight into the composer whenever the active
+  // session changes. Mobile intentionally starts with the compact one-line
+  // composer and waits for a tap before expanding it and opening the keyboard.
   useEffect(() => {
     if (!sessionId) return;
     const textarea = textareaRef.current;
     if (!textarea || textarea.disabled) return;
+    if (!composerLayout.autoFocusOnSessionChange) {
+      textarea.blur();
+      setComposerHasFocus(false);
+      return;
+    }
     textarea.focus();
-  }, [sessionId]);
+  }, [composerLayout.autoFocusOnSessionChange, sessionId]);
 
   useEffect(() => {
     const isOriginatingCountdown =
@@ -3401,6 +3440,7 @@ export function SessionView({
 
     if (
       hadVisibleFocusAdvanceRef.current &&
+      !isMobileComposerViewport &&
       sessionId &&
       textarea &&
       !textarea.disabled
@@ -3408,7 +3448,7 @@ export function SessionView({
       textarea.focus();
     }
     hadVisibleFocusAdvanceRef.current = false;
-  }, [focusAdvanceCountdown, sessionId]);
+  }, [focusAdvanceCountdown, isMobileComposerViewport, sessionId]);
 
   useEffect(() => {
     const isOriginatingCountdown =
@@ -3452,14 +3492,14 @@ export function SessionView({
     const paddingHeight =
       Number.parseFloat(computedStyle.paddingTop) +
       Number.parseFloat(computedStyle.paddingBottom);
-    const maxHeight =
-      lineHeight * COMPOSER_MAX_LINES + paddingHeight + borderHeight;
+    const maxLines = composerLayout.maxLines;
+    const maxHeight = lineHeight * maxLines + paddingHeight + borderHeight;
     const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
 
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY =
-      textarea.scrollHeight > maxHeight ? "auto" : "hidden";
-  }, [message]);
+      maxLines > 1 && textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [composerLayout.maxLines, message]);
 
   // Mirror the composer draft (text + skill chips) to localStorage on change.
   // Skip while a steer is in flight: the composer is disabled and `message` is
@@ -5706,6 +5746,81 @@ export function SessionView({
     events,
     pendingMessage
   );
+  const showComposerDetails = composerLayout.showDetails;
+  const composerPlaceholder = steerInProgress
+    ? "Steering…"
+    : streaming
+      ? IS_TOUCH_DEVICE
+        ? "Send to queue"
+        : `Enter to queue · ${STEER_KEY_LABEL} to steer`
+      : availableSkills.length > 0
+        ? "Describe what you want to build… type / for a skill, @ to mention a file"
+        : sessionId
+          ? "Ask for follow-up changes — type @ to mention a file"
+          : "Describe what you want to build… type @ to mention a file";
+  const renderComposerActions = (expanded: boolean) => (
+    <div
+      className={`flex shrink-0 items-center justify-end gap-2 ${
+        expanded ? "self-end sm:self-auto" : ""
+      }`}
+    >
+      {!streaming && canAttachMore && (
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          title={
+            !providerSupportsAttachments
+              ? `${selectedProvider} does not support attachments`
+              : !modelSupportsAttachments
+                ? "Selected model does not support attachments"
+                : "Attach files"
+          }
+          className="flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <Paperclip className="h-3.5 w-3.5" />
+        </button>
+      )}
+      {streaming && (
+        <button
+          type="button"
+          onClick={handleStop}
+          title="Stop"
+          className="flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+        >
+          <Square className="h-3.5 w-3.5" />
+        </button>
+      )}
+      <Button
+        type="submit"
+        size="icon"
+        title={
+          streaming &&
+          !message.trim() &&
+          composerAttachments.length === 0 &&
+          queue.length > 0
+            ? "Send queued message (interrupt)"
+            : streaming
+              ? "Queue for next run"
+              : "Send"
+        }
+        disabled={
+          steerInProgress ||
+          (!message.trim() &&
+            composerAttachments.length === 0 &&
+            !(streaming && queue.length > 0)) ||
+          !providerReady ||
+          (streaming && !(activeStreamSessionId ?? sessionId))
+        }
+        className="h-8 w-8 rounded-full"
+      >
+        {streaming ? (
+          <Plus className="h-4 w-4" />
+        ) : (
+          <ArrowUp className="h-4 w-4" />
+        )}
+      </Button>
+    </div>
+  );
   const waitingForStructuredInput = Boolean(latestStructuredInputRequest);
   // Live approvals render inline as stream items; this covers the reload case
   // where only persisted events exist and an approval is still pending.
@@ -5745,9 +5860,27 @@ export function SessionView({
       toast.error(err instanceof Error ? err.message : "Failed to update focus queue");
     }
   };
+  const conversationFocusCountdown = getConversationCountdown(
+    focusAdvanceCountdown,
+    sessionId,
+  );
 
   return (
     <>
+      {sessionId && onFocusSkip && onFocusDone && onToggleAutoAdvance ? (
+        <FocusConversationControls
+          variant="mobile"
+          bindings={shortcutBindings}
+          isOnRadar={isFocusPinned}
+          autoAdvance={autoAdvance}
+          onNext={onFocusSkip}
+          onDone={onFocusDone}
+          onAddToRadar={handleHeaderFocusPin}
+          onToggleAutoAdvance={onToggleAutoAdvance}
+          countdown={conversationFocusCountdown}
+        />
+      ) : null}
+
       {/* Header */}
       <header className={`${sessionId ? "flex" : "hidden md:flex"} h-12 md:h-14 shrink-0 items-center justify-end md:justify-between border-b border-border bg-background px-3 md:px-4`}>
         <div className="hidden md:flex flex-col justify-center min-w-0">
@@ -5859,20 +5992,6 @@ export function SessionView({
             );
           })()}
           <div className="ml-3 flex items-center gap-1">
-            {sessionId && (
-              <button
-                type="button"
-                onClick={handleHeaderFocusPin}
-                className={`rounded-md p-1.5 transition-colors ${
-                  isFocusPinned
-                    ? "bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 hover:text-blue-200"
-                    : "text-muted-foreground hover:bg-accent hover:text-foreground"
-                }`}
-                title={isFocusPinned ? "Remove from Radar" : "Add to Radar"}
-              >
-                <Radar className="h-4 w-4" />
-              </button>
-            )}
             {sessionId && onArchive && (
               <button
                 type="button"
@@ -5956,9 +6075,23 @@ export function SessionView({
       {/* Main content area: chat + terminal side by side on desktop, tabbed on mobile */}
       <div className="flex flex-1 min-h-0">
         {/* Chat panel — hidden on mobile when terminal or changes tab is active */}
-        <div className={`flex-col min-h-0 min-w-0 w-full ${
+        <div className={`relative flex-col min-h-0 min-w-0 w-full ${
           sessionId && mobilePanel !== "agent" ? "hidden md:flex" : "flex"
         } flex-1`}>
+          {sessionId && onFocusSkip && onFocusDone && onToggleAutoAdvance ? (
+            <FocusConversationControls
+              variant="desktop"
+              bindings={shortcutBindings}
+              isOnRadar={isFocusPinned}
+              autoAdvance={autoAdvance}
+              onNext={onFocusSkip}
+              onDone={onFocusDone}
+              onAddToRadar={handleHeaderFocusPin}
+              onToggleAutoAdvance={onToggleAutoAdvance}
+              countdown={conversationFocusCountdown}
+            />
+          ) : null}
+
           {/* Messages / Events area */}
           <div
             ref={scrollContainerRef}
@@ -6343,7 +6476,28 @@ export function SessionView({
                 }}
               >
                 <div
-                  className="rounded-xl border border-border bg-input p-3"
+                  data-testid="session-composer"
+                  data-mobile-collapsed={
+                    isMobileComposerViewport && !composerHasFocus ? "true" : undefined
+                  }
+                  className={`rounded-xl border border-border bg-input transition-[padding] md:p-3 ${
+                    showComposerDetails ? "p-3" : "p-2.5"
+                  }`}
+                  onBlurCapture={(event) => {
+                    if (
+                      event.currentTarget.contains(
+                        event.relatedTarget as Node | null,
+                      )
+                    ) {
+                      return;
+                    }
+                    setComposerHasFocus(false);
+                    setSkillPopoverOpen(false);
+                    setMentionPopoverOpen(false);
+                    setShowProviderPicker(false);
+                    setShowReasoningEffortPicker(false);
+                    setShowModelPicker(false);
+                  }}
                   onDragOver={(event) => {
                     if (!canAttachMore) return;
                     event.preventDefault();
@@ -6380,8 +6534,8 @@ export function SessionView({
                       event.currentTarget.value = "";
                     }}
                   />
-                  {activeSkills.length > 0 && !skillPopoverOpen && (
-                    <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                  {showComposerDetails && activeSkills.length > 0 && !skillPopoverOpen && (
+                    <div key="composer-skills" className="mb-2 flex flex-wrap items-center gap-1.5">
                       {activeSkills.map((skill, index) => (
                         <span
                           key={skill.name}
@@ -6412,8 +6566,8 @@ export function SessionView({
                       )}
                     </div>
                   )}
-                  {activeMentions.length > 0 && !mentionPopoverOpen && (
-                    <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                  {showComposerDetails && activeMentions.length > 0 && !mentionPopoverOpen && (
+                    <div key="composer-mentions" className="mb-2 flex flex-wrap items-center gap-1.5">
                       {activeMentions.map((mention, index) => (
                         <span
                           key={`${mention.path}-${index}`}
@@ -6448,10 +6602,11 @@ export function SessionView({
                       )}
                     </div>
                   )}
-                  <div className="relative">
+                  <div key="composer-input" className="relative flex min-w-0 items-center gap-2">
                     <textarea
                       ref={textareaRef}
                       value={message}
+                      onFocus={() => setComposerHasFocus(true)}
                       onChange={(e) => {
                         setMessage(e.target.value);
                         setCaretPos(e.target.selectionStart ?? e.target.value.length);
@@ -6477,25 +6632,14 @@ export function SessionView({
                       onSelect={(e) =>
                         setCaretPos(e.currentTarget.selectionStart ?? 0)
                       }
-                      placeholder={
-                        steerInProgress
-                          ? "Steering…"
-                          : streaming
-                          ? IS_TOUCH_DEVICE
-                            ? "Send to queue"
-                            : `Enter to queue · ${STEER_KEY_LABEL} to steer`
-                          : availableSkills.length > 0
-                          ? "Describe what you want to build… type / for a skill, @ to mention a file"
-                          : sessionId
-                          ? "Ask for follow-up changes — type @ to mention a file"
-                          : "Describe what you want to build… type @ to mention a file"
-                      }
+                      placeholder={composerPlaceholder}
                       rows={1}
                       disabled={steerInProgress}
-                      className="w-full resize-none overflow-y-auto bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
+                      className="min-w-0 flex-1 resize-none overflow-y-auto bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
                       style={{ maxHeight: "calc(1.25rem * 5)" }}
                     />
-                    {skillPopoverOpen && filteredSkills.length > 0 && (
+                    {composerLayout.showCompactActions && renderComposerActions(false)}
+                    {showComposerDetails && skillPopoverOpen && filteredSkills.length > 0 && (
                       <div
                         role="listbox"
                         aria-label="Skills"
@@ -6564,7 +6708,7 @@ export function SessionView({
                         </div>
                       </div>
                     )}
-                    {mentionPopoverOpen && (
+                    {showComposerDetails && mentionPopoverOpen && (
                       <div
                         role="listbox"
                         aria-label="Files"
@@ -6653,7 +6797,7 @@ export function SessionView({
                       </div>
                     )}
                   </div>
-                  {composerAttachments.length > 0 && (
+                  {showComposerDetails && composerAttachments.length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-2">
                       {composerAttachments.map((attachment) => {
                         const fileName = getFileDisplayName(attachment.file);
@@ -6690,12 +6834,12 @@ export function SessionView({
                       })}
                     </div>
                   )}
-                  {attachmentError && (
+                  {showComposerDetails && attachmentError && (
                     <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                       {attachmentError}
                     </div>
                   )}
-                  {providerStatusMessage && (
+                  {showComposerDetails && providerStatusMessage && (
                     <div className="mt-2 flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                       <span className="min-w-0">{providerStatusMessage}</span>
                       <button
@@ -6708,6 +6852,7 @@ export function SessionView({
                       </button>
                     </div>
                   )}
+                  {showComposerDetails && (
                   <div className="mt-2 flex items-center gap-2 sm:justify-between">
                     <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 sm:gap-2">
                       {/* Agent provider + run-option pickers. */}
@@ -6942,64 +7087,9 @@ export function SessionView({
                           </div>
                     </>)}
                     </div>
-                    <div className="flex shrink-0 items-center justify-end gap-2 self-end sm:self-auto">
-                      {!streaming && canAttachMore && (
-                        <button
-                          type="button"
-                          onClick={() => fileInputRef.current?.click()}
-                          title={
-                            !providerSupportsAttachments
-                              ? `${selectedProvider} does not support attachments`
-                              : !modelSupportsAttachments
-                              ? "Selected model does not support attachments"
-                              : "Attach files"
-                          }
-                          className="flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                        >
-                          <Paperclip className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                      {streaming && (
-                        <button
-                          type="button"
-                          onClick={handleStop}
-                          title="Stop"
-                          className="flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
-                        >
-                          <Square className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                      <Button
-                        type="submit"
-                        size="icon"
-                        title={
-                          streaming &&
-                          !message.trim() &&
-                          composerAttachments.length === 0 &&
-                          queue.length > 0
-                            ? "Send queued message (interrupt)"
-                            : streaming
-                              ? "Queue for next run"
-                              : "Send"
-                        }
-                        disabled={
-                          steerInProgress ||
-                          (!message.trim() &&
-                            composerAttachments.length === 0 &&
-                            !(streaming && queue.length > 0)) ||
-                          !providerReady ||
-                          (streaming && !(activeStreamSessionId ?? sessionId))
-                        }
-                        className="h-8 w-8 rounded-full"
-                      >
-                        {streaming ? (
-                          <Plus className="h-4 w-4" />
-                        ) : (
-                          <ArrowUp className="h-4 w-4" />
-                        )}
-                      </Button>
-                    </div>
+                    {renderComposerActions(true)}
                   </div>
+                  )}
                 </div>
               </form>
             </div>

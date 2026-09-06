@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import type { ClaudeApprovalRequest } from "./agents.js";
+import type { AgentStreamEvent, ClaudeApprovalRequest } from "./agents.js";
 
 export interface SessionRuntimeMetadata {
   projectId: string;
@@ -19,11 +19,9 @@ export interface SessionRuntimeState {
   pendingApprovals?: Map<string, ClaudeApprovalRequest>;
   /**
    * True when the agent has paused on a `user.input_requested` event
-   * (e.g. Claude's structured-input flow) and is waiting for the user
-   * to answer. The child process is killed at that point so the runtime
-   * is `active: false`, but the session still needs the user's
-   * attention — the focus-queue sidebar surfaces it as the highest
-   * priority item regardless of active/inactive state.
+   * and is waiting for the user to answer. Some providers end the
+   * process at that point, so the session can be inactive while it
+   * still needs the user's attention.
    *
    * Cleared whenever a new stream starts (`markSessionActive`) so a
    * resumed run doesn't carry the flag forward.
@@ -82,12 +80,28 @@ export function recordPendingApproval(
   runtime.pendingApprovals.set(request.requestId, request);
 }
 
+export function recordSessionAttentionEvent(
+  sessionId: string,
+  event: AgentStreamEvent
+) {
+  if (event.type === "user.input_requested") {
+    setSessionAwaitingUserInput(sessionId, true);
+    return;
+  }
+  if (event.type === "tool.approval_requested") {
+    recordPendingApproval(sessionId, {
+      requestId: event.id,
+      toolName: event.toolName,
+      input: event.input,
+      suggestions: event.suggestions,
+    });
+  }
+}
+
 /**
- * Mark the session as paused on a user-input request. Called by the
- * stream handler when a `user.input_requested` event lands (Claude's
- * structured-input flow kills the child at that point, so the runtime
- * flips `active: false` shortly after — the flag survives that
- * transition).
+ * Mark the session as paused on a user-input request. The flag survives
+ * an inactive transition for providers that end the process at the
+ * request boundary.
  */
 export function setSessionAwaitingUserInput(
   sessionId: string,
@@ -118,8 +132,8 @@ export interface SessionRuntimeSummary {
   projectId?: string;
   worktreeId?: string;
   /**
-   * True when the agent is paused on a user-input request (Claude's
-   * structured-input flow) OR has at least one pending tool approval.
+   * True when the agent is paused on a user-input request OR has at
+   * least one pending tool approval.
    * The focus-queue sidebar uses this as the highest-priority
    * "needs your attention" signal regardless of `active` state.
    */

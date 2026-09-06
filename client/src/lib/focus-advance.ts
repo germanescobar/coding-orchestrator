@@ -83,6 +83,14 @@ export interface FocusQueueItemLike {
   lastVisitedAt?: string;
 }
 
+export function pickFirstFocusItem<
+  T extends FocusQueueItemLike,
+>(focusQueue: T[], currentSessionId: string): T | null {
+  return (
+    focusQueue.find((item) => item.session.id !== currentSessionId) ?? null
+  );
+}
+
 export function pickNextFocusItem<
   T extends FocusQueueItemLike,
 >(
@@ -158,6 +166,7 @@ export function pickNextFocusItem<
     for (let offset = 0; offset < len; offset++) {
       const item = focusQueue[(scanStart + offset) % len];
       if (item.session.id === sentFromSessionId) continue;
+      if (item.active === true) continue;
       const finishedAt = new Date(item.session.lastActiveAt).getTime();
       if (finishedAt >= lastInteractionAt) {
         return item;

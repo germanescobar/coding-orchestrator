@@ -16,10 +16,7 @@ import {
   CheckCircle2,
   RotateCw,
   AlertTriangle,
-  Pause,
-  Play,
   HelpCircle,
-  SkipForward,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -63,8 +60,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { canonicalProviderId } from "@/lib/provider-id";
 import { DOCS_URL } from "@/lib/links";
-import { formatChord, isMacPlatform } from "@/lib/shortcut-match";
-import type { ShortcutBindings } from "../../../shared/shortcuts.ts";
 
 const SESSION_BATCH_SIZE = 5;
 
@@ -87,37 +82,15 @@ interface SidebarProps {
   onSettings: () => void;
   /**
    * The canonical sorted focus queue, owned by App (which overlays
-   * per-session visit timestamps and runs `sortFocusQueue`). The
-   * sidebar uses this for rendering; App uses it for navigation
-   * (`pickNextFocusItem`). The sidebar still emits a *raw* version
+   * per-session handled timestamps and runs `sortFocusQueue`). The
+   * sidebar uses this for rendering and App uses its first row for
+   * navigation. The sidebar still emits a *raw* version
    * of this via `onFocusQueueChange` so App can apply its visit
    * overlay in one place.
    */
   focusQueue?: FocusQueueItem[];
   onFocusQueueChange?: (queue: FocusQueueItem[]) => void;
-  /**
-   * When true (default), replies auto-advance to the next focus-queue
-   * session after a 4-second countdown. When false, replies stay on
-   * the current session until the user hits Next or Mark Done
-   * manually. The Next chord always advances regardless of this
-   * setting. See issue #333 follow-up.
-   */
-  autoAdvance?: boolean;
-  onToggleAutoAdvance?: () => void;
-  /**
-   * Manual "Next" — equivalent to the focus-advance-next chord
-   * (default ⌃N / Ctrl+N). Surfaced as a button in the radar
-   * header so the user can click instead of remembering the
-   * chord. See issue #333 follow-up.
-   */
-  onSkip?: () => void;
   focusRefreshKey?: number;
-  /**
-   * Effective shortcut bindings. Used to render the chord hint on
-   * the auto-advance toggle button so the visible chip matches the
-   * key the listener accepts. See issue #235.
-   */
-  shortcutBindings?: ShortcutBindings | null;
   // Bumped by the App's project-event subscription when an out-of-band
   // lifecycle change lands (worktree added/removed, session added,
   // focus state changed, etc.). Triggers a fresh `loadAll` so the
@@ -152,15 +125,14 @@ export interface FocusQueueItem {
    */
   awaitingInput?: boolean;
   /**
-   * ISO timestamp of the last time the user landed on this session
-   * via any navigation (Next, auto-advance, mark-done follow-up,
-   * sidebar click, conversation link). Drives the
+   * ISO timestamp of the last time the user explicitly advanced past
+   * this session with Next or auto-advance. Drives the
    * visited/unvisited split in `sortFocusQueue` — finished sessions
-   * the user has never opened sit at the top of the finished block
-   * ("triage pile"), and any visit sinks them below the unvisited
+   * the user has not handled sit at the top of the finished block
+   * ("triage pile"), and advancing past one sinks it below the unvisited
    * pile so the user isn't bounced back to them on every cycle.
    * Independent of `lastActiveAt`, which still tracks agent
-   * activity and drives the recently-finished navigation bucket.
+   * activity and ordering within the unfinished queue.
    */
   lastVisitedAt?: string;
 }
@@ -177,15 +149,14 @@ export interface FocusQueueItem {
  *      structured-input pause kills the child so a session can be
  *      inactive and still awaiting.
  *   2. **Finished, unvisited** — the triage pile. Items whose agent
- *      finished and the user has not yet landed on via any
- *      navigation (Next, auto-advance, mark-done follow-up,
- *      sidebar click, conversation link). Oldest-arrival first
+ *      finished and the user has not yet explicitly advanced past.
+ *      Merely opening one does not change its position. Oldest-arrival first
  *      (`lastActiveAt` asc) so the user walks the pile in the
- *      order the agents finished. Visiting a session sinks it
+ *      order the agents finished. Advancing past a session sinks it
  *      into the next bucket so the user isn't bounced back to it
  *      on every cycle.
- *   3. **Finished, visited** — items the user has already looked
- *      at. Most-recently-visited at the very bottom of this
+ *   3. **Finished, visited** — items the user has already handled.
+ *      Most-recently-handled at the very bottom of this
  *      sub-bucket (`lastVisitedAt` asc, ties on array order) so
  *      the freshest look sits closest to the running pile below.
  *   4. **Running (active)** — sessions where the agent is still
@@ -232,6 +203,25 @@ export function sortFocusQueue(items: FocusQueueItem[]): FocusQueueItem[] {
     );
 
   return [...awaiting, ...finishedUnvisited, ...finishedVisited, ...running];
+}
+
+/**
+ * Mark one queue item as handled, then return the queue in its new
+ * canonical order. Navigation intentionally happens after this step
+ * so Next and auto-advance always open the new first row.
+ */
+export function markFocusItemHandled(
+  items: FocusQueueItem[],
+  sessionId: string,
+  handledAt: string,
+): FocusQueueItem[] {
+  return sortFocusQueue(
+    items.map((item) =>
+      item.session.id === sessionId
+        ? { ...item, lastVisitedAt: handledAt }
+        : item,
+    ),
+  );
 }
 
 function CodexLogo({ className }: { className?: string }) {
@@ -379,10 +369,6 @@ export function Sidebar({
   onSettings,
   focusQueue: focusQueueProp,
   onFocusQueueChange,
-  autoAdvance = true,
-  onToggleAutoAdvance,
-  onSkip,
-  shortcutBindings = null,
   focusRefreshKey,
   eventsRefreshKey,
 }: SidebarProps) {
@@ -901,54 +887,6 @@ export function Sidebar({
           <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
             On radar
           </span>
-          <div className="flex items-center gap-1">
-            {focusQueue.length > 0 && onSkip ? (
-              <button
-                type="button"
-                onClick={onSkip}
-                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground"
-                title={`Skip to the next focus-queue session (${formatChord(
-                  shortcutBindings?.focusAdvanceNext ?? "ctrl-n",
-                  isMacPlatform(),
-                )})`}
-                aria-label="Skip to the next focus-queue session"
-              >
-                <SkipForward className="h-3.5 w-3.5" />
-                <span>Next</span>
-              </button>
-            ) : null}
-            {focusQueue.length > 0 && onToggleAutoAdvance ? (
-              <button
-                type="button"
-                onClick={onToggleAutoAdvance}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors",
-                  autoAdvance
-                    ? "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
-                    : "bg-amber-500/15 text-amber-300 ring-1 ring-inset ring-amber-400/30 hover:bg-amber-500/25 hover:text-amber-200",
-                )}
-                title={
-                  autoAdvance
-                    ? `Turn off auto-advance (${formatChord(
-                        shortcutBindings?.focusAutoAdvance ?? "ctrl-t",
-                        isMacPlatform(),
-                      )})`
-                    : `Turn on auto-advance (${formatChord(
-                        shortcutBindings?.focusAutoAdvance ?? "ctrl-t",
-                        isMacPlatform(),
-                      )})`
-                }
-                aria-pressed={!autoAdvance}
-              >
-                {autoAdvance ? (
-                  <Play className="h-3.5 w-3.5" />
-                ) : (
-                  <Pause className="h-3.5 w-3.5" />
-                )}
-                <span>{autoAdvance ? "Auto-advance" : "Paused"}</span>
-              </button>
-            ) : null}
-          </div>
         </div>
 
         <div className="flex flex-col gap-1 pb-3">

@@ -63,7 +63,7 @@ import {
   getSessionRuntime,
   markSessionActive,
   markSessionInactive,
-  recordPendingApproval,
+  recordSessionAttentionEvent,
   setSessionAwaitingUserInput,
   stopSessionRuntime,
 } from "../lib/session-runtime.js";
@@ -1400,29 +1400,14 @@ export async function handleSessionStream(
                   runTerminated = true;
                   runCancelled = event.type === "run.cancelled";
                 }
-                // Stash the pending approval in memory before the client sees
-                // it, so a decision can be answered without racing disk I/O.
-                if (event.type === "tool.approval_requested" && streamSessionId) {
-                  recordPendingApproval(streamSessionId, {
-                    requestId: event.id,
-                    toolName: event.toolName,
-                    input: event.input,
-                    suggestions: event.suggestions,
-                  });
+                if (streamSessionId) {
+                  recordSessionAttentionEvent(streamSessionId, event);
                 }
                 sseSend({ type: "anita_event", event });
               })
               .catch(() => {});
             if (providerId === "claude" && event.type === "user.input_requested") {
               pausedForClaudeUserInput = true;
-              // Flag the session as awaiting user input BEFORE killing
-              // the child: markSessionInactive runs in the close handler
-              // and mustn't wipe the flag (it doesn't, but order still
-              // matters — the runtime state has to be consistent by
-              // the time the close handler fires).
-              if (streamSessionId) {
-                setSessionAwaitingUserInput(streamSessionId, true);
-              }
               child.kill("SIGTERM");
             }
             // Stand the watchdog down while an approval is pending, and re-arm
@@ -1437,12 +1422,6 @@ export async function handleSessionStream(
               }
             } else if (awaitingApproval) {
               awaitingApproval = false;
-              // Approval was answered; the session is no longer
-              // awaiting input. Clear the flag so the focus queue
-              // demotes the session back to its regular bucket.
-              if (streamSessionId) {
-                setSessionAwaitingUserInput(streamSessionId, false);
-              }
               resetWatchdog();
             }
           }
@@ -1485,6 +1464,9 @@ export async function handleSessionStream(
               ) {
                 runTerminated = true;
                 runCancelled = event.type === "run.cancelled";
+              }
+              if (streamSessionId) {
+                recordSessionAttentionEvent(streamSessionId, event);
               }
               sseSend({ type: "anita_event", event });
               if (providerId === "claude" && event.type === "user.input_requested") {
@@ -1968,6 +1950,10 @@ async function streamCodexPlanSession(
           await persistAgentEvent(event);
         }
 
+        if (streamSessionId) {
+          recordSessionAttentionEvent(streamSessionId, event);
+        }
+
         sseSend({ type: "anita_event", event });
 
         if (event.type === "run.completed" || event.type === "run.failed") {
@@ -2243,6 +2229,7 @@ sessionsRouter.post(
         type: "user_input_response",
         data: { dismissed: true },
       });
+      setSessionAwaitingUserInput(req.params.sessionId, false);
 
       const existing = await getSession(worktree.path, req.params.sessionId);
       if (existing) {
@@ -2295,6 +2282,7 @@ sessionsRouter.post(
           type: "user_input_response",
           data: { answers },
         });
+        setSessionAwaitingUserInput(req.params.sessionId, false);
 
         if (session) {
           session.lastActiveAt = new Date().toISOString();
@@ -2306,6 +2294,7 @@ sessionsRouter.post(
       }
 
       await codexAppServerManager.submitUserInput(req.params.sessionId, answers);
+      setSessionAwaitingUserInput(req.params.sessionId, false);
       await appendEvent(worktree.path, req.params.sessionId, {
         id: randomUUID(),
         sessionId: req.params.sessionId,
@@ -2991,6 +2980,7 @@ sessionsRouter.post(
           requestId,
           decision
         );
+        consumePendingApproval(req.params.sessionId, requestId);
       } catch (error) {
         res.status(404).json({
           error: error instanceof Error ? error.message : String(error),
@@ -3015,6 +3005,7 @@ sessionsRouter.post(
           .json({ error: "The session process is no longer accepting input." });
         return;
       }
+      consumePendingApproval(req.params.sessionId, requestId);
     } else {
       if (!runtime.child) {
         res
