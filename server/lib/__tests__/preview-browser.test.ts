@@ -15,6 +15,13 @@ function register(socket: FakeSocket, key: string): void {
   socket.emit("message", Buffer.from(JSON.stringify({ kind: "register", key })));
 }
 
+function registerController(socket: FakeSocket): void {
+  socket.emit(
+    "message",
+    Buffer.from(JSON.stringify({ kind: "register-controller" }))
+  );
+}
+
 test("forwards a command to the registered host and resolves with its result", async () => {
   const socket = new FakeSocket();
   previewBrowserBridge.handleConnection(socket as never);
@@ -101,6 +108,78 @@ test("waits briefly for a host to register before rejecting (issue #170)", async
   assert.deepEqual(result, { ok: true, text: "late" });
   // Sanity: the wait was real (>= 150ms).
   assert.ok(Date.now() - start >= 100, "waited at least 100ms for the host");
+});
+
+test("asks the desktop registry to create an unvisited worktree pane", async () => {
+  const registry = new FakeSocket();
+  previewBrowserBridge.handleConnection(registry as never);
+  registerController(registry);
+
+  const pane = new FakeSocket();
+  const pending = previewBrowserBridge.execute(
+    "p-lazy:w-lazy",
+    "snapshot",
+    {},
+    { hostWaitMs: 1_000, ensureHost: { projectRoot: "/tmp/lazy" } }
+  );
+
+  assert.equal(registry.sent.length, 1);
+  assert.deepEqual(JSON.parse(registry.sent[0]), {
+    kind: "ensure-pane",
+    key: "p-lazy:w-lazy",
+    projectRoot: "/tmp/lazy",
+  });
+
+  previewBrowserBridge.handleConnection(pane as never);
+  register(pane, "p-lazy:w-lazy");
+  setTimeout(() => {
+    const command = JSON.parse(pane.sent[0]);
+    pane.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          kind: "result",
+          requestId: command.requestId,
+          result: { ok: true, text: "created lazily" },
+        })
+      )
+    );
+  }, 150);
+
+  assert.deepEqual(await pending, { ok: true, text: "created lazily" });
+});
+
+test("uses only the latest desktop registry and drops it on disconnect", async () => {
+  const oldRegistry = new FakeSocket();
+  const activeRegistry = new FakeSocket();
+  previewBrowserBridge.handleConnection(oldRegistry as never);
+  previewBrowserBridge.handleConnection(activeRegistry as never);
+  registerController(oldRegistry);
+  registerController(activeRegistry);
+
+  await assert.rejects(
+    previewBrowserBridge.execute(
+      "p-window:w-window",
+      "snapshot",
+      {},
+      { hostWaitMs: 50, ensureHost: { projectRoot: "/tmp/window" } }
+    ),
+    /No preview pane/
+  );
+  assert.equal(oldRegistry.sent.length, 0);
+  assert.equal(activeRegistry.sent.length, 1);
+
+  activeRegistry.emit("close");
+  await assert.rejects(
+    previewBrowserBridge.execute(
+      "p-closed:w-closed",
+      "snapshot",
+      {},
+      { hostWaitMs: 50, ensureHost: { projectRoot: "/tmp/closed" } }
+    ),
+    /No preview pane/
+  );
+  assert.equal(activeRegistry.sent.length, 1);
 });
 
 test("rejects fast when no host appears within the grace window", async () => {

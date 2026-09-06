@@ -42,6 +42,8 @@ interface PendingRequest {
 export interface ExecuteOptions {
   timeoutMs?: number;
   hostWaitMs?: number;
+  /** Ask a connected desktop renderer to create this pane before waiting. */
+  ensureHost?: { projectRoot: string };
 }
 
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -49,12 +51,19 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_HOST_WAIT_MS = 3_000;
 /** Poll cadence while waiting for a host to register. */
 const HOST_WAIT_POLL_MS = 100;
+const NO_HOST_ERROR =
+  "No preview pane is connected for this worktree. Open the project in the Controller desktop app and retry.";
 
 class PreviewBrowserBridge {
   // Most recently registered renderer socket per pane key. A session is
   // normally visible in a single window; last-writer-wins keeps the active
   // window in control without leaking stale sockets.
   private hosts = new Map<string, WebSocket>();
+  // App-level renderer sockets can lazily create a pane for a worktree that
+  // has not been visited since the desktop app launched.
+  // Match pane-host routing: the most recently connected desktop window owns
+  // lazy pane creation, avoiding cross-window registration races.
+  private registry: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
   private nextRequestId = 1;
 
@@ -69,7 +78,8 @@ class PreviewBrowserBridge {
    * replies with `result` frames.
    */
   handleConnection(ws: WebSocket): void {
-    let registeredKey: string | null = null;
+    const registeredKeys = new Set<string>();
+    let isRegistry = false;
 
     ws.on("message", (raw: Buffer) => {
       let message: Record<string, unknown>;
@@ -80,8 +90,14 @@ class PreviewBrowserBridge {
       }
 
       if (message.kind === "register" && typeof message.key === "string") {
-        registeredKey = message.key;
+        registeredKeys.add(message.key);
         this.hosts.set(message.key, ws);
+        return;
+      }
+
+      if (message.kind === "register-controller") {
+        isRegistry = true;
+        this.registry = ws;
         return;
       }
 
@@ -91,9 +107,10 @@ class PreviewBrowserBridge {
     });
 
     const detach = () => {
-      if (registeredKey && this.hosts.get(registeredKey) === ws) {
-        this.hosts.delete(registeredKey);
+      for (const key of registeredKeys) {
+        if (this.hosts.get(key) === ws) this.hosts.delete(key);
       }
+      if (isRegistry && this.registry === ws) this.registry = null;
     };
     ws.on("close", detach);
     ws.on("error", detach);
@@ -119,13 +136,24 @@ class PreviewBrowserBridge {
       return this.send(existing, action, params, timeoutMs);
     }
     if (hostWaitMs <= 0) {
-      return Promise.reject(
-        new Error(
-          "No preview pane is connected for this session. Open the Preview tab in the app first."
-        )
-      );
+      return Promise.reject(new Error(NO_HOST_ERROR));
+    }
+    if (options.ensureHost) {
+      this.ensurePane(key, options.ensureHost.projectRoot);
     }
     return this.waitForHostThenSend(key, action, params, timeoutMs, hostWaitMs);
+  }
+
+  /** Tell the active desktop window to lazily host the requested pane. */
+  private ensurePane(key: string, projectRoot: string): void {
+    const frame = JSON.stringify({ kind: "ensure-pane", key, projectRoot });
+    const registry = this.registry;
+    if (!registry) return;
+    try {
+      registry.send(frame);
+    } catch {
+      if (this.registry === registry) this.registry = null;
+    }
   }
 
   /** Send a command to a known socket and resolve when the renderer answers. */
@@ -171,9 +199,7 @@ class PreviewBrowserBridge {
       const host = this.hosts.get(key);
       if (host) return this.send(host, action, params, timeoutMs);
     }
-    throw new Error(
-      "No preview pane is connected for this session. Open the Preview tab in the app first."
-    );
+    throw new Error(NO_HOST_ERROR);
   }
 
   private resolvePending(requestId: string, result: BridgeResult): void {

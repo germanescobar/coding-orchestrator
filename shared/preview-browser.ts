@@ -54,10 +54,9 @@ export type BrowserCommandResult =
 // WebSocket framing (server -> renderer)
 // ---------------------------------------------------------------------------
 //
-// The renderer's outbound frames (`{ kind: "register", key }` and
-// `{ kind: "result", requestId, result }`) are written inline; only the
-// inbound command frame is consumed as a type, so that's the only one modeled
-// here.
+// The renderer's outbound registration/result frames are written inline.
+// Server messages are modeled here because both the pane host and the
+// app-level lazy-pane registry consume them.
 
 /** Server asks the renderer to run a command against its `<webview>`. */
 export interface BrowserCommandMessage {
@@ -65,6 +64,13 @@ export interface BrowserCommandMessage {
   requestId: string;
   action: BrowserAction;
   params: Record<string, unknown>;
+}
+
+/** Server asks the app-level preview pool to create a host for a worktree. */
+export interface BrowserEnsurePaneMessage {
+  kind: "ensure-pane";
+  key: string;
+  projectRoot: string;
 }
 
 /**
@@ -82,4 +88,4 @@ export interface BrowserOpenParams {
   insecure?: boolean;
 }
 
-export type BrowserServerMessage = BrowserCommandMessage;
+export type BrowserServerMessage = BrowserCommandMessage | BrowserEnsurePaneMessage;

@@ -15,6 +15,7 @@
 
 import { useEffect, useRef } from "react";
 import type {
+  BrowserCommandMessage,
   BrowserCommandResult,
   BrowserServerMessage,
 } from "../../../shared/preview-browser.ts";
@@ -47,7 +48,7 @@ export interface PreviewBrowserHostOptions {
 const RECONNECT_DELAY_MS = 1500;
 const LOAD_TIMEOUT_MS = 12_000;
 
-function wsUrl(): string {
+export function previewBrowserWsUrl(): string {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const host = window.location.hostname;
   const port = import.meta.env.DEV
@@ -78,7 +79,7 @@ export function usePreviewBrowserHost(options: PreviewBrowserHostOptions): void 
     const refs: Record<string, string> = {};
 
     const runCommand = async (
-      message: BrowserServerMessage
+      message: BrowserCommandMessage
     ): Promise<BrowserCommandResult> => {
       try {
         switch (message.action) {
@@ -124,7 +125,7 @@ export function usePreviewBrowserHost(options: PreviewBrowserHostOptions): void 
 
     const connect = () => {
       if (disposed) return;
-      const ws = new WebSocket(wsUrl());
+      const ws = new WebSocket(previewBrowserWsUrl());
       socket = ws;
 
       ws.onopen = () => {

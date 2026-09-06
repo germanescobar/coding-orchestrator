@@ -68,7 +68,9 @@ browserRouter.post("/command", async (req: Request, res: Response) => {
 
   const key = `${worktree.projectId}:${worktree.id}`;
   try {
-    const result = await previewBrowserBridge.execute(key, action, params);
+    const result = await previewBrowserBridge.execute(key, action, params, {
+      ensureHost: { projectRoot: worktree.path },
+    });
     res.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
