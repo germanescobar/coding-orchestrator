@@ -30,9 +30,11 @@ import {
 import { toast } from "sonner";
 import { getController, isControllerAvailable } from "@/lib/controller";
 import {
+  previewBrowserWsUrl,
   usePreviewBrowserHost,
   type PreviewWebview,
 } from "@/lib/usePreviewBrowserHost";
+import type { BrowserServerMessage } from "../../../shared/preview-browser";
 
 /** Per-pane preview chrome state, mirrored from the live webview. */
 export interface PreviewPaneState {
@@ -148,6 +150,8 @@ export function PreviewBrowserProvider({ children }: { children: ReactNode }) {
   const storeRef = useRef<PreviewBrowserStore | null>(null);
   if (!storeRef.current) storeRef.current = new PreviewBrowserStore();
   const store = storeRef.current;
+
+  usePreviewPaneRegistry(available, store);
 
   // Live webview elements by pane key, plus the overlay container, kept in refs
   // so positioning never triggers React re-renders.
@@ -339,6 +343,54 @@ export function PreviewBrowserProvider({ children }: { children: ReactNode }) {
       )}
     </PreviewBrowserContext.Provider>
   );
+}
+
+/**
+ * Keep one app-level socket available so the server can request a pane for a
+ * worktree that this desktop window has not visited since launch. The normal
+ * per-pane host socket is created by PaneFrames after `store.track` updates
+ * the topology.
+ */
+function usePreviewPaneRegistry(
+  enabled: boolean,
+  store: PreviewBrowserStore
+): void {
+  useEffect(() => {
+    if (!enabled) return;
+
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let disposed = false;
+
+    const connect = () => {
+      if (disposed) return;
+      const ws = new WebSocket(previewBrowserWsUrl());
+      socket = ws;
+      ws.onopen = () => ws.send(JSON.stringify({ kind: "register-controller" }));
+      ws.onmessage = (event) => {
+        let message: BrowserServerMessage;
+        try {
+          message = JSON.parse(event.data) as BrowserServerMessage;
+        } catch {
+          return;
+        }
+        if (message.kind !== "ensure-pane") return;
+        store.track(message.key, message.projectRoot);
+      };
+      ws.onclose = () => {
+        if (disposed) return;
+        reconnectTimer = window.setTimeout(connect, 1500);
+      };
+      ws.onerror = () => ws.close();
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, [enabled, store]);
 }
 
 // ---------------------------------------------------------------------------

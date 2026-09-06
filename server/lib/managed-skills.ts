@@ -238,9 +238,9 @@ changes that would break a positional CSS selector.
   from your working directory.
 - Allowed targets: localhost and project-local files by default, plus web URLs.
 - If a command reports that no preview pane is connected, ask the user to open
-  the Preview tab for this session, then retry. The bridge waits up to a few
-  seconds for a reconnecting pane before erroring, so a transient drop is
-  usually safe to ignore — re-running the command is enough.
+  the project in the Controller desktop app, then retry. The app can create an
+  unvisited worktree pane on demand, and the bridge waits a few seconds for it
+  to register before erroring.
 - \`ref=\` lookups return \`Stale ref\` if the page changed between the snapshot
   and the action. Re-run \`snapshot\` to refresh the refs.
 `;
