@@ -3122,6 +3122,8 @@ export function SessionView({
   const terminalRefs = useRef<Record<string, TerminalHandle | null>>({});
   const terminalTabsSavePendingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
+  const composerPointerDownRef = useRef(false);
   const hadVisibleFocusAdvanceRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
@@ -3401,6 +3403,26 @@ export function SessionView({
     mediaQuery.addEventListener("change", syncViewport);
     return () => mediaQuery.removeEventListener("change", syncViewport);
   }, []);
+
+  // Mobile taps do not reliably populate a blur event's `relatedTarget`.
+  // Collapsing from onBlur could therefore unmount an agent/model picker
+  // between pointer-down and click. Treat the entire composer as one
+  // interaction surface and collapse only on an explicit tap outside it.
+  useEffect(() => {
+    if (!isMobileComposerViewport || !composerHasFocus) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && composerRef.current?.contains(target)) return;
+      setComposerHasFocus(false);
+      setSkillPopoverOpen(false);
+      setMentionPopoverOpen(false);
+      setShowProviderPicker(false);
+      setShowReasoningEffortPicker(false);
+      setShowModelPicker(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handlePointerDown, true);
+  }, [composerHasFocus, isMobileComposerViewport]);
 
   useEffect(() => {
     debugSessionIsolation("view.mounted", { projectId, worktreeId, sessionId });
@@ -6476,6 +6498,7 @@ export function SessionView({
                 }}
               >
                 <div
+                  ref={composerRef}
                   data-testid="session-composer"
                   data-mobile-collapsed={
                     isMobileComposerViewport && !composerHasFocus ? "true" : undefined
@@ -6483,11 +6506,18 @@ export function SessionView({
                   className={`rounded-xl border border-border bg-input transition-[padding] md:p-3 ${
                     showComposerDetails ? "p-3" : "p-2.5"
                   }`}
+                  onPointerDownCapture={() => {
+                    composerPointerDownRef.current = true;
+                    window.setTimeout(() => {
+                      composerPointerDownRef.current = false;
+                    }, 0);
+                  }}
                   onBlurCapture={(event) => {
                     if (
                       event.currentTarget.contains(
                         event.relatedTarget as Node | null,
-                      )
+                      ) ||
+                      (isMobileComposerViewport && composerPointerDownRef.current)
                     ) {
                       return;
                     }
