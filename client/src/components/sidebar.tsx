@@ -128,7 +128,7 @@ export interface FocusQueueItem {
    * ISO timestamp of the last time the user explicitly advanced past
    * this session with Next or auto-advance. Drives the
    * visited/unvisited split in `sortFocusQueue` — finished sessions
-   * the user has not handled sit at the top of the finished block
+   * the user has not handled since their latest completion sit at the top
    * ("triage pile"), and advancing past one sinks it below the unvisited
    * pile so the user isn't bounced back to them on every cycle.
    * Independent of `lastActiveAt`, which still tracks agent
@@ -149,7 +149,8 @@ export interface FocusQueueItem {
  *      structured-input pause kills the child so a session can be
  *      inactive and still awaiting.
  *   2. **Finished, unvisited** — the triage pile. Items whose agent
- *      finished and the user has not yet explicitly advanced past.
+ *      finished and the user has not yet explicitly advanced past that
+ *      completion. A new completion after a prior visit returns here.
  *      Merely opening one does not change its position. Oldest-arrival first
  *      (`lastActiveAt` asc) so the user walks the pile in the
  *      order the agents finished. Advancing past a session sinks it
@@ -170,6 +171,14 @@ export interface FocusQueueItem {
  * Pure: does not mutate the input.
  */
 export function sortFocusQueue(items: FocusQueueItem[]): FocusQueueItem[] {
+  const hasUnseenCompletion = (item: FocusQueueItem) => {
+    if (!item.lastVisitedAt) return true;
+    return (
+      new Date(item.session.lastActiveAt).getTime() >
+      new Date(item.lastVisitedAt).getTime()
+    );
+  };
+
   const awaiting = items
     .filter((item) => item.awaitingInput)
     .sort(
@@ -179,7 +188,10 @@ export function sortFocusQueue(items: FocusQueueItem[]): FocusQueueItem[] {
     );
 
   const finishedUnvisited = items
-    .filter((item) => !item.awaitingInput && !item.active && !item.lastVisitedAt)
+    .filter(
+      (item) =>
+        !item.awaitingInput && !item.active && hasUnseenCompletion(item),
+    )
     .sort(
       (a, b) =>
         new Date(a.session.lastActiveAt).getTime() -
@@ -187,7 +199,10 @@ export function sortFocusQueue(items: FocusQueueItem[]): FocusQueueItem[] {
     );
 
   const finishedVisited = items
-    .filter((item) => !item.awaitingInput && !item.active && item.lastVisitedAt)
+    .filter(
+      (item) =>
+        !item.awaitingInput && !item.active && !hasUnseenCompletion(item),
+    )
     .sort(
       (a, b) =>
         new Date(a.lastVisitedAt!).getTime() -
@@ -536,12 +551,12 @@ export function Sidebar({
   }, [loadAll, focusRefreshKey, eventsRefreshKey]);
 
   useEffect(() => {
-    if (activeSessionIds.size === 0) return;
+    if (activeSessionIds.size === 0 && awaitingInputSessionIds.size === 0) return;
     const interval = window.setInterval(() => {
       refreshActiveSessions().catch(() => {});
     }, 2000);
     return () => window.clearInterval(interval);
-  }, [activeSessionIds, refreshActiveSessions]);
+  }, [activeSessionIds, awaitingInputSessionIds, refreshActiveSessions]);
 
   const toggleProject = (id: string) => {
     setProjectData((prev) =>

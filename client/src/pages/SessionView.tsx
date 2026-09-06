@@ -6530,7 +6530,10 @@ export function SessionView({
                     className="hidden"
                     accept={attachmentAcceptMimeTypes.join(",")}
                     onChange={(event) => {
-                      if (event.target.files) addComposerFiles(event.target.files);
+                      if (event.target.files?.length) {
+                        if (isMobileComposerViewport) setComposerHasFocus(true);
+                        addComposerFiles(event.target.files);
+                      }
                       event.currentTarget.value = "";
                     }}
                   />

@@ -145,12 +145,15 @@ export interface SessionRuntimeSummary {
  * single request. Sessions without metadata (e.g. populated by an older
  * server build) are returned without `projectId`/`worktreeId`.
  */
-export function listSessionRuntimes(): SessionRuntimeSummary[] {
+export function listSessionRuntimes(
+  persistedAwaitingInput: ReadonlySet<string> = new Set(),
+): SessionRuntimeSummary[] {
   const summaries: SessionRuntimeSummary[] = [];
   for (const [sessionId, state] of runtimes) {
     const awaitingInput =
       state.awaitingUserInput === true ||
-      (state.pendingApprovals?.size ?? 0) > 0;
+      (state.pendingApprovals?.size ?? 0) > 0 ||
+      persistedAwaitingInput.has(sessionId);
     summaries.push({
       sessionId,
       active: state.active,
@@ -159,6 +162,10 @@ export function listSessionRuntimes(): SessionRuntimeSummary[] {
       projectId: state.metadata?.projectId,
       worktreeId: state.metadata?.worktreeId,
     });
+  }
+  for (const sessionId of persistedAwaitingInput) {
+    if (runtimes.has(sessionId)) continue;
+    summaries.push({ sessionId, active: false, awaitingInput: true });
   }
   return summaries;
 }

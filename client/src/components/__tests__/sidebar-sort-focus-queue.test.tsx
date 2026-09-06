@@ -225,6 +225,24 @@ test("finished, unvisited: oldest-arrival first at the top of the finished block
   ]);
 });
 
+test("a session that finishes after it was handled returns to the unvisited pile", () => {
+  const result = sortFocusQueue([
+    item(
+      "finished-again",
+      "2024-01-05T00:00:00.000Z",
+      false,
+      "2024-01-04T00:00:00.000Z",
+    ),
+    item(
+      "already-handled",
+      "2024-01-01T00:00:00.000Z",
+      false,
+      "2024-01-06T00:00:00.000Z",
+    ),
+  ]);
+  assert.deepEqual(ids(result), ["finished-again", "already-handled"]);
+});
+
 test("finished, visited: sinks below the unvisited triage pile", () => {
   // Mixing visited and unvisited. Unvisited stays at the top of
   // the finished block; visited sinks below.
